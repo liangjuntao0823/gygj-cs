@@ -223,6 +223,69 @@ expect(testMediaSummary(images: 5, videos: 1) == "图片5个，视频1个",
        "8.7 媒体数量摘要不带文件名")
 
 // ============================================================================
+// 9. 收租计划口径（Property.sortedRentRecords / earliestUnpaidRentRecord /
+//    outstandingRecords / isPaidForCard 等价实现）
+//    规则：应收期只认 monthlyRentRecords 计划内的记录，计划未覆盖的月份不虚构欠租；
+//    卡片状态与未收租提醒都从计划取最早一条未交记录。
+// ============================================================================
+struct TestRecord: Equatable { let year: Int; let month: Int; let isPaid: Bool }
+
+func sortedRecords(_ records: [TestRecord]) -> [TestRecord] {
+    records.sorted { $0.year != $1.year ? $0.year < $1.year : $0.month < $1.month }
+}
+func earliestUnpaid(_ records: [TestRecord]) -> TestRecord? {
+    sortedRecords(records).first { !$0.isPaid }
+}
+func outstanding(_ records: [TestRecord], upTo y: Int, _ m: Int) -> [TestRecord] {
+    sortedRecords(records).filter { !$0.isPaid && ($0.year < y || ($0.year == y && $0.month <= m)) }
+}
+/// nextDueDays：下一未交期距今天数（由应收日真实日期差算出，这里直接喂入等价结果）
+func cardPaid(_ records: [TestRecord], nowY: Int, nowM: Int, nextDueDays: Int) -> Bool {
+    let sorted = sortedRecords(records)
+    guard !sorted.isEmpty else { return false }
+    if !outstanding(sorted, upTo: nowY, nowM).isEmpty { return false }
+    let hasUpToNow = sorted.contains { $0.year < nowY || ($0.year == nowY && $0.month <= nowM) }
+    if !hasUpToNow { return sorted.first!.isPaid }
+    guard earliestUnpaid(sorted) != nil else { return true }
+    return nextDueDays > 3
+}
+
+// 本案：今天 2026-11-22，首期 2026-12 已勾，2027-01 起未勾
+let caseA: [TestRecord] = [
+    TestRecord(year: 2026, month: 12, isPaid: true),
+    TestRecord(year: 2027, month: 1, isPaid: false),
+    TestRecord(year: 2027, month: 2, isPaid: false),
+]
+expect(earliestUnpaid(caseA) == TestRecord(year: 2027, month: 1, isPaid: false), "9.1 最早未交期取计划内 2027-01")
+expect(outstanding(caseA, upTo: 2026, 11).isEmpty, "9.2 首期之前（2026-11）不计入欠租，不虚构逾期")
+expect(cardPaid(caseA, nowY: 2026, nowM: 11, nextDueDays: 40) == true, "9.3 首期已交、下期尚远 → 卡片已收")
+
+// 首期未交、计划还没到当前月
+let caseB: [TestRecord] = [TestRecord(year: 2026, month: 12, isPaid: false)]
+expect(cardPaid(caseB, nowY: 2026, nowM: 11, nextDueDays: 9) == false, "9.4 首期未交且未到当前月 → 待收")
+expect(earliestUnpaid(caseB)?.year == 2026 && earliestUnpaid(caseB)?.month == 12, "9.5 提醒应收期是首期 12 月，不是 11 月")
+
+// 当月有未交记录
+let caseC: [TestRecord] = [TestRecord(year: 2026, month: 11, isPaid: false)]
+expect(cardPaid(caseC, nowY: 2026, nowM: 11, nextDueDays: 2) == false, "9.6 当月未交 → 待收")
+
+// 全部收齐
+let caseD: [TestRecord] = [
+    TestRecord(year: 2026, month: 11, isPaid: true),
+    TestRecord(year: 2026, month: 12, isPaid: true),
+]
+expect(earliestUnpaid(caseD) == nil, "9.7 全部已交 → 无未交记录，不进提醒")
+expect(cardPaid(caseD, nowY: 2026, nowM: 11, nextDueDays: 0) == true, "9.8 全部收齐 → 卡片已收")
+
+// AI 欠租清单：只列计划内存在且未交的月份；计划外的 2026-11 不算
+let caseE: [TestRecord] = [
+    TestRecord(year: 2026, month: 10, isPaid: false),
+    TestRecord(year: 2026, month: 12, isPaid: false),
+]
+let listed = outstanding(caseE, upTo: 2026, 11)
+expect(listed == [TestRecord(year: 2026, month: 10, isPaid: false)], "9.9 欠租清单只统计计划内的 2026-10，漏列计划外 11 月")
+
+// ============================================================================
 // 汇总
 // ============================================================================
 if failed == 0 {

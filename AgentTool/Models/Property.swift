@@ -199,31 +199,67 @@ final class TodoItem {
 }
 
 
-// MARK: - 卡片状态扩展
+// MARK: - 收租计划口径统一入口
+/// 所有「应收期 / 已收未收 / 提醒」判定都只认 monthlyRentRecords 这份计划：
+/// 计划未覆盖的月份（首期之前、租期结束之后）一律不虚构应收期，计划对则状态与提醒都不会错。
 extension Property {
-    /// 收租卡片已收/未收状态：下一期交租日前3天转为未收
-    /// 例如交租日1号，9月已交显示已收，10月1日提前3天（9月28日）起显示未收
+    /// 收租计划按年-月排序
+    var sortedRentRecords: [RentMonthRecord] {
+        monthlyRentRecords.sorted { $0.year != $1.year ? $0.year < $1.year : $0.month < $1.month }
+    }
+
+    /// 计划内最早一条未交记录；全部收齐返回 nil（不再用当前日历月反推）
+    func earliestUnpaidRentRecord() -> RentMonthRecord? {
+        sortedRentRecords.first { !$0.isPaid }
+    }
+
+    /// 某期应收日：交租日收敛到当月最后一天（沿用 v2.19 口径）
+    func rentDueDate(of record: RentMonthRecord) -> Date {
+        let cal = Calendar.current
+        var monthFirst = DateComponents()
+        monthFirst.year = record.year
+        monthFirst.month = record.month
+        monthFirst.day = 1
+        let first = cal.date(from: monthFirst) ?? Date()
+        let daysInMonth = cal.range(of: .day, in: .month, for: first)?.count ?? 31
+        var comps = DateComponents()
+        comps.year = record.year
+        comps.month = record.month
+        comps.day = min(max(rentDueDay, 1), daysInMonth)
+        return cal.date(from: comps) ?? first
+    }
+
+    /// 计划内截至当前月仍未交的记录（不含计划未覆盖的月份）
+    func outstandingRecords(upTo date: Date = Date()) -> [RentMonthRecord] {
+        let cal = Calendar.current
+        let y = cal.component(.year, from: date)
+        let m = cal.component(.month, from: date)
+        return sortedRentRecords.filter { !$0.isPaid && ($0.year < y || ($0.year == y && $0.month <= m)) }
+    }
+
+    /// 收租卡片已收/未收状态：下一期交租日前 3 天转为未收；首期晚于当前月时按首期是否已交判定
     var isPaidForCard: Bool {
         let cal = Calendar.current
         let now = Date()
         let cy = cal.component(.year, from: now)
         let cm = cal.component(.month, from: now)
-        // 本月是否已收
-        let currentPaid = monthlyRentRecords.contains { $0.year == cy && $0.month == cm && $0.isPaid }
-        // 找下一期待交记录（当前月及之后第一条未交）
-        let sorted = monthlyRentRecords.sorted { $0.year != $1.year ? $0.year < $1.year : $0.month < $1.month }
-        guard let nextUnpaid = sorted.first(where: { !$0.isPaid && ($0.year > cy || ($0.year == cy && $0.month >= cm)) }) else {
-            // v2.47：当前月及之后再无未交记录（含最后一个月刚勾上）→ 全部收齐，按本月是否已收显示
-            return currentPaid
+        let sorted = sortedRentRecords
+        guard !sorted.isEmpty else { return false }
+
+        // 计划内今天及以前仍有未交 → 逾期，待收
+        let outstandingNow = sorted.contains { !$0.isPaid && ($0.year < cy || ($0.year == cy && $0.month <= cm)) }
+        if outstandingNow { return false }
+
+        let hasRecordUpToNow = sorted.contains { $0.year < cy || ($0.year == cy && $0.month <= cm) }
+        if !hasRecordUpToNow {
+            // 计划尚未到当前月（首期在未来）：首期未交 → 待收；首期已交 → 已收
+            return sorted.first!.isPaid
         }
-        // 下一期待交日期
-        var comps = DateComponents()
-        comps.year = nextUnpaid.year
-        comps.month = nextUnpaid.month
-        comps.day = rentDueDay
-        let nextDue = cal.date(from: comps) ?? now
+
+        guard let next = sorted.first(where: { !$0.isPaid }) else { return true }
+        let nextDue = rentDueDate(of: next)
         let days = cal.dateComponents([.day], from: now, to: nextDue).day ?? 0
-        // 距离下一期交租日 <= 3天（含已逾期）→ 显示未收
-        return currentPaid && days > 3
+        // 距离下一期交租日 <= 3 天（含已逾期）→ 显示未收
+        return days > 3
     }
 }

@@ -302,10 +302,8 @@ struct RentCollectionView: View {
         df.locale = Locale(identifier: "zh_CN")
         df.dateFormat = "yyyy年M月d日 HH:mm"
         let dateStr = df.string(from: Date())
-        let currentMonth = Calendar.current.component(.month, from: Date())
-        let currentYear = Calendar.current.component(.year, from: Date())
         let rows = filteredProperties.map { prop -> [String] in
-            let paid = prop.monthlyRentRecords.contains { $0.year == currentYear && $0.month == currentMonth && $0.isPaid }
+            let paid = !prop.monthlyRentRecords.isEmpty && prop.outstandingRecords().isEmpty
             return [prop.roomNumber, prop.landlord, prop.unitType,
                     "¥\(Int(prop.rent))", "\(prop.rentDueDay)号",
                     prop.propertyType, paid ? "已收" : "未收"]
@@ -336,7 +334,7 @@ struct RentCollectionView: View {
             let m = cal.component(.month, from: Date())
             let current = prop.monthlyRentRecords.first { $0.year == y && $0.month == m }
             let amount = current?.amount ?? (prop.rent + prop.prepayment)
-            let status = current?.isPaid == true ? "已收" : "未收"
+            let status = (!prop.monthlyRentRecords.isEmpty && prop.outstandingRecords().isEmpty) ? "已收" : "未收"
             let records = prop.monthlyRentRecords.sorted { ($0.year, $0.month) < ($1.year, $1.month) }
             let detail = records.map { "\($0.year)年\($0.month)月:\($0.isPaid ? "已收" : "未收")¥\(Int($0.amount))" }.joined(separator: "；")
             return [prop.roomNumber, prop.landlord, prop.unitType, "\(Int(prop.rent))", "\(prop.rentDueDay)", prop.propertyType, prop.notes, "\(Int(prop.prepayment))", "\(Int(amount))", status, detail]
@@ -715,8 +713,6 @@ struct PropertyDetailView: View {
     @State private var showUtilityPlanEditor=false
     @State private var selectedBillRecord: RentMonthRecord?
     @State private var showBillMonths=false
-    @State private var billImage:UIImage?
-    @State private var showBillShare=false
     @State private var showExtraChoice=false
     @State private var extraFormToken: ExtraFormToken?
     @State private var extraItems:[BillExtraItem]=[]
@@ -919,7 +915,6 @@ struct PropertyDetailView: View {
             .confirmationDialog("选择账单月份",isPresented:$showBillMonths,titleVisibility:.visible){ForEach(rentRows,id:\.id){r in Button("\(r.year)年\(r.month)月"){if let rec=rentRecord(id:r.id){pendingBill=rec;extraItems=[];extraName="";extraAmount="";showExtraChoice=true}}};Button("取消",role:.cancel){}}
             .confirmationDialog("是否添加附加费用",isPresented:$showExtraChoice,titleVisibility:.visible){Button("有"){extraFormToken=ExtraFormToken()};Button("无"){if let r=pendingBill{makeBill(r)}};Button("取消",role:.cancel){}}
             .sheet(item:$extraFormToken){_ in BillExtraForm(items:$extraItems,name:$extraName,amount:$extraAmount){extraFormToken=nil;DispatchQueue.main.asyncAfter(deadline:.now()+0.2){if let r=pendingBill{makeBill(r)}}}}
-                        .sheet(isPresented:$showBillShare){if let billImage{StableShareView(image: billImage, onComplete: { showBillShare = false })}}
             .sheet(isPresented:$showEditProperty){AddPropertyView(property:property)}
             .sheet(isPresented:$showRentPlanEditor){RentPlanEditorView(property:property)}
             .sheet(isPresented:$showUtilityPlanEditor){UtilityPlanEditorView(property:property)}
@@ -947,7 +942,30 @@ struct PropertyDetailView: View {
             }
         }
     }
-    private func makeBill(_ rent:RentMonthRecord){let utility=property.utilitySettlementRecords.first{rec in guard let d=rec.dueDate else{return false};return Calendar.current.component(.year,from:d)==rent.year && Calendar.current.component(.month,from:d)==rent.month};let view=RentBillShareView(property:property,rent:rent,utility:utility,extras:extraItems);let renderer=ImageRenderer(content:view.frame(width:360).background(Color.white));renderer.scale=3;if let image=renderer.uiImage{billImage=image;extraItems=[];DispatchQueue.main.asyncAfter(deadline:.now()+0.2){showBillShare=true}}}
+    private func makeBill(_ rent:RentMonthRecord){
+        let utility=property.utilitySettlementRecords.first{rec in guard let d=rec.dueDate else{return false};return Calendar.current.component(.year,from:d)==rent.year && Calendar.current.component(.month,from:d)==rent.month}
+        let view=RentBillShareView(property:property,rent:rent,utility:utility,extras:extraItems)
+        let renderer=ImageRenderer(content:view.frame(width:360).background(Color.white))
+        renderer.scale=3
+        guard let image=renderer.uiImage else { return }
+        extraItems=[]
+        // 分享面板走 SharePresenter 从最顶层控制器直呈，不再用 .sheet 包 UIActivityViewController：
+        // 附加费表单 sheet 刚收起时再挂第二层 sheet，面板会被挂到正在拆除的上下文上，首弹一片空白
+        presentBillShare(image)
+    }
+
+    /// 账单图片先压缩写临时 JPEG，再交系统分享面板（与 StableShareView 同口径，避免大图卡死）
+    private func presentBillShare(_ image: UIImage) {
+        guard let data = image.jpegData(compressionQuality: 0.9) else { return }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("bill_\(Int(Date().timeIntervalSince1970)).jpg")
+        do {
+            try data.write(to: url)
+            SharePresenter.present(items: [url])
+        } catch {
+            SharePresenter.present(items: [image])
+        }
+    }
     private func updateRentAmount(for record: UtilitySettlementRecord) {
         guard let d = record.dueDate else { return }
         let cal = Calendar.current

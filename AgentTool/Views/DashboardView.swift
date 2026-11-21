@@ -242,8 +242,6 @@ struct DashboardView: View {
     private func loadRentReminders() -> [RentReminder] {
         let calendar = Calendar.current
         let now = Date()
-        let currentMonth = calendar.component(.month, from: now)
-        let currentYear = calendar.component(.year, from: now)
 
         var reminders: [RentReminder] = []
         let descriptor = FetchDescriptor<Property>(predicate: #Predicate { !$0.isDeleted })
@@ -251,33 +249,13 @@ struct DashboardView: View {
 
         for prop in properties {
             if prop.isTerminated { continue }
-            let dueDay = prop.rentDueDay
 
-            // 确定关注的应收期：从当前月起向后滚动找第一个"未收"的期（无记录或未收即视为未收）。
-            // v1.98：原逻辑只判断"当月已收→看下月"，不校验下月是否已收——提前交了下期租
-            // （如10月收11月）后，提醒仍把11月当应收期、永不消失（"保存后待收租还在"根因）。
-            var targetYear = currentYear
-            var targetMonth = currentMonth
-            for _ in 0..<12 {
-                let rec = prop.monthlyRentRecords.first { $0.year == targetYear && $0.month == targetMonth }
-                if rec == nil || !rec!.isPaid { break }
-                targetMonth += 1
-                if targetMonth > 12 { targetMonth = 1; targetYear += 1 }
-            }
+            // 应收期直接取收租计划（monthlyRentRecords）里最早一条未交记录；
+            // 计划未覆盖的月份（首期之前）不虚构应收期，计划对则提醒不会错。
+            guard let target = prop.earliestUnpaidRentRecord() else { continue }
 
             // 计算距离目标期交租日的天数和逾期状态（按真实日期差，跨月也准确）
-            var dateComps = DateComponents()
-            dateComps.year = targetYear
-            dateComps.month = targetMonth
-            // v2.19：交租日 31 号遇到 30 天的月份会被落到次月 1 号，这里收敛到当月最后一天
-            var monthFirstComps = DateComponents()
-            monthFirstComps.year = targetYear
-            monthFirstComps.month = targetMonth
-            monthFirstComps.day = 1
-            let monthFirst = calendar.date(from: monthFirstComps) ?? now
-            let daysInMonth = calendar.range(of: .day, in: .month, for: monthFirst)?.count ?? 31
-            dateComps.day = min(max(dueDay, 1), daysInMonth)
-            let dueDate = calendar.date(from: dateComps) ?? now
+            let dueDate = prop.rentDueDate(of: target)
             let daysDiff = calendar.dateComponents([.day], from: now, to: dueDate).day ?? 0
             let isOverdue = daysDiff < 0
             let overdueDays = isOverdue ? -daysDiff : 0
@@ -286,7 +264,7 @@ struct DashboardView: View {
             // 显示条件：逾期 或 3天内到期
             if isOverdue || daysUntilDue <= 3 {
                 // 水电结算状态：直接读取对应应收期的结算计划（有记录且未结算→需结算；有记录且已结算→已结算；无记录→不需要）
-                let utilityRecord = settlementRecord(for: prop, year: targetYear, month: targetMonth)
+                let utilityRecord = settlementRecord(for: prop, year: target.year, month: target.month)
                 let needUtilitySettlement = utilityRecord != nil && !utilityRecord!.isSettled
                 let utilitySettled = utilityRecord?.isSettled ?? true
 
@@ -294,10 +272,10 @@ struct DashboardView: View {
                     property: prop,
                     roomNumber: prop.roomNumber,
                     landlord: prop.landlord,
-                    amount: prop.monthlyRentRecords.first { $0.year == targetYear && $0.month == targetMonth }?.amount ?? (prop.rent + prop.prepayment),
-                    year: targetYear,
-                    month: targetMonth,
-                    dueDay: dueDay,
+                    amount: target.amount > 0 ? target.amount : (prop.rent + prop.prepayment),
+                    year: target.year,
+                    month: target.month,
+                    dueDay: prop.rentDueDay,
                     daysUntilDue: daysUntilDue,
                     isOverdue: isOverdue,
                     overdueDays: overdueDays,

@@ -85,9 +85,10 @@ final class LocalNotificationManager: NSObject, UNUserNotificationCenterDelegate
         var result: [UNNotificationRequest] = []
         for offset in 0..<7 {
             guard let day = calendar.date(byAdding: .day, value: offset, to: today), let fire = calendar.date(bySettingHour: 11, minute: 0, second: 0, of: day), fire > now else { continue }
-            let year = calendar.component(.year, from: day), month = calendar.component(.month, from: day)
             for p in properties where !p.isTerminated {
-                if !p.monthlyRentRecords.contains(where: { $0.year == year && $0.month == month && $0.isPaid }), let due = normalizedDate(year: year, month: month, day: p.rentDueDay) {
+                // 应收期直接取收租计划里最早一条未交记录，计划未覆盖的月份不催租
+                if let target = p.earliestUnpaidRentRecord() {
+                    let due = p.rentDueDate(of: target)
                     let days = calendar.dateComponents([.day], from: day, to: due).day ?? 99
                     if days <= 3 {
                         let body = days >= 0 ? "🟢\(p.roomNumber)房\(p.rentDueDay)号交租，还剩\(days)天，请关注！" : "🔴\(p.roomNumber)房\(p.rentDueDay)号交租，已逾期\(-days)天，请关注！"
@@ -140,7 +141,6 @@ final class LocalNotificationManager: NSObject, UNUserNotificationCenterDelegate
         return nil
     }
 
-    private func normalizedDate(year:Int, month:Int, day:Int)->Date? { let c=Calendar.current; var d=DateComponents();d.year=year;d.month=month;let b=c.date(from:d) ?? Date();d.day=min(day,c.range(of:.day,in:.month,for:b)?.count ?? 28);return c.date(from:d) }
     private func parseLeaseEnd(_ text:String)->Date? { let f=DateFormatter();f.dateFormat="yyyy.M.d";return f.date(from:text) }
     private func dateKey(_ date:Date)->String { let f=DateFormatter();f.dateFormat="yyyyMMdd";return f.string(from:date) }
     private func request(id:String,title:String,body:String,date:Date,tab:Int)->UNNotificationRequest { let c=UNMutableNotificationContent();c.title=title;c.body=body;c.sound = sound(for: category(for: title));c.badge=1;c.userInfo=["tab":tab,"plannedAt":date.timeIntervalSince1970];let d=Calendar.current.dateComponents([.year,.month,.day,.hour,.minute],from:date);return UNNotificationRequest(identifier:id,content:c,trigger:UNCalendarNotificationTrigger(dateMatching:d,repeats:false)) }

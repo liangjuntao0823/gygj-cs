@@ -85,26 +85,15 @@ enum WidgetDataSync {
         let todoReq = FetchDescriptor<TodoItem>(predicate: #Predicate { !$0.isCompleted && !$0.isDeleted })
         let todoCount = (try? modelContext.fetch(todoReq).count) ?? 0
 
-        // 2. 未收租提醒（对齐看板「未收租提醒」口径）：从当前月向后滚动找第一个未收的应收期，
-        //    该期交租日已逾期或 3 天内到期才计数（提前交下期租后提醒自动消失）
+        // 2. 未收租提醒（对齐看板「未收租提醒」口径）：应收期直接取收租计划里最早一条未交记录，
+        //    计划未覆盖的月份不计；该期交租日已逾期或 3 天内到期才计数（提前交下期租后提醒自动消失）
         let propReq = FetchDescriptor<Property>(predicate: #Predicate { !$0.isDeleted })
         let props = (try? modelContext.fetch(propReq)) ?? []
         var uncollected = 0
         var expiring = 0
         for p in props where !p.isTerminated {
-            var targetYear = year
-            var targetMonth = month
-            for _ in 0..<12 {
-                let rec = p.monthlyRentRecords.first { $0.year == targetYear && $0.month == targetMonth }
-                if rec == nil || !rec!.isPaid { break }
-                targetMonth += 1
-                if targetMonth > 12 { targetMonth = 1; targetYear += 1 }
-            }
-            var comps = DateComponents()
-            comps.year = targetYear
-            comps.month = targetMonth
-            comps.day = max(1, min(31, p.rentDueDay))
-            let dueDate = cal.date(from: comps) ?? now
+            guard let target = p.earliestUnpaidRentRecord() else { continue }
+            let dueDate = p.rentDueDate(of: target)
             let daysDiff = cal.dateComponents([.day], from: now, to: dueDate).day ?? 0
             if daysDiff <= 3 { uncollected += 1 }   // 逾期（负数）或 3 天内到期
 

@@ -1196,7 +1196,7 @@ struct AIToolExecutor {
             let cm = cal.component(.month, from: now)
             var rows: [String] = []
             for prop in props where !prop.isDeleted {
-                // 最近 6 个月未收月份
+                // 最近 6 个月未收月份（只认收租计划内的月份，首期之前不计欠租）
                 var missing: [String] = []
                 for back in 0..<6 {
                     var comps = DateComponents()
@@ -1204,7 +1204,7 @@ struct AIToolExecutor {
                     if let m = cal.date(byAdding: .month, value: -back, to: now) {
                         let y = cal.component(.year, from: m)
                         let mo = cal.component(.month, from: m)
-                        if !prop.monthlyRentRecords.contains(where: { $0.year == y && $0.month == mo && $0.isPaid }) {
+                        if let rec = prop.monthlyRentRecords.first(where: { $0.year == y && $0.month == mo }), !rec.isPaid {
                             missing.append("\(y)年\(mo)月")
                         }
                     }
@@ -1399,7 +1399,7 @@ struct AIToolExecutor {
                     if let m = cal.date(byAdding: .month, value: -back, to: now) {
                         let y = cal.component(.year, from: m)
                         let mo = cal.component(.month, from: m)
-                        if !prop.monthlyRentRecords.contains(where: { $0.year == y && $0.month == mo && $0.isPaid }) {
+                        if let rec = prop.monthlyRentRecords.first(where: { $0.year == y && $0.month == mo }), !rec.isPaid {
                             missing.append("\(y)-\(mo)")
                         }
                     }
