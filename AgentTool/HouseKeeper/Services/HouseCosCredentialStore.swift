@@ -58,3 +58,13 @@ final class HouseCosCredentialStore {
         inflight = nil
     }
 }
+
+extension CosConfig {
+    /// 从服务器签发的临时凭证构造（主 App 专属；分享扩展不参与 STS 媒体上传，
+    /// 故本工厂只放在主 App 文件，避免扩展 target 找不到凭证类型）。
+    static func sts(_ c: HouseCosCredential) -> CosConfig {
+        CosConfig(bucket: c.bucket, region: c.region, secretId: c.secretId,
+                  secretKey: c.secretKey, customDomain: "",
+                  sessionToken: c.sessionToken)
+    }
+}

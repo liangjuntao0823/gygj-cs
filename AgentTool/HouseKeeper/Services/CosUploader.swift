@@ -177,13 +177,6 @@ struct CosConfig {
         !bucket.isEmpty && !region.isEmpty && !secretId.isEmpty && !secretKey.isEmpty
     }
 
-    /// 从服务器签发的临时凭证构造（媒体上传专用；App 不持久化任何永久密钥）
-    static func sts(_ c: HouseCosCredential) -> CosConfig {
-        CosConfig(bucket: c.bucket, region: c.region, secretId: c.secretId,
-                  secretKey: c.secretKey, customDomain: "",
-                  sessionToken: c.sessionToken)
-    }
-
     /// 从钥匙串读取配置（自动去掉首尾空格，避免复制粘贴带入空白导致签名失败）
     static func load() -> CosConfig? {
         let trimSet = CharacterSet.whitespacesAndNewlines
