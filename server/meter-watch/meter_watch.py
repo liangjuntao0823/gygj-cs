@@ -906,7 +906,12 @@ class Engine:
         head = "，".join(f"{room} {s:g}度({st or '未知'})" for s, room, st in rows[:3]) or "暂无读数"
         total = len(rows)
         off_n = sum(1 for _, _, st in rows if st == "拉闸")
-        body = f"云端值守已启动：共 {total} 块表，最低 {head}；拉闸 {off_n} 户。阈值 {threshold:g} 度，每 30 分钟轮询。"
+        period = self.tenant_poll_interval(svc, tenant)
+        if period % 3600 == 0:
+            period_text = f"每 {period // 3600:g} 小时轮询"
+        else:
+            period_text = f"每 {period // 60:g} 分钟轮询"
+        body = f"云端值守已启动：共 {total} 块表，最低 {head}；拉闸 {off_n} 户。阈值 {threshold:g} 度，{period_text}。"
         self._push_tenant(svc, tenant, "公寓管家电表值守", body)
 
     # ---- CLI 辅助 ----
