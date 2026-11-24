@@ -346,17 +346,46 @@ final class MeterCloudSync {
     private var pushTask: Task<Void, Never>?
     private var lastPayloadData: Data?
     private var lastPullAt: Date?
-    // 内存缓存：真机侧载/伪签环境钥匙串单次读取可能抖动，缓存保证一次会话内 hasToken 稳定，不闪断
+    // 内存缓存：保证一次会话内 hasToken 稳定，不闪断
     private var cachedToken: String?
     private init() {}
 
-    /// 令牌读取：优先内存缓存；缓存缺失再读钥匙串并回填。两者都为空才视为无令牌，
-    /// 避免点同步/轮询时某次钥匙串读取失败被误判成“令牌已清除”。
+    // 本机沙盒兜底文件：ad-hoc 侧载（无 team）钥匙串访问组不可靠，文件仅存 App 私有容器、不上云
+    private var tokenFileURL: URL {
+        let fm = FileManager.default
+        let dir = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        if !fm.fileExists(atPath: dir.path) {
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return dir.appendingPathComponent("meter-cloud-token")
+    }
+    private func loadFileToken() -> String? {
+        guard let s = try? String(contentsOf: tokenFileURL, encoding: .utf8) else { return nil }
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty ? nil : t
+    }
+    private func saveFileToken(_ t: String) {
+        try? t.write(to: tokenFileURL, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: tokenFileURL.path)
+    }
+    private func deleteFileToken() {
+        try? FileManager.default.removeItem(at: tokenFileURL)
+    }
+
+    /// 令牌读取：内存缓存 → 钥匙串 → 本机兜底文件，任一存在即视为已接入，
+    /// 彻底避免 ad-hoc 钥匙串权限校验失败时被误判成“令牌已清除”。
     var token: String? {
         if let c = cachedToken, !c.isEmpty { return c }
         if let k = KeychainStore.load(MeterCloudConfig.tokenKey), !k.isEmpty {
             cachedToken = k
             return k
+        }
+        if let f = loadFileToken() {
+            cachedToken = f
+            _ = KeychainStore.save(f, for: MeterCloudConfig.tokenKey) // 顺手补写钥匙串
+            return f
         }
         return nil
     }
@@ -502,10 +531,12 @@ final class MeterCloudSync {
             if httpCode == 429 { throw MeterCloudError.server("尝试过于频繁，请稍后再试") }
             throw MeterCloudError.server(obj?.error ?? "接入失败（服务器 \(httpCode)）")
         }
-        let saved = KeychainStore.save(t, for: MeterCloudConfig.tokenKey)
-        // 伪签/侧载环境钥匙串可能缺 entitlement：必须回读校验，否则会“假成功”并反复 enroll 产生重复租户
-        guard saved, KeychainStore.load(MeterCloudConfig.tokenKey) == t else {
-            throw MeterCloudError.server("本机钥匙串写入失败，请检查 App 签名或重装后重试")
+        let keychainOK = KeychainStore.save(t, for: MeterCloudConfig.tokenKey)
+        // ad-hoc 侧载钥匙串可能不可靠：同时写本机沙盒兜底文件（仅本机、不上云）
+        saveFileToken(t)
+        let fileOK = loadFileToken() == t
+        guard keychainOK || fileOK else {
+            throw MeterCloudError.server("本机存储写入失败，请检查 App 签名或重装后重试")
         }
         cachedToken = t
         lastPayloadData = nil
@@ -513,8 +544,9 @@ final class MeterCloudSync {
     }
 
     func clearToken() {
-        // 真正删除钥匙串条目，并同步清空内存缓存，功能等价退出登录（不会用于请求）
+        // 退出登录：清钥匙串、本机兜底文件与内存缓存
         KeychainStore.delete(MeterCloudConfig.tokenKey)
+        deleteFileToken()
         cachedToken = nil
         lastPayloadData = nil
     }
