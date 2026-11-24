@@ -801,6 +801,9 @@ class Engine:
         is_off = str(m.get("zhuangtai") or "") == "拉闸"
         # 保护：合闸状态下平台给 0 度常是通信异常/空值，不据此误报低电量
         is_low = (not is_off) and shengyu > 0 and shengyu < threshold
+        # 与 App「低电量提醒」开关对齐：关闭时不发低电量告警，也不发低电量回升恢复通知；拉闸告警不受此开关影响
+        tenant_settings = tenant.get("settings") if isinstance(tenant.get("settings"), dict) else {}
+        low_alert_on = bool(tenant_settings.get("lowAlertEnabled", True))
 
         # 1) 拉闸：边沿立即推 + 持续复提醒 + 合闸恢复
         if is_off:
@@ -835,7 +838,7 @@ class Engine:
                     sent_titles.append(title)
 
         # 2) 低电量：边沿立即推 + 持续复提醒 + 回升恢复
-        if is_low:
+        if is_low and low_alert_on:
             if not m.get("low_active"):
                 m["low_active"] = True
                 m["low_since"] = now
@@ -859,7 +862,7 @@ class Engine:
                     sent_titles.append(title)
         elif m.get("low_active") and not is_off:
             m["low_active"] = False
-            if svc.get("notify_recovery", True) and shengyu > 0 and shengyu >= threshold:
+            if low_alert_on and svc.get("notify_recovery", True) and shengyu > 0 and shengyu >= threshold:
                 title = "【电量恢复】"
                 body = f"{label} 剩余 {shengyu:g} 度，已高于阈值 {threshold:g} 度。"
                 if self._push_tenant(svc, tenant, title, body, keys=keys) > 0:

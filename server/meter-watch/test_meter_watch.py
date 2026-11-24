@@ -640,6 +640,29 @@ class TestPeriodDedupAndEnrollIdempotent(unittest.TestCase):
         self.assertEqual(len(again), 1)
         self.assertEqual(len(self.fake.calls), 2)
 
+    def test_low_alert_disabled_setting_suppresses_alert_and_recovery(self):
+        svc = {"notify_recovery": True}
+        tenant = {"bark_keys": ["k1"], "settings": {"lowAlertEnabled": False}}
+        m = self._low_meter()
+        # 开关关闭：低电量不推告警
+        sent = self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 1000, period_seconds=3600)
+        self.assertEqual(sent, [])
+        self.assertEqual(self.fake.calls, [])
+        # 开关关闭：已记账低电量回升也不发恢复通知
+        m["low_active"] = True
+        m["shengyu"] = 40
+        sent2 = self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 2000, period_seconds=3600)
+        self.assertEqual(sent2, [])
+        self.assertEqual(self.fake.calls, [])
+        self.assertFalse(m["low_active"])  # 状态仍正常翻转，只是不打扰
+
+    def test_low_alert_enabled_by_default(self):
+        svc, tenant = {}, {"bark_keys": ["k1"]}
+        m = self._low_meter()
+        sent = self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 1000, period_seconds=3600)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(len(self.fake.calls), 1)
+
     def test_enroll_idempotent_same_user_and_device(self):
         t1 = self.store.enroll("123456", "iphone", user_token="nt_x")
         t2 = self.store.enroll("123456", "iphone", user_token="nt_x")
