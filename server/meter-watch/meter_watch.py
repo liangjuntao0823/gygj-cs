@@ -819,7 +819,8 @@ class Engine:
                     if self._push_tenant(svc, tenant, title, body, keys=keys, subtitle=subtitle) > 0:
                         m["last_off_push"] = now
                         sent_titles.append(title)
-            elif now - float(m.get("last_off_push") or 0) >= float(svc.get("off_remind_hours", 24)) * 3600:
+            elif not self._within_period(m, "last_off_push", now, period_seconds):
+                # 持续拉闸：每过一个轮询期复提醒一次（与低电量口径一致，不再按 24h 硬间隔去重）
                 rendered = self._render_alert(tenant, "off", uid, label, shengyu, threshold)
                 if rendered:
                     title, subtitle, body = rendered

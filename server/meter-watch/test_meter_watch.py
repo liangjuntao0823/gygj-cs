@@ -166,13 +166,14 @@ class TestEvaluator(unittest.TestCase):
 
     def test_off_edge_and_recover(self):
         now = 2_000_000.0
+        period = 3600.0
         m = mw._new_meter_state("2-1418下")
         m["zhuangtai"] = "拉闸"
-        titles = self.engine.evaluate_meter(self.svc, self.tenant, "u2", m, 30.0, now)
+        titles = self.engine.evaluate_meter(self.svc, self.tenant, "u2", m, 30.0, now, period_seconds=period)
         self.assertEqual(titles, ["【电表拉闸】"])
-        self.assertEqual(self.engine.evaluate_meter(self.svc, self.tenant, "u2", m, 30.0, now + 30), [])
+        self.assertEqual(self.engine.evaluate_meter(self.svc, self.tenant, "u2", m, 30.0, now + 30, period_seconds=period), [])
         m["zhuangtai"] = "合闸"
-        titles = self.engine.evaluate_meter(self.svc, self.tenant, "u2", m, 30.0, now + 60)
+        titles = self.engine.evaluate_meter(self.svc, self.tenant, "u2", m, 30.0, now + 60, period_seconds=period)
         self.assertEqual(titles, ["【电表恢复】"])
         self.assertFalse(m["off_active"])
 
@@ -670,6 +671,20 @@ class TestPeriodDedupAndEnrollIdempotent(unittest.TestCase):
         m = self._low_meter()
         self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 1000, period_seconds=3600)
         self.assertTrue(m["low_active"])
+        # 未超期：抑制
+        self.assertEqual(self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 2000, period_seconds=3600), [])
+        self.assertEqual(len(self.fake.calls), 1)
+        # 超期：复推
+        again = self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 5000, period_seconds=3600)
+        self.assertEqual(len(again), 1)
+        self.assertEqual(len(self.fake.calls), 2)
+
+    def test_off_active_state_repeats_each_period(self):
+        # 持续拉闸（off_active 保持 True）：同一轮询期内抑制，超过一个轮询期复提醒一次（与低电量口径一致）
+        svc, tenant = {}, {"bark_keys": ["k1"]}
+        m = {"shengyu": 10, "zhuangtai": "拉闸"}
+        self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 1000, period_seconds=3600)
+        self.assertTrue(m["off_active"])
         # 未超期：抑制
         self.assertEqual(self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 2000, period_seconds=3600), [])
         self.assertEqual(len(self.fake.calls), 1)
