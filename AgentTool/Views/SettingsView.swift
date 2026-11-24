@@ -98,6 +98,8 @@ struct SettingsView: View {
     @State private var meterLinkTip: String?
     /// v2.18：全量备份进度（0~1）；nil = 没在跑。此前只有一句「正在生成全量备份…」，几十秒没反馈像卡死
     @ObservedObject private var backupProgress = FullBackupProgressHub.shared
+    // b206：一级菜单「云端推送」副标题实时反映绑定账号、设备数与电表通知开关
+    @ObservedObject private var notifyHub = NotifyHub.shared
 
     /// v1.41：刷新分享水印入口副标题（返回设置页 / 页面出现时读取最新 store，立即反映开关状态）
     private func refreshWatermarkSubtitle() {
@@ -1043,6 +1045,10 @@ struct SettingsView: View {
                                 subtitle: "电费 / 水费单价 · 默认预存 · 账单模板") { DefaultsSettingsPage() }
                     settingsRow("外部服务", icon: "antenna.radiowaves.left.and.right",
                                 subtitle: "电表监控 · 安居客后台 · AI 助手") { ServicesSettingsPage() }
+                    settingsRow("云端推送", icon: "bell.badge.fill",
+                                subtitle: notifyHub.isBound
+                                    ? "\(notifyHub.username.isEmpty ? "已绑定" : notifyHub.username) · \(notifyHub.devices.count) 台设备 · 电表通知\(notifyHub.channelEnabled && notifyHub.meterModuleEnabled ? "开" : "关")"
+                                    : "未绑定 · 电表告警 / 将来到期收租通知") { CloudPushSettingsView() }
                     settingsRow("存储与清理", icon: "internaldrive",
                                 subtitle: "数据文件夹 · AI 产物 · 下载的安装包 · 桶孤儿媒体") { StorageSettingsPage() }
                     // v2.51：电梯码（全屏展示 + 更换 + 一键打开方式）
@@ -1054,6 +1060,10 @@ struct SettingsView: View {
                     Text("点分组进对应的二级页；最下面「关于」仍是本机版本、检查更新与更新介绍。")
                 }
                 aboutSection
+            }
+            .task {
+                // 进入设置页静默刷新推送账号档案（开关/设备数/最近投递）；失败保留本机缓存展示
+                if NotifyHub.shared.isBound { await NotifyHub.shared.refreshMe() }
             }
             // v1.9：背景挂载滚动监听（不占任何 Form 行/间距，顶部不再有空白行）
             .background(

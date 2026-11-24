@@ -453,7 +453,7 @@ final class MeterCloudSync {
                 if enabled { lastPayloadData = body }
                 defaults.set(false, forKey: MeterCloudConfig.dirtyKey)
                 let t = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
-                store.cloudStatusText = enabled ? "已同步 · \(t)" : "云端值守已关闭"
+                store.cloudStatusText = enabled ? "已同步 · \(t)" : "云端轮询已关闭"
                 return true
             }
             defaults.set(true, forKey: MeterCloudConfig.dirtyKey)
@@ -523,6 +523,44 @@ final class MeterCloudSync {
         }
     }
 
+    // MARK: 手动立即轮询（b206：不用等云端间隔，服务器唤醒 worker 立即查一轮；HTTP 只入队，异步执行立即返回）
+
+    func runNow(store: MeterStore) async -> String {
+        guard let endpoint = currentEndpoint(store: store),
+              let token = token, !token.isEmpty,
+              let url = URL(string: endpoint + "/api/meter/run-now") else {
+            return "尚未接入云端轮询（服务器地址或接入令牌缺失）"
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 12
+        req.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.httpBody = Data("{}".utf8)
+        struct RunNowAck: Codable {
+            let ok: Bool?
+            let queued: Bool?
+            let error: String?
+            let hint: String?
+            let retry_after: Int?
+        }
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            let ack = try? JSONDecoder().decode(RunNowAck.self, from: data)
+            if code == 200, ack?.ok == true {
+                return "已通知服务器立即轮询，约十几秒到两分钟完成；有告警会即时推送，稍后进入电表页可看云端更新时间"
+            }
+            if code == 409 { return ack?.hint ?? "请先开启云端轮询并同步成功后，再点立即轮询" }
+            if code == 429 { return "操作太频繁，请 \(ack?.retry_after ?? 10) 秒后再点" }
+            if code == 401 { return "云端令牌已失效，请重新填写电表接入码" }
+            let detail = ack?.error.map { "：\($0)" } ?? ""
+            return "触发失败（服务器 \(code)）\(detail)"
+        } catch {
+            return "触发失败：\(error.localizedDescription)"
+        }
+    }
+
     // MARK: 看板进入时拉取云端快照（3s 仅去重同一次进入的重复 onAppear，等同每次进入都拉；开关关闭直接返回，保持纯手动模式）
 
     func pullSnapshotIfNeeded(store: MeterStore, force: Bool) async {
@@ -559,7 +597,7 @@ final class MeterCloudSync {
             if let round = decoded.lastRoundAt, round > 0 {
                 store.cloudStatusText = "云端数据 \(fmt.string(from: Date(timeIntervalSince1970: round)))"
             } else {
-                store.cloudStatusText = "云端值守已开启，等待服务器首轮巡检"
+                store.cloudStatusText = "云端轮询已开启，等待服务器首轮查询"
             }
         } catch {
             store.cloudStatusText = "云端快照获取失败：\(error.localizedDescription)"
@@ -696,7 +734,7 @@ final class NotifyHub: ObservableObject {
                          auth: Bool = true) async throws -> NotifyHubResponse {
         guard let url = buildURL(sub) else {
             throw NSError(domain: "NotifyHub", code: -1,
-                          userInfo: [NSLocalizedDescriptionKey: "服务器地址无效，可到「电表监控设置 → 云端值守」检查服务器地址"])
+                          userInfo: [NSLocalizedDescriptionKey: "服务器地址无效，可到「电表监控设置 → 云端轮询 → 电表云端接入」检查服务器地址"])
         }
         var req = URLRequest(url: url)
         req.httpMethod = method

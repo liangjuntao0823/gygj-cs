@@ -54,7 +54,7 @@ struct MeterSettingsDetailView: View {
             } header: {
                 Text("查询链接")
             } footer: {
-                Text("从微信复制电表缴费页链接粘贴到这里，App 会解析 openId 作为查询身份。换微信后需更换链接（openId 随微信账号变化）。链接默认仅保存在本机；若开启下方「云端值守」，查询链接与 openId、电表清单会同步到你自己配置的服务器，用于服务器云端定时轮询与告警推送（轮询频率可在下方云端值守区自行设置）。")
+                Text("从微信复制电表缴费页链接粘贴到这里，App 会解析 openId 作为查询身份。换微信后需更换链接（openId 随微信账号变化）。链接默认仅保存在本机；若开启下方「云端轮询」，查询链接与 openId、电表清单会同步到你自己配置的服务器，用于服务器云端定时轮询（频率可在下方自行设置）；查出来的告警是否推送到手机，由设置一级菜单「云端推送」里的电表通知开关控制。")
             }
 
             Section {
@@ -167,6 +167,7 @@ private struct MeterCloudWatchSection: View {
     @State private var pollTag: Int = 30          // 云端轮询预设：30/60/120 分钟，0=自定义
     @State private var customPollInput = ""
     @State private var pollTip: String?
+    @State private var runningNow = false         // 「立即轮询一次」请求中
 
     @MainActor
     private var sync: MeterCloudSync { MeterCloudSync.shared }
@@ -184,22 +185,17 @@ private struct MeterCloudWatchSection: View {
                 get: { store.settings.cloudWatchEnabled },
                 set: { onToggle($0) }
             )) {
-                Label("开启云端值守", systemImage: "cloud.bolt.fill")
+                Label("开启云端轮询", systemImage: "cloud.bolt.fill")
                     .font(.system(size: 14))
             }
-            .disabled(busy)
-
-            NavigationLink {
-                NotifyHubSettingsView()
-            } label: {
-                Label("统一推送通道（多设备 · 账号隔离）", systemImage: "bell.badge.fill")
-                    .font(.system(size: 13, weight: .semibold))
-            }
+            .disabled(busy || runningNow)
 
             pollIntervalBlock
 
-            if store.settings.cloudWatchEnabled || tokenSaved || busy {
-                VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 10) {
+                    Text("电表云端接入")
+                        .font(.system(size: 12))
+                        .foregroundColor(.themeText3)
                     Text("服务器地址")
                         .font(.system(size: 12))
                         .foregroundColor(.themeText3)
@@ -220,7 +216,7 @@ private struct MeterCloudWatchSection: View {
 
                     if tokenSaved {
                         HStack(spacing: 6) {
-                            Label("本机已保存云端令牌", systemImage: "checkmark.shield.fill")
+                            Label("本机已保存电表云端令牌", systemImage: "checkmark.shield.fill")
                                 .font(.system(size: 12))
                                 .foregroundColor(.themeAccentDark)
                             Spacer()
@@ -229,7 +225,7 @@ private struct MeterCloudWatchSection: View {
                         }
                     } else {
                         VStack(alignment: .leading, spacing: 7) {
-                            TextField("首次使用填接入码（向服务器部署者获取）", text: $codeInput)
+                            TextField("首次使用填电表接入码（测试期 123456）", text: $codeInput)
                                 .textInputAutocapitalization(.never)
                                 .autocorrectionDisabled()
                                 .font(.system(size: 13))
@@ -271,13 +267,17 @@ private struct MeterCloudWatchSection: View {
                             Button {
                                 Task { _ = await sync.pushConfig(store: store, enabled: true) }
                             } label: {
-                                Label("立即同步", systemImage: "arrow.clockwise")
+                                Label("立即同步配置", systemImage: "arrow.clockwise")
                             }
                             Button {
-                                Task { await runTestPush() }
+                                Task { await runNow() }
                             } label: {
-                                Label("测试推送", systemImage: "bell.badge")
+                                HStack(spacing: 5) {
+                                    if runningNow { ProgressView().controlSize(.small) }
+                                    Label("立即轮询一次", systemImage: "bolt.fill")
+                                }
                             }
+                            .disabled(runningNow)
                             Spacer()
                         }
                         .font(.system(size: 12, weight: .semibold))
@@ -285,11 +285,17 @@ private struct MeterCloudWatchSection: View {
                     }
                 }
                 .padding(.vertical, 2)
+
+            NavigationLink {
+                CloudPushSettingsView()
+            } label: {
+                Label("通知开关与 Bark 推送通道", systemImage: "bell.badge.fill")
+                    .font(.system(size: 13, weight: .semibold))
             }
         } header: {
-            Text("云端值守（测试）")
+            Text("云端轮询（测试）")
         } footer: {
-            Text("开启后，查询链接/openId、低电量阈值、提醒开关、轮询间隔与电表清单会自动同步到你的服务器，由服务器按你设置的云端轮询间隔（默认 30 分钟，可选 30 分钟/1 小时/2 小时或自定义）自动轮询，达到阈值或拉闸时经自建 Bark 推送；之后在本机改阈值、间隔、新增/删除电表也会自动同步。开关开启时，每次进入电表首页会自动获取云端最近一轮数据；关闭后完全保持手动刷新。长期令牌只保存在本机钥匙串。")
+            Text("这个开关只决定服务器要不要按间隔替你查询电表（查询链接/openId、阈值、间隔与电表清单会自动同步；开启时进电表首页自动拉取云端快照，关闭后保持纯手动刷新）。查出来的告警要不要推送到手机，由「设置 → 云端推送 → 电表推送」开关控制（需先在下方接入电表云端，并在云端推送页绑定 Bark）。长期令牌只存本机钥匙串。")
         }
         .onAppear {
             endpointInput = store.settings.cloudEndpoint
@@ -349,7 +355,7 @@ private struct MeterCloudWatchSection: View {
                 }
             }
 
-            Text("云端值守开启并同步后，由服务器按此频率代你轮询电表平台；未开启时选择先保存在本机。它与本页上方仅在 App 打开时生效的「定时自动刷新」是两套机制。保存并同步后服务器约半分钟内按新间隔调度、无需重启；间隔越短查询越频繁，建议不低于 10–30 分钟，避免被电表平台限流。")
+            Text("云端轮询开启并同步后，由服务器按此频率代你查询电表平台；未开启时选择先保存在本机。它与本页上方仅在 App 打开时生效的「定时自动刷新」是两套机制。保存并同步后服务器约半分钟内按新间隔调度、无需重启；间隔越短查询越频繁，建议不低于 10–30 分钟，避免被电表平台限流。")
                 .font(.system(size: 10))
                 .foregroundColor(.themeText3)
         }
@@ -397,7 +403,7 @@ private struct MeterCloudWatchSection: View {
             }
         }
         guard sync.hasToken else {
-            tip = "请先填写接入码并验证成功，再开启云端值守"
+            tip = "请先在下方「电表云端接入」填写接入码并验证成功，再开启云端轮询"
             return
         }
         UserDefaults.standard.set(true, forKey: MeterCloudConfig.wasEnabledKey)
@@ -451,10 +457,11 @@ private struct MeterCloudWatchSection: View {
     }
 
     @MainActor
-    private func runTestPush() async {
-        busy = true
-        defer { busy = false }
-        tip = await sync.sendTestPush(store: store)
+    private func runNow() async {
+        runningNow = true
+        defer { runningNow = false }
+        let result = await sync.runNow(store: store)
+        store.cloudStatusText = result
     }
 }
 
@@ -502,7 +509,7 @@ struct NotifyHubSettingsView: View {
                         .foregroundColor(.themeAccentDark)
                 }
             } footer: {
-                Text("推送通道与电表云端值守共用同一台服务器，地址可在「电表监控设置 → 云端值守」修改。通道按账号隔离：服务器只把事件发到该账号绑定的手机，将来多人使用也不会互推。")
+                Text("推送通道与电表云端轮询共用同一台服务器，地址可在「电表监控设置 → 云端轮询 → 电表云端接入」修改。通道按账号隔离：服务器只把事件发到该账号绑定的手机，将来多人使用也不会互推；各业务模块的通知开关在「设置 → 云端推送」首页。")
             }
 
             if !hub.isBound {
@@ -635,19 +642,14 @@ struct NotifyHubSettingsView: View {
 
     private var switchSection: some View {
         Section {
-            Toggle("启用云端推送通道", isOn: Binding(
+            Toggle("启用云端推送通道（总开关）", isOn: Binding(
                 get: { hub.channelEnabled },
                 set: { on in Task { await hub.updatePrefs(channelEnabled: on) } }
             ))
-            Toggle("电表告警（低电量 / 拉闸 / 值守）", isOn: Binding(
-                get: { hub.meterModuleEnabled },
-                set: { on in Task { await hub.updatePrefs(meterEnabled: on) } }
-            ))
-            .disabled(!hub.channelEnabled)
         } header: {
-            Text("投递开关")
+            Text("通道总开关")
         } footer: {
-            Text("关闭总开关后，服务器不再向你的设备推送，也不会回退到服务器全局 Key；电表是第一个接入模块，后续到期提醒、收租提醒等会在这里增加独立开关。")
+            Text("关闭后服务器不再向你的设备推送任何模块通知，也不会回退到服务器全局 Key。电表等业务模块的独立通知开关在「设置 → 云端推送」首页；后续到期提醒、收租提醒等也会加到那里。")
         }
     }
 
@@ -843,5 +845,83 @@ struct NotifyHubSettingsView: View {
         case "failed": return .red
         default: return .themeText3
         }
+    }
+}
+
+// MARK: - 一级菜单「云端推送」（b206）
+// 统一通知设置首页：本页只放“收不收业务通知”的模块开关（当前仅电表推送，后续扩展到期/收租/待办）；
+// Bark 绑定、多设备、通道总开关、通道测试与最近投递记录收进二级页 NotifyHubSettingsView。
+// 注意与「电表监控设置 → 云端轮询」的分工：轮询开关决定服务器查不查电表，本页开关决定查出来的告警推不推到手机。
+
+struct CloudPushSettingsView: View {
+    @ObservedObject private var hub = NotifyHub.shared
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle(isOn: Binding(
+                    get: { hub.meterModuleEnabled },
+                    set: { on in Task { await hub.updatePrefs(meterEnabled: on) } }
+                )) {
+                    Label("电表推送", systemImage: "bolt.batteryblock.fill")
+                        .font(.system(size: 14))
+                }
+                .disabled(!hub.isBound || !hub.channelEnabled)
+            } header: {
+                Text("通知开关")
+            } footer: {
+                Text(meterFooter)
+            }
+
+            Section {
+                HStack {
+                    Label("推送通道", systemImage: "antenna.radiowaves.left.and.right")
+                        .font(.system(size: 13))
+                    Spacer()
+                    if hub.isBound {
+                        Text(channelSummary)
+                            .font(.system(size: 11))
+                            .foregroundColor(.themeAccentDark)
+                            .lineLimit(1)
+                    } else {
+                        Text("未绑定")
+                            .font(.system(size: 12))
+                            .foregroundColor(.red)
+                    }
+                }
+                NavigationLink {
+                    NotifyHubSettingsView()
+                } label: {
+                    Label(hub.isBound ? "通道账号、设备、测试与投递记录" : "绑定 Bark 推送通道",
+                          systemImage: "bell.badge.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                }
+            } header: {
+                Text("推送通道")
+            } footer: {
+                Text("通道按账号隔离，事件只投到本账号绑定的手机；首次使用先进入上方绑定 Bark 首页推送链接。电表“要不要服务器轮询查询”在「电表监控设置 → 云端轮询」里控制，与本页“要不要接收通知”相互独立。后续到期、收租、待办等提醒会在本页增加独立开关。")
+            }
+        }
+        .navigationTitle("云端推送")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            if hub.isBound { Task { await hub.refreshMe() } }
+        }
+    }
+
+    private var channelSummary: String {
+        let name = hub.username.isEmpty ? "已绑定" : hub.username
+        let state = hub.channelEnabled ? "总开关开" : "总开关关"
+        return "\(name) · \(hub.devices.count) 台设备 · \(state)"
+    }
+
+    private var meterFooter: String {
+        if !hub.isBound {
+            return "请先在下方「推送通道」绑定 Bark，绑定成功后才能接收电表告警。"
+        }
+        if !hub.channelEnabled {
+            return "推送通道总开关已关闭；请先到下方「通道账号、设备、测试与投递记录」打开总开关，再设置电表推送。"
+        }
+        return "控制服务器云端轮询产生的低电量、拉闸、值守告警是否推送到本账号设备。关闭后服务器仍会按「电表监控设置 → 云端轮询」的开关与间隔查询并更新云端快照，但不发通知；重新打开即恢复推送。"
     }
 }
