@@ -990,9 +990,8 @@ struct HouseBatchImportView: View {
 
     /// 服务器模式批量导入：媒体走服务器 STS 临时凭证传 COS，文本逐套推服务器权威库；
     /// 文本失败入待补传队列联网自动重试，媒体失败入媒体补传队列。返回未同步成功的房号。
-    @MainActor
     private func syncBatchToServer(houses: [House], flowTitle: String,
-                                   summary: inout BatchImportSummary) -> [String] {
+                                   summary: inout BatchImportSummary) async -> [String] {
         let totalUnits = max(1, houses.reduce(0) { $0 + $1.mediaItems.count } + houses.count)
         let importID = syncCenter.begin(kind: .media, title: flowTitle,
                                         roomKeys: houses.map { $0.mediaRoomKey }, total: totalUnits)
