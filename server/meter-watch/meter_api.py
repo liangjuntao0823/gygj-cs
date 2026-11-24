@@ -351,23 +351,30 @@ def serve(store: mw.Store, engine: mw.Engine) -> int:
     signal.signal(signal.SIGTERM, _handle_stop)
     signal.signal(signal.SIGINT, _handle_stop)
 
-    interval = max(60, int(svc.get("poll_interval_seconds") or 1800))
+    # 常驻 worker 以固定细粒度 tick 唤醒：定时分支只跑“按各自间隔到期”的租户（间隔由 App 下发并随
+    # tenants.json 每轮热加载，改间隔无需重启服务）；App 保存配置触发的 wake 仍立即全量跑一轮（3s 合并防抖）。
+    tick_seconds = max(15, min(300, int(svc.get("scheduler_tick_seconds") or 30)))
     try:
         engine.run_all(startup=True)
     except Exception:
         mw.log.exception("启动首轮值守异常（不影响同步 API）")
 
     while not stop.is_set():
-        awakened = wake.wait(timeout=interval)
+        awakened = wake.wait(timeout=tick_seconds)
         if stop.is_set():
             break
         if awakened:
             wake.clear()
             time.sleep(3)   # 合并 App 连续保存（设置+清单可能分多次 PUT）
-        try:
-            engine.run_all(startup=False)
-        except Exception:
-            mw.log.exception("值守轮询异常，下一轮重试")
+            try:
+                engine.run_all(startup=False)
+            except Exception:
+                mw.log.exception("唤醒值守轮询异常，下一轮重试")
+        else:
+            try:
+                engine.run_all(startup=False, only_due=True)
+            except Exception:
+                mw.log.exception("值守调度异常，下一 tick 重试")
 
     try:
         httpd.shutdown()

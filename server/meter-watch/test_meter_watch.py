@@ -269,6 +269,110 @@ class TestStore(unittest.TestCase):
         self.assertEqual(mw.parse_open_id("not a link"), "")
 
 
+class TestTenantPollSchedule(unittest.TestCase):
+    """租户级云端轮询间隔：App 下发入库校验 + worker only_due 到期过滤。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = mw.Store(self.tmp.name)
+        self.engine = mw.Engine(self.store, dry_run=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _enroll_enabled(self, poll=None):
+        token = self.store.enroll(str(self.store.svc["enroll_code"]), "iphone-test")
+        settings = {"openId": "ox-" + token[:6], "lowThreshold": 30}
+        if poll is not None:
+            settings["pollIntervalSeconds"] = poll
+        tenant = self.store.upsert_config(
+            token, {"enabled": True, "settings": settings, "meters": []})
+        return token, tenant
+
+    def test_upsert_poll_interval_default_clamp_keep_alias_bad(self):
+        _, tenant = self._enroll_enabled()
+        self.assertEqual(tenant["settings"]["pollIntervalSeconds"], 1800)  # 缺省 30 分钟
+
+        token, _ = self._enroll_enabled(poll=3600)
+        self.assertEqual(self.store.load_tenants()[token]["settings"]["pollIntervalSeconds"], 3600)
+
+        tenant = self.store.upsert_config(token, {"settings": {"pollIntervalSeconds": 1}})
+        self.assertEqual(tenant["settings"]["pollIntervalSeconds"], mw.MIN_TENANT_POLL_SECONDS)
+
+        tenant = self.store.upsert_config(token, {"settings": {"pollIntervalSeconds": 999999}})
+        self.assertEqual(tenant["settings"]["pollIntervalSeconds"], mw.MAX_TENANT_POLL_SECONDS)
+
+        # 旧版 App 报文不带该字段：保留服务端已存值，不被默认覆盖，其余字段正常合并
+        tenant = self.store.upsert_config(token, {"settings": {"openId": "ox-keep"}})
+        self.assertEqual(tenant["settings"]["pollIntervalSeconds"], mw.MAX_TENANT_POLL_SECONDS)
+        self.assertEqual(tenant["settings"]["openId"], "ox-keep")
+
+        # 兼容下划线命名
+        tenant = self.store.upsert_config(token, {"settings": {"poll_interval_seconds": 600}})
+        self.assertEqual(tenant["settings"]["pollIntervalSeconds"], 600)
+
+        # 脏值回退内置默认
+        tenant = self.store.upsert_config(token, {"settings": {"pollIntervalSeconds": "abc"}})
+        self.assertEqual(tenant["settings"]["pollIntervalSeconds"], 1800)
+
+    def test_tenant_poll_interval_priority_and_global_fallback(self):
+        tenant = {"settings": {"pollIntervalSeconds": 7200}}
+        self.assertEqual(mw.Engine.tenant_poll_interval({"poll_interval_seconds": 1800}, tenant), 7200)
+        # 租户未设置 → 服务器全局
+        self.assertEqual(
+            mw.Engine.tenant_poll_interval({"poll_interval_seconds": 7200}, {"settings": {}}), 7200)
+        self.assertEqual(mw.Engine.tenant_poll_interval({"poll_interval_seconds": 7200}, {}), 7200)
+        # 全局也没有 → 内置默认
+        self.assertEqual(mw.Engine.tenant_poll_interval({}, {}), 1800)
+        # 读取时同样 clamp
+        self.assertEqual(
+            mw.Engine.tenant_poll_interval({}, {"settings": {"pollIntervalSeconds": 10}}), 300)
+
+    def test_run_all_only_due_filters_by_tenant_interval(self):
+        now = mw.now_ts()
+        token_a, _ = self._enroll_enabled(poll=3600)   # A：1 小时
+        token_b, _ = self._enroll_enabled(poll=300)    # B：5 分钟（下限档）
+
+        doc = self.store.load_state_doc()
+        doc["tenants"][token_a] = mw._new_tenant_state()
+        doc["tenants"][token_a]["last_round_at"] = now - 7200   # A 上轮在 2 小时前 → 到期
+        doc["tenants"][token_b] = mw._new_tenant_state()
+        doc["tenants"][token_b]["last_round_at"] = now          # B 刚跑完 → 未到期
+        self.store.save_state_doc(doc)
+
+        ran = []
+
+        def fake_run_tenant(tok, svc, tenant, ts, startup):
+            ran.append(tok)
+            ts["last_round_at"] = mw.now_ts()
+
+        self.engine.run_tenant = fake_run_tenant  # type: ignore[method-assign]
+
+        self.engine.run_all(startup=False, only_due=True)
+        self.assertEqual(ran, [token_a])  # 定时 tick 只跑到期的 A，B 被跳过且不刷新其 last_round
+
+        # 非 only_due（启动首轮 / App 保存唤醒）保持全量逐租户执行
+        ran.clear()
+        self.engine.run_all(startup=False)
+        self.assertEqual(set(ran), {token_a, token_b})
+
+    def test_run_all_only_due_runs_never_ran_tenant(self):
+        # 从未成功轮询（last_round_at=0）的启用租户，首个 tick 就应执行，不能被间隔挡住
+        token, _ = self._enroll_enabled(poll=3600)
+        ran = []
+        self.engine.run_tenant = lambda tok, *a, **k: ran.append(tok)  # type: ignore[method-assign]
+        self.engine.run_all(startup=False, only_due=True)
+        self.assertEqual(ran, [token])
+
+    def test_run_all_only_due_skips_disabled(self):
+        token, _ = self._enroll_enabled(poll=3600)
+        self.store.upsert_config(token, {"enabled": False})
+        ran = []
+        self.engine.run_tenant = lambda tok, *a, **k: ran.append(tok)  # type: ignore[method-assign]
+        self.engine.run_all(startup=False, only_due=True)
+        self.assertEqual(ran, [])
+
+
 class TestApiFlow(unittest.TestCase):
     def setUp(self):
         CloudHandler._enroll_fails.clear()
@@ -331,7 +435,8 @@ class TestApiFlow(unittest.TestCase):
 
         code, obj = self._req("PUT", "/api/meter/config", token=token, body={
             "enabled": True,
-            "settings": {"openId": "ox-api", "lowThreshold": 50, "lowAlertEnabled": True},
+            "settings": {"openId": "ox-api", "lowThreshold": 50, "lowAlertEnabled": True,
+                         "pollIntervalSeconds": 3600},
             "meters": [{"uid": "u1", "room": "1-2334上"}, {"uid": "u2", "room": ""}],
         })
         self.assertEqual(code, 200)
@@ -341,6 +446,7 @@ class TestApiFlow(unittest.TestCase):
         saved = self.store.load_tenants()[token]
         self.assertEqual(saved["settings"]["lowThreshold"], 50.0)
         self.assertEqual(saved["settings"]["openId"], "ox-api")
+        self.assertEqual(saved["settings"]["pollIntervalSeconds"], 3600)
         self.assertEqual([m["uid"] for m in saved["meters"]], ["u1", "u2"])
 
         code, obj = self._req("GET", "/api/meter/state", token=token)

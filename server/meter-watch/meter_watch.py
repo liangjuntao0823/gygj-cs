@@ -81,6 +81,11 @@ DEFAULT_SERVICE: dict[str, Any] = {
 MAX_METERS_PER_TENANT = 500
 MAX_BARK_KEYS = 10
 
+# 租户级云端轮询间隔（App「服务器轮询间隔」下发，单位秒）：快捷档 30/60/120 分钟，允许自定义 5～1440 分钟
+DEFAULT_TENANT_POLL_SECONDS = 1800
+MIN_TENANT_POLL_SECONDS = 300
+MAX_TENANT_POLL_SECONDS = 86400
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [meter-watch] %(message)s",
@@ -439,12 +444,24 @@ class Store:
             provider = str(incoming_s.get("provider") or cur.get("provider") or "direct")
             if provider not in ("direct", "webview"):
                 provider = "direct"
+            # 租户级云端轮询间隔（秒）：App 用 pollIntervalSeconds 下发，兼容下划线命名；
+            # 旧 App 报文不带该字段时保留已存值，再缺省 1800；统一夹到 5 分钟～24 小时。
+            cur_poll = cur.get("pollIntervalSeconds", cur.get("poll_interval_seconds",
+                                                              DEFAULT_TENANT_POLL_SECONDS))
+            poll_raw = incoming_s.get("pollIntervalSeconds",
+                                      incoming_s.get("poll_interval_seconds", cur_poll))
+            try:
+                poll_iv = int(float(poll_raw))
+            except (TypeError, ValueError):
+                poll_iv = DEFAULT_TENANT_POLL_SECONDS
+            poll_iv = max(MIN_TENANT_POLL_SECONDS, min(MAX_TENANT_POLL_SECONDS, poll_iv))
             tenant["settings"] = {
                 "queryLink": str(incoming_s.get("queryLink", cur.get("queryLink", "")))[:2000],
                 "openId": str(incoming_s.get("openId", cur.get("openId", "")))[:200],
                 "lowThreshold": low,
                 "lowAlertEnabled": bool(incoming_s.get("lowAlertEnabled", cur.get("lowAlertEnabled", True))),
                 "provider": provider,
+                "pollIntervalSeconds": poll_iv,
             }
             # 若 App 只给了链接没解析出 openId，服务端兜底解析一次
             if not tenant["settings"]["openId"] and tenant["settings"]["queryLink"]:
@@ -582,7 +599,25 @@ class Engine:
                 keys.append(k)
         return [str(k) for k in keys if str(k).strip()]
 
-    def run_all(self, startup: bool = False, only_token: str | None = None) -> None:
+    @staticmethod
+    def tenant_poll_interval(svc: dict[str, Any], tenant: dict[str, Any]) -> int:
+        """该租户云端值守轮询间隔（秒）。
+
+        优先级：租户 App 下发的 settings.pollIntervalSeconds → 服务器全局 poll_interval_seconds
+        （旧租户/旧 App 兼容）→ 内置 1800；结果统一夹到 5 分钟～24 小时。
+        """
+        settings = tenant.get("settings") if isinstance(tenant.get("settings"), dict) else {}
+        raw = settings.get("pollIntervalSeconds", settings.get("poll_interval_seconds"))
+        if raw in (None, ""):
+            raw = (svc or {}).get("poll_interval_seconds") or DEFAULT_TENANT_POLL_SECONDS
+        try:
+            iv = int(float(raw))
+        except (TypeError, ValueError):
+            iv = DEFAULT_TENANT_POLL_SECONDS
+        return max(MIN_TENANT_POLL_SECONDS, min(MAX_TENANT_POLL_SECONDS, iv))
+
+    def run_all(self, startup: bool = False, only_token: str | None = None,
+                only_due: bool = False) -> None:
         svc = self.store.svc
         tenants = self.store.load_tenants()
         doc = self.store.load_state_doc()
@@ -592,6 +627,15 @@ class Engine:
                 if only_token and token != only_token:
                     continue
                 ts = tstates.setdefault(token, _new_tenant_state())
+                if only_due:
+                    # 定时 tick（非 App 唤醒）：按该租户自己的间隔与上轮实际执行时间判断是否到期，
+                    # 多账号可各自 30/60/120 分钟而互不影响；未启用或未到期直接跳过，且不刷新 last_round_at。
+                    if not tenant.get("enabled"):
+                        continue
+                    last_round = float(ts.get("last_round_at") or 0.0)
+                    interval = self.tenant_poll_interval(svc, tenant)
+                    if last_round > 0 and now_ts() - last_round < interval:
+                        continue
                 try:
                     self.run_tenant(token, svc, tenant, ts, startup)
                 except Exception as e:  # 单租户兜底，不影响其他租户与常驻进程
