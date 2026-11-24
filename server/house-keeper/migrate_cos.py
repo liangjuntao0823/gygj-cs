@@ -19,6 +19,7 @@ import json
 import time
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any, Callable
 
 # 与客户端 MediaNaming 同口径：视频 .mov -> .mp4
@@ -148,3 +149,39 @@ def run_migration(store: Any, client: CosXMLClient,
             result["failed"] += 1
             logger(f"失败 {key}: {e}")
     return result
+
+
+def _main(argv: list[str] | None = None) -> int:
+    import argparse
+    import os
+    import sys
+
+    p = argparse.ArgumentParser(description="存量 COS 房源一次性迁移到服务器 SQLite")
+    p.add_argument("--db", default=os.environ.get("HOUSE_DB", "/opt/meter-watch/house.db"),
+                   help="房源 SQLite 路径（默认 HOUSE_DB 或 /opt/meter-watch/house.db）")
+    args = p.parse_args(argv)
+
+    secret_id = os.environ.get("COS_SECRET_ID", "")
+    secret_key = os.environ.get("COS_SECRET_KEY", "")
+    app_id = os.environ.get("COS_APP_ID", "")
+    bucket = os.environ.get("COS_BUCKET", "")
+    region = os.environ.get("COS_REGION", "")
+    missing = [k for k, v in (
+        ("COS_SECRET_ID", secret_id), ("COS_SECRET_KEY", secret_key),
+        ("COS_APP_ID", app_id), ("COS_BUCKET", bucket), ("COS_REGION", region)) if not v]
+    if missing:
+        print("缺少环境变量: " + ", ".join(missing))
+        return 2
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import house_store as hs
+
+    store = hs.HouseStore(args.db)
+    client = CosXMLClient(secret_id, secret_key, bucket, region)
+    result = run_migration(store, client)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
