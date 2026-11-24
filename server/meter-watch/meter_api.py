@@ -11,6 +11,7 @@
     PUT  /api/meter/config    全量同步开关/设置/电表清单（Bearer），写入后唤醒值守线程
     GET  /api/meter/state     读取最近一轮云端值守快照（App 进电表页时拉取）
     POST /api/meter/test-push 向该租户 Bark 设备发一条测试推送（Bearer）
+    POST /api/meter/run-now 手动触发该租户立即轮询一轮（Bearer，10 秒节流，唤醒 worker 异步执行）
 
 鉴权：除 health/enroll 外均需 `Authorization: Bearer <tenant token>`；
 token 由 enroll 生成并作为 tenants.json 的键持久化（文件 600，部署时注意备份权限）。
@@ -55,6 +56,11 @@ class CloudHandler(BaseHTTPRequestHandler):
     # 接入码试错节流（所有请求线程共享）
     _enroll_lock = threading.Lock()
     _enroll_fails: dict[str, list[float]] = {}
+
+    # run-now 手动立即轮询：同一租户两次触发最小间隔，防止连点导致集中请求电表平台被限流
+    _run_now_lock = threading.Lock()
+    _run_now_last: dict[str, float] = {}
+    RUN_NOW_MIN_INTERVAL_SEC = 10.0
 
     # ---- 基础 ----
     def log_message(self, fmt: str, *args) -> None:  # 走统一日志，不刷默认 stderr
@@ -244,6 +250,45 @@ class CloudHandler(BaseHTTPRequestHandler):
             self._enroll_clear(ip)
             self._send({"ok": True, "token": token, "token_type": "Bearer"})
             return
+        if path == "/api/meter/run-now":
+            auth = self._require_auth()
+            if not auth:
+                return
+            token, tenant = auth
+            # 未开启云端轮询的租户不允许触发（App 按钮也只在开启后展示，服务端兜底）
+            if not tenant.get("enabled"):
+                self._send({"ok": False, "error": "poll_disabled",
+                            "hint": "请先在电表设置开启云端轮询并完成同步"}, 409)
+                return
+            now = time.time()
+            with CloudHandler._run_now_lock:
+                last = CloudHandler._run_now_last.get(token, 0.0)
+                if now - last < CloudHandler.RUN_NOW_MIN_INTERVAL_SEC:
+                    retry_after = int(CloudHandler.RUN_NOW_MIN_INTERVAL_SEC - (now - last)) + 1
+                    self._send({"ok": False, "error": "too_frequent",
+                                "retry_after": retry_after}, 429)
+                    return
+                CloudHandler._run_now_last[token] = now
+            # 定向唤醒：只把该租户放入 kick 集合，worker 唤醒分支取出后 run_all(only_token=)
+            kick = getattr(self.ctx, "kick_tokens", None)
+            kick_lock = getattr(self.ctx, "kick_lock", None)
+            scoped = isinstance(kick, set)
+            if scoped:
+                if kick_lock is not None:
+                    with kick_lock:
+                        kick.add(token)
+                else:
+                    kick.add(token)
+            wake = getattr(self.ctx, "wake", None)
+            if wake is None:
+                self._send({"ok": False, "error": "scheduler_unavailable"}, 503)
+                return
+            wake.set()  # worker wake 分支有 3s 合并防抖，并在后台线程执行，HTTP 立即返回避免 App 超时
+            log.info("租户 %s 手动触发立即轮询 meters=%s scoped=%s",
+                     mw.mask_secret(token, 6, 4), len(tenant.get("meters") or []), scoped)
+            self._send({"ok": True, "queued": True, "scoped": scoped,
+                        "note": "服务器约 3 秒后立即查询一轮，完成后更新云端快照，达到阈值或拉闸会推送"})
+            return
         if path == "/api/meter/test-push":
             auth = self._require_auth()
             if not auth:
@@ -331,7 +376,8 @@ def serve(store: mw.Store, engine: mw.Engine) -> int:
     httpd.daemon_threads = True
     wake = threading.Event()
     stop = threading.Event()
-    httpd.ctx = types.SimpleNamespace(store=store, engine=engine, wake=wake, hub=hub)  # type: ignore[attr-defined]
+    httpd.ctx = types.SimpleNamespace(store=store, engine=engine, wake=wake, hub=hub,  # type: ignore[attr-defined]
+                                      kick_lock=threading.Lock(), kick_tokens=set())
 
     server_thread = threading.Thread(target=httpd.serve_forever,
                                      kwargs={"poll_interval": 0.5}, daemon=True)
@@ -365,9 +411,25 @@ def serve(store: mw.Store, engine: mw.Engine) -> int:
             break
         if awakened:
             wake.clear()
-            time.sleep(3)   # 合并 App 连续保存（设置+清单可能分多次 PUT）
+            time.sleep(3)   # 合并 App 连续保存（设置+清单可能分多次 PUT）与 run-now 连点
             try:
-                engine.run_all(startup=False)
+                # run-now 定向触发：窗口内收集到的租户逐个只跑自己；普通配置保存唤醒（集合为空）仍全量一轮
+                kick_tokens: set[str] = set()
+                kick_lock = getattr(httpd.ctx, "kick_lock", None)
+                kick_set = getattr(httpd.ctx, "kick_tokens", None)
+                if isinstance(kick_set, set):
+                    if kick_lock is not None:
+                        with kick_lock:
+                            kick_tokens |= kick_set
+                            kick_set.clear()
+                    else:
+                        kick_tokens |= kick_set
+                        kick_set.clear()
+                if kick_tokens:
+                    for kick_token in kick_tokens:
+                        engine.run_all(startup=False, only_token=kick_token)
+                else:
+                    engine.run_all(startup=False)
             except Exception:
                 mw.log.exception("唤醒值守轮询异常，下一轮重试")
         else:

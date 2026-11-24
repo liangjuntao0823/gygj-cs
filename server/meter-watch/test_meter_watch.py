@@ -376,6 +376,7 @@ class TestTenantPollSchedule(unittest.TestCase):
 class TestApiFlow(unittest.TestCase):
     def setUp(self):
         CloudHandler._enroll_fails.clear()
+        CloudHandler._run_now_last.clear()
         self.tmp = tempfile.TemporaryDirectory()
         atomic = Path(self.tmp.name) / "service.json"
         mw.atomic_write_json(atomic, {**mw.DEFAULT_SERVICE, "enroll_code": "code-123",
@@ -385,7 +386,8 @@ class TestApiFlow(unittest.TestCase):
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), CloudHandler)
         self.port = self.httpd.server_address[1]
         self.httpd.ctx = types.SimpleNamespace(  # type: ignore[attr-defined]
-            store=self.store, engine=self.engine, wake=threading.Event())
+            store=self.store, engine=self.engine, wake=threading.Event(),
+            kick_lock=threading.Lock(), kick_tokens=set())
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
         self.base = f"http://127.0.0.1:{self.port}"
@@ -396,6 +398,7 @@ class TestApiFlow(unittest.TestCase):
         self.thread.join(timeout=2)
         self.tmp.cleanup()
         CloudHandler._enroll_fails.clear()
+        CloudHandler._run_now_last.clear()
 
     def _req(self, method, path, body=None, token=None, raw=None):
         data = None
@@ -459,6 +462,41 @@ class TestApiFlow(unittest.TestCase):
 
         code, obj = self._req("PUT", "/api/meter/config", token=token, raw="{not-json")
         self.assertEqual(code, 400)
+
+    def test_run_now_auth_gate_enable_gate_queue_and_throttle(self):
+        # 无令牌 401
+        code, _ = self._req("POST", "/api/meter/run-now", body={})
+        self.assertEqual(code, 401)
+
+        code, obj = self._req("POST", "/api/meter/enroll", {"code": "code-123", "device": "iphone"})
+        token = obj["token"]
+
+        # 租户默认未开启云端轮询 → 409，且不唤醒调度
+        code, obj = self._req("POST", "/api/meter/run-now", token=token, body={})
+        self.assertEqual(code, 409)
+        self.assertEqual(obj["error"], "poll_disabled")
+        self.assertFalse(self.httpd.ctx.wake.is_set())  # type: ignore[attr-defined]
+
+        # 开启并同步（PUT 本身会 wake，先清掉以便断言 run-now 重新唤醒与定向入队）
+        code, _ = self._req("PUT", "/api/meter/config", token=token, body={
+            "enabled": True,
+            "settings": {"openId": "ox-run-now", "pollIntervalSeconds": 1800},
+            "meters": [{"uid": "012334", "room": ""}],
+        })
+        self.assertEqual(code, 200)
+        self.httpd.ctx.wake.clear()  # type: ignore[attr-defined]
+
+        code, obj = self._req("POST", "/api/meter/run-now", token=token, body={})
+        self.assertEqual(code, 200)
+        self.assertTrue(obj["queued"])
+        self.assertTrue(obj["scoped"])
+        self.assertTrue(self.httpd.ctx.wake.is_set())  # type: ignore[attr-defined]
+        self.assertIn(token, self.httpd.ctx.kick_tokens)  # type: ignore[attr-defined]
+
+        # 10 秒内连点被节流
+        code, obj = self._req("POST", "/api/meter/run-now", token=token, body={})
+        self.assertEqual(code, 429)
+        self.assertEqual(obj["error"], "too_frequent")
 
 
 class _FakeHub:
