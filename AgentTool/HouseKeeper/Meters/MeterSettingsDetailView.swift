@@ -863,7 +863,7 @@ struct CloudPushSettingsView: View {
                     get: { hub.meterModuleEnabled },
                     set: { on in Task { await hub.updatePrefs(meterEnabled: on) } }
                 )) {
-                    Label("电表推送", systemImage: "bolt.batteryblock.fill")
+                    Label("电表推送", systemImage: "bolt.fill")
                         .font(.system(size: 14))
                 }
                 .disabled(!hub.isBound || !hub.channelEnabled)
