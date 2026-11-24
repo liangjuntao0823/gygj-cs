@@ -66,9 +66,11 @@ class CloudHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args) -> None:
         # 成功请求保持 DEBUG 不刷屏；4xx/5xx 与错误行提升到 INFO，便于真机问题在 journal 定位。
         # 仅记录请求行/状态码/字节数，Authorization 令牌头与请求体不落日志。
+        # 注意：BaseHTTPRequestHandler.log_request 传入的状态码是 str，log_error 第二参是错误文案，需统一解析。
         try:
-            code = args[1] if len(args) >= 2 else None
-            noisy = not (isinstance(code, int) and 200 <= code < 400)
+            code_arg = args[1] if len(args) >= 2 else None
+            code_num = int(code_arg) if str(code_arg).isdigit() else None
+            noisy = code_num is None or code_num >= 400
             line = "http %s - %s" % (self.address_string(), fmt % args)
             if noisy:
                 mw.log.info(line)
