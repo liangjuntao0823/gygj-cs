@@ -177,6 +177,16 @@ struct CosConfig {
         !bucket.isEmpty && !region.isEmpty && !secretId.isEmpty && !secretKey.isEmpty
     }
 
+    init(bucket: String, region: String, secretId: String, secretKey: String,
+         customDomain: String, sessionToken: String = "") {
+        self.bucket = bucket
+        self.region = region
+        self.secretId = secretId
+        self.secretKey = secretKey
+        self.customDomain = customDomain
+        self.sessionToken = sessionToken
+    }
+
     /// 从钥匙串读取配置（自动去掉首尾空格，避免复制粘贴带入空白导致签名失败）
     static func load() -> CosConfig? {
         let trimSet = CharacterSet.whitespacesAndNewlines
