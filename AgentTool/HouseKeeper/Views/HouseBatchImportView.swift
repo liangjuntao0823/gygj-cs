@@ -889,8 +889,10 @@ struct HouseBatchImportView: View {
                 return
             }
 
-            // 2. 同步云端
-            if let cfg = CosConfig.load(), cfg.isValid {
+            // 2. 同步云端：服务器模式走服务器权威库；旧 COS 链路仅非服务器模式
+            if HouseServerMode.ready {
+                let _ = await syncBatchToServer(houses: houses, flowTitle: flowTitle, summary: &summary)
+            } else if let cfg = CosConfig.load(), cfg.isValid {
                 await MediaActivityGate.shared.beginUpload()
                 defer { Task { await MediaActivityGate.shared.endUpload() } }
                 let compress = shareCompressionEnabled
@@ -984,6 +986,68 @@ struct HouseBatchImportView: View {
             )
             NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
         }
+    }
+
+    /// 服务器模式批量导入：媒体走服务器 STS 临时凭证传 COS，文本逐套推服务器权威库；
+    /// 文本失败入待补传队列联网自动重试，媒体失败入媒体补传队列。返回未同步成功的房号。
+    @MainActor
+    private func syncBatchToServer(houses: [House], flowTitle: String,
+                                   summary: inout BatchImportSummary) -> [String] {
+        let totalUnits = max(1, houses.reduce(0) { $0 + $1.mediaItems.count } + houses.count)
+        let importID = syncCenter.begin(kind: .media, title: flowTitle,
+                                        roomKeys: houses.map { $0.mediaRoomKey }, total: totalUnits)
+        var failedMediaRooms: [String] = []
+        var failedLedgerRooms: [String] = []
+        await MediaActivityGate.shared.beginUpload()
+        defer { Task { await MediaActivityGate.shared.endUpload() } }
+        let stsConfig: CosConfig? = (try? await HouseCosCredentialStore.shared.credential())
+            .map { CosConfig.sts($0) }
+        var done = 0
+        for house in houses {
+            let roomKey = house.mediaRoomKey
+            let files = house.mediaItems
+            syncCenter.advance(id: importID, done: done, note: "正在处理 \(roomKey)")
+            for mi in files {
+                do {
+                    guard let cfg = stsConfig else {
+                        throw HouseAPIError(message: "未取得服务器临时凭证")
+                    }
+                    try await CosUploader.uploadHouseMedia(fileName: mi.fileName, kind: mi.kind,
+                                                           roomKey: roomKey, config: cfg,
+                                                           compress: shareCompressionEnabled)
+                    HouseMediaUploadQueue.remove(roomKey: roomKey, fileName: mi.fileName)
+                } catch {
+                    HouseMediaUploadQueue.enqueue(roomKey: roomKey, fileName: mi.fileName, kind: mi.kind)
+                    if !failedMediaRooms.contains(roomKey) { failedMediaRooms.append(roomKey) }
+                }
+                done += 1
+                syncCenter.advance(id: importID, done: done)
+            }
+            do {
+                try await HouseSyncEngine.shared.pushHouse(house)
+                house.cloudStatus = .both
+                SyncFailStore.clear(roomKey)
+                summary.cloudLedger += 1
+            } catch {
+                HousePendingUploader.shared.markPending(roomKey)
+                SyncFailStore.mark(roomKey)
+                if !failedLedgerRooms.contains(roomKey) { failedLedgerRooms.append(roomKey) }
+                summary.cloudFailed += 1
+            }
+            done += 1
+            syncCenter.advance(id: importID, done: done)
+        }
+        try? houseModelContext?.save()
+        let failedRooms = Array(Set(failedMediaRooms + failedLedgerRooms))
+        if failedRooms.isEmpty {
+            syncCenter.finish(id: importID, success: true, note: "导入完成 \(houses.count) 套")
+        } else {
+            let roomText = failedRooms.prefix(6).joined(separator: "、")
+            let more = failedRooms.count > 6 ? " 等 \(failedRooms.count) 套" : ""
+            syncCenter.finish(id: importID, success: false,
+                              failure: "这几套没同步上：\(roomText)\(more)，点重试")
+        }
+        return failedRooms
     }
 
     /// 该房源要挂的媒体文件：媒体包模式从临时目录复制进正式目录；返回实际复制/可用的文件名

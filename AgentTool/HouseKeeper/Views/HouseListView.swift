@@ -569,6 +569,8 @@ struct HouseListView: View {
             // 服务器模式：进页面静默增量拉取权威库（小 JSON，失败不打扰、不打断操作）
             if HouseServerMode.ready, let ctx = houseModelContext {
                 Task {
+                    // 进页先补传离线未提交的改动，再增量拉取权威库（弱网改动不丢）
+                    _ = await HousePendingUploader.shared.flush(context: ctx)
                     if let n = try? await HouseSyncEngine.shared.pull(context: ctx), n > 0 {
                         reloadHouses()
                     }
