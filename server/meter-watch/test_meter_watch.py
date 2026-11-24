@@ -136,11 +136,12 @@ class TestEvaluator(unittest.TestCase):
 
     def test_low_edge_dedup_remind_recover(self):
         now = 1_000_000.0
+        period = 3600.0
         m = mw._new_meter_state("1-2334上")
         m["zhuangtai"] = "合闸"
         m["shengyu"] = 20.0
 
-        titles = self.engine.evaluate_meter(self.svc, self.tenant, "u1", m, 30.0, now)
+        titles = self.engine.evaluate_meter(self.svc, self.tenant, "u1", m, 30.0, now, period_seconds=period)
         self.assertEqual(len(titles), 1)
         self.assertIn("低电量", titles[0])
         self.assertIn("1-2334上", self.fake.calls[-1][2])
@@ -148,17 +149,17 @@ class TestEvaluator(unittest.TestCase):
         self.assertTrue(m["low_active"])
         self.assertEqual(m["last_low_push"], now)
 
-        # 1 分钟内不重复
-        self.assertEqual(self.engine.evaluate_meter(self.svc, self.tenant, "u1", m, 30.0, now + 60), [])
+        # 同一轮询期内不重复
+        self.assertEqual(self.engine.evaluate_meter(self.svc, self.tenant, "u1", m, 30.0, now + 60, period_seconds=period), [])
 
-        # 25 小时后持续低电量复提醒
-        titles = self.engine.evaluate_meter(self.svc, self.tenant, "u1", m, 30.0, now + 25 * 3600)
+        # 超过一个轮询期持续低电量复提醒
+        titles = self.engine.evaluate_meter(self.svc, self.tenant, "u1", m, 30.0, now + 2 * period, period_seconds=period)
         self.assertEqual(len(titles), 1)
         self.assertIn("提醒", titles[0])
 
         # 电量回升推恢复并复位
         m["shengyu"] = 60.0
-        titles = self.engine.evaluate_meter(self.svc, self.tenant, "u1", m, 30.0, now + 25 * 3600 + 60)
+        titles = self.engine.evaluate_meter(self.svc, self.tenant, "u1", m, 30.0, now + 2 * period + 60, period_seconds=period)
         self.assertEqual(len(titles), 1)
         self.assertIn("恢复", titles[0])
         self.assertFalse(m["low_active"])
@@ -662,6 +663,20 @@ class TestPeriodDedupAndEnrollIdempotent(unittest.TestCase):
         sent = self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 1000, period_seconds=3600)
         self.assertEqual(len(sent), 1)
         self.assertEqual(len(self.fake.calls), 1)
+
+    def test_low_active_state_repeats_each_period(self):
+        # 持续低电量（low_active 保持 True）：同一轮询期内抑制，超过一个轮询期复提醒一次
+        svc, tenant = {}, {"bark_keys": ["k1"]}
+        m = self._low_meter()
+        self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 1000, period_seconds=3600)
+        self.assertTrue(m["low_active"])
+        # 未超期：抑制
+        self.assertEqual(self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 2000, period_seconds=3600), [])
+        self.assertEqual(len(self.fake.calls), 1)
+        # 超期：复推
+        again = self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 5000, period_seconds=3600)
+        self.assertEqual(len(again), 1)
+        self.assertEqual(len(self.fake.calls), 2)
 
     def test_enroll_idempotent_same_user_and_device(self):
         t1 = self.store.enroll("123456", "iphone", user_token="nt_x")
