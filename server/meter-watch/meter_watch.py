@@ -154,6 +154,14 @@ class PlatformError(Exception):
     """平台查询失败（网络/非 JSON/业务 code 非 0）。"""
 
 
+class PlatformMeterError(PlatformError):
+    """会话/网络正常，但单块电表无有效读数（平台对该表返回“查询失败”，多为电表离线/信号弱）。
+
+    与鉴权/会话类 PlatformError 区分：这类错误重建 openId 会话没有意义，
+    _query_one 不再重建会话放大请求，直接交由单表循环跳过并保留上一次成功读数。
+    """
+
+
 class MeterPlatformClient:
     def __init__(self, base: str = DEFAULT_BASE, timeout: float = 12.0,
                  request_interval: float = 1.5, sleeper: Callable[[float], None] | None = None):
@@ -241,6 +249,17 @@ class MeterPlatformClient:
         data = self._data_dict(obj)
         if not data:
             raise PlatformError("查询返回空 data")
+        raw_shengyu = data.get("shengyu", "")
+        # 平台对离线/弱信号电表会在 code=0、data 内回中文“查询失败”（几个字段同为该文案），
+        # 必须识别为该表本轮失败：不能当数值 0，更不能据此误判拉闸/低电量或污染快照时间戳。
+        try:
+            shengyu_num = float(str(raw_shengyu).strip())
+        except (TypeError, ValueError):
+            raise PlatformMeterError(
+                f"电表 {uid} 平台返回“{raw_shengyu or '查询失败'}”（可能离线/信号弱，保留上次读数）"
+            ) from None
+        if shengyu_num < 0:
+            raise PlatformMeterError(f"电表 {uid} 返回负电量 {shengyu_num:g}，按异常读数跳过")
         return {
             "shengyu": data.get("shengyu", ""),
             "leiji": data.get("leiji", ""),
@@ -482,6 +501,30 @@ def parse_open_id(link: str) -> str:
         return ""
 
 
+def format_uid_room(uid: str) -> str:
+    """按用户给定户号规则推导房号（仅作显示兜底，不替代 App 台账权威房号备注）。
+
+    规则：6 位数字，前两位为座号（仅 01=1座、02=2座），后四位为楼层+房号（不再拆分）；
+    电表户号不分上层/下层（同一房号上层/下层共用一块电表）。无法识别时返回空串。
+    """
+    u = str(uid or "").strip()
+    if len(u) == 6 and u.isdigit() and u[:2] in ("01", "02"):
+        return ("1座" if u[:2] == "01" else "2座") + u[2:]
+    return ""
+
+
+def meter_label(uid: str, room: str = "") -> str:
+    """告警/汇总文案里的电表显示名：App 同步房号备注优先，缺失时按户号规则兜底，再不行用户号尾号。"""
+    room = str(room or "").strip()
+    if room:
+        return room
+    derived = format_uid_room(uid)
+    if derived:
+        return derived
+    u = str(uid or "").strip()
+    return f"电表{u[-4:]}" if len(u) > 4 else (u or "未知电表")
+
+
 # ---------------------------------------------------------------------------
 # 值守引擎
 # ---------------------------------------------------------------------------
@@ -640,8 +683,11 @@ class Engine:
         try:
             wid = self._ensure_wechat(client, token, open_id)
             return client.query_with_retry(wid, uid)
+        except PlatformMeterError:
+            # 该表自身查询失败（离线/弱信号），重建微信会话无意义；重试已在 query_with_retry 内做过
+            raise
         except PlatformError:
-            # 会话可能过期：清缓存重建一次再试（仅一次，避免死循环）
+            # 其余多为会话过期/网络抖动：清缓存重建一次再试（仅一次，避免死循环）
             self._sessions.pop(token, None)
             wid = self._ensure_wechat(client, token, open_id)
             return client.query_with_retry(wid, uid)
@@ -665,7 +711,7 @@ class Engine:
                        uid: str, m: dict[str, Any], threshold: float, now: float) -> list[str]:
         sent_titles: list[str] = []
         keys = self.tenant_keys(svc, tenant)
-        label = m.get("room") or (f"电表{uid[-4:]}" if len(uid) > 4 else uid)
+        label = meter_label(uid, m.get("room") or "")
         shengyu = float(m.get("shengyu") or 0.0)
         is_off = str(m.get("zhuangtai") or "") == "拉闸"
         # 保护：合闸状态下平台给 0 度常是通信异常/空值，不据此误报低电量
@@ -731,7 +777,8 @@ class Engine:
     def _startup_summary(self, svc: dict[str, Any], tenant: dict[str, Any],
                         ts: dict[str, Any], threshold: float) -> None:
         mstates = ts.get("meters") or {}
-        rows = [(float(m.get("shengyu") or 0), m.get("room") or uid, str(m.get("zhuangtai") or ""))
+        rows = [(float(m.get("shengyu") or 0), meter_label(uid, m.get("room") or ""),
+                 str(m.get("zhuangtai") or ""))
                 for uid, m in mstates.items() if float(m.get("last_ok_ts") or 0) > 0]
         rows.sort(key=lambda x: x[0])
         head = "，".join(f"{room} {s:g}度({st or '未知'})" for s, room, st in rows[:3]) or "暂无读数"

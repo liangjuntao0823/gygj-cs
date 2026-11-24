@@ -84,6 +84,42 @@ class TestPlatformClient(unittest.TestCase):
         with self.assertRaises(mw.PlatformError):
             client.index_open_id("bad")
 
+    def test_query_business_failure_raises(self):
+        client = mw.MeterPlatformClient(request_interval=0, sleeper=lambda _s: None)
+        # 平台对离线/弱信号表在 code=0、data 内回中文“查询失败”，必须识别为该表失败而非数值 0
+        client._open = lambda req, timeout: FakeResp({
+            "code": 0,
+            "data": {"shengyu": "查询失败", "leiji": "查询失败",
+                     "zhuangtai": "查询失败", "shijian": "查询失败"}})
+        with self.assertRaises(mw.PlatformMeterError):
+            client.query_meter("123456", "011714")
+
+        # 正常数字字符串仍原样返回（保持既有字段类型约定，Engine 层再 to_float）
+        client._open = lambda req, timeout: FakeResp({
+            "code": 0,
+            "data": {"shengyu": "20.5", "leiji": "123.4", "zhuangtai": "合闸",
+                     "shijian": "2026-11-24 13:00:00"}})
+        q = client.query_meter("123456", "012334")
+        self.assertEqual(q["shengyu"], "20.5")
+        self.assertEqual(q["zhuangtai"], "合闸")
+
+
+class TestRoomRule(unittest.TestCase):
+    def test_format_uid_room(self):
+        self.assertEqual(mw.format_uid_room("012334"), "1座2334")
+        self.assertEqual(mw.format_uid_room("021418"), "2座1418")
+        self.assertEqual(mw.format_uid_room("032334"), "")   # 座号仅 01/02
+        self.assertEqual(mw.format_uid_room("12345"), "")    # 非 6 位
+        self.assertEqual(mw.format_uid_room("01233a"), "")   # 含非数字
+        self.assertEqual(mw.format_uid_room(""), "")
+
+    def test_meter_label_priority(self):
+        self.assertEqual(mw.meter_label("012334", "2334上层"), "2334上层")  # App 备注权威优先
+        self.assertEqual(mw.meter_label("012334", ""), "1座2334")
+        self.assertEqual(mw.meter_label("021006"), "2座1006")
+        self.assertEqual(mw.meter_label("abc1234", ""), "电表1234")
+        self.assertEqual(mw.meter_label("999", ""), "999")
+
 
 class TestEvaluator(unittest.TestCase):
     def setUp(self):
