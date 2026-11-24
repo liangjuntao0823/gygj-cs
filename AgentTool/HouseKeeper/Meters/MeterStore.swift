@@ -397,7 +397,9 @@ final class MeterCloudSync {
             "openId": s.openId,
             "lowThreshold": s.lowThreshold,
             "lowAlertEnabled": s.lowAlertEnabled,
-            "provider": s.provider.rawValue
+            "provider": s.provider.rawValue,
+            // 云端值守服务器轮询间隔（秒）：App 设置页 30/60/120 分钟或自定义，服务端按租户独立调度
+            "pollIntervalSeconds": s.cloudPollMinutes * 60
         ]
         let metersArray: [[String: Any]] = store.meters.map { m in
             ["uid": m.uid, "room": m.room, "pinned": m.isPinned]
@@ -636,6 +638,8 @@ final class NotifyHub: ObservableObject {
     @Published var busy = false
     @Published var statusText: String?
     @Published var lastSyncAt: Date?
+    /// 首次绑定通道账号后“自动补一次电表同步”的结果：nil=未触发（无电表令牌/仅添加设备），true/false=补同步成败
+    @Published var lastBindMeterSync: Bool?
 
     private let defaults = UserDefaults.standard
     private init() {
@@ -740,7 +744,9 @@ final class NotifyHub: ObservableObject {
     func register(code: String, username inputName: String, barkText: String, deviceName: String) async -> String? {
         busy = true
         statusText = nil
+        lastBindMeterSync = nil
         defer { busy = false }
+        let oldToken = token ?? ""
         let body: [String: Any] = [
             "code": code.trimmingCharacters(in: .whitespacesAndNewlines),
             "username": inputName.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -753,11 +759,26 @@ final class NotifyHub: ObservableObject {
             let obj = try await request("register", method: "POST", body: body)
             applyProfile(obj)
             rememberEnrollCode(code.trimmingCharacters(in: .whitespacesAndNewlines))
+            // 仅首次拿到新的通道账号令牌（注册/换机登录）才补同步；已登录添加设备时 token 不变，不重复推电表配置
+            if let newToken = obj.token, !newToken.isEmpty, newToken != oldToken {
+                lastBindMeterSync = await syncMeterBindingAfterRegister()
+            }
             return nil
         } catch {
             statusText = error.localizedDescription
             return error.localizedDescription
         }
+    }
+
+    /// 绑定成功后自动补一次电表全量配置，把通道 userToken 绑到电表租户；
+    /// 修复“先开电表值守、后绑推送通道”时需手动再同步一次的顺序缺口。
+    /// - Returns: nil=本机还没接入电表云端（无电表令牌，跳过，之后开值守 buildPayload 会自动带 token）；true/false=补同步成败
+    private func syncMeterBindingAfterRegister() async -> Bool? {
+        let sync = MeterCloudSync.shared
+        guard sync.hasToken else { return nil }
+        let store = MeterStore.shared
+        // 保持用户当前值守开关状态，不借绑定动作擅自开启服务器轮询
+        return await sync.pushConfig(store: store, enabled: store.settings.cloudWatchEnabled)
     }
 
     func refreshMe() async {

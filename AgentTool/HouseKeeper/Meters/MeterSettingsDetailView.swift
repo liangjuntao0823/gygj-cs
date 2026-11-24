@@ -54,7 +54,7 @@ struct MeterSettingsDetailView: View {
             } header: {
                 Text("查询链接")
             } footer: {
-                Text("从微信复制电表缴费页链接粘贴到这里，App 会解析 openId 作为查询身份。换微信后需更换链接（openId 随微信账号变化）。链接默认仅保存在本机；若开启下方「云端值守」，查询链接与 openId、电表清单会同步到你自己配置的服务器，用于 30 分钟云端轮询与推送。")
+                Text("从微信复制电表缴费页链接粘贴到这里，App 会解析 openId 作为查询身份。换微信后需更换链接（openId 随微信账号变化）。链接默认仅保存在本机；若开启下方「云端值守」，查询链接与 openId、电表清单会同步到你自己配置的服务器，用于服务器云端定时轮询与告警推送（轮询频率可在下方云端值守区自行设置）。")
             }
 
             Section {
@@ -164,6 +164,9 @@ private struct MeterCloudWatchSection: View {
     @State private var tip: String?
     @State private var busy = false
     @State private var tokenSaved = false
+    @State private var pollTag: Int = 30          // 云端轮询预设：30/60/120 分钟，0=自定义
+    @State private var customPollInput = ""
+    @State private var pollTip: String?
 
     @MainActor
     private var sync: MeterCloudSync { MeterCloudSync.shared }
@@ -192,6 +195,8 @@ private struct MeterCloudWatchSection: View {
                 Label("统一推送通道（多设备 · 账号隔离）", systemImage: "bell.badge.fill")
                     .font(.system(size: 13, weight: .semibold))
             }
+
+            pollIntervalBlock
 
             if store.settings.cloudWatchEnabled || tokenSaved || busy {
                 VStack(alignment: .leading, spacing: 10) {
@@ -284,12 +289,85 @@ private struct MeterCloudWatchSection: View {
         } header: {
             Text("云端值守（测试）")
         } footer: {
-            Text("开启后，查询链接/openId、低电量阈值、提醒开关与电表清单会自动同步到你的服务器，由服务器每 30 分钟轮询一次，达到阈值或拉闸时经自建 Bark 推送；之后在本机改阈值、新增/删除电表也会自动同步。开关开启时，每次进入电表首页会自动获取云端最近一轮数据；关闭后完全保持手动刷新。长期令牌只保存在本机钥匙串。")
+            Text("开启后，查询链接/openId、低电量阈值、提醒开关、轮询间隔与电表清单会自动同步到你的服务器，由服务器按你设置的云端轮询间隔（默认 30 分钟，可选 30 分钟/1 小时/2 小时或自定义）自动轮询，达到阈值或拉闸时经自建 Bark 推送；之后在本机改阈值、间隔、新增/删除电表也会自动同步。开关开启时，每次进入电表首页会自动获取云端最近一轮数据；关闭后完全保持手动刷新。长期令牌只保存在本机钥匙串。")
         }
         .onAppear {
             endpointInput = store.settings.cloudEndpoint
             tokenSaved = sync.hasToken
+            let minutes = store.settings.cloudPollMinutes
+            if [30, 60, 120].contains(minutes) {
+                pollTag = minutes
+            } else {
+                pollTag = 0
+                customPollInput = String(minutes)
+            }
         }
+    }
+
+    // MARK: 云端轮询间隔（租户级，随 config 下发，服务器热生效）
+
+    @ViewBuilder
+    private var pollIntervalBlock: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("服务器轮询间隔")
+                .font(.system(size: 12))
+                .foregroundColor(.themeText3)
+            Picker("服务器轮询间隔", selection: $pollTag) {
+                Text("30 分钟").tag(30)
+                Text("1 小时").tag(60)
+                Text("2 小时").tag(120)
+                Text("自定义").tag(0)
+            }
+            .pickerStyle(.menu)
+            .font(.system(size: 13))
+            .onChange(of: pollTag) { _, tag in
+                guard tag != 0 else {
+                    customPollInput = String(store.settings.cloudPollMinutes)
+                    return
+                }
+                pollTip = nil
+                store.settings.cloudPollMinutes = tag
+                store.saveSettings()   // 防抖全量同步，pollIntervalSeconds 随 config 下发
+            }
+
+            if pollTag == 0 {
+                HStack(spacing: 8) {
+                    TextField("自定义分钟（5–1440）", text: $customPollInput)
+                        .keyboardType(.numberPad)
+                        .font(.system(size: 13))
+                        .padding(8)
+                        .background(Color.themeBorder.opacity(0.3))
+                        .clipShape(RoundedRectangle(cornerRadius: 9))
+                    Button("应用") { applyCustomPoll() }
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.themeAccentDark)
+                }
+                if let pollTip, !pollTip.isEmpty {
+                    Text(pollTip)
+                        .font(.system(size: 11))
+                        .foregroundColor(.red)
+                }
+            }
+
+            Text("云端值守开启并同步后，由服务器按此频率代你轮询电表平台；未开启时选择先保存在本机。它与本页上方仅在 App 打开时生效的「定时自动刷新」是两套机制。保存并同步后服务器约半分钟内按新间隔调度、无需重启；间隔越短查询越频繁，建议不低于 10–30 分钟，避免被电表平台限流。")
+                .font(.system(size: 10))
+                .foregroundColor(.themeText3)
+        }
+        .padding(9)
+        .background(Color.themeBorder.opacity(0.18))
+        .clipShape(RoundedRectangle(cornerRadius: 9))
+    }
+
+    @MainActor
+    private func applyCustomPoll() {
+        let raw = customPollInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let minutes = Int(raw), (5...1440).contains(minutes) else {
+            pollTip = "请输入 5–1440 之间的整数分钟"
+            return
+        }
+        pollTip = nil
+        store.settings.cloudPollMinutes = minutes
+        store.saveSettings()   // 开启云端值守时由同步钩子防抖上报；未开启则先存本机
     }
 
     // MARK: 动作
@@ -509,7 +587,14 @@ struct NotifyHubSettingsView: View {
         if err == nil {
             barkInput = ""
             formTip = nil
-            testTip = "绑定成功，建议立即发送一条通道测试通知"
+            switch hub.lastBindMeterSync {
+            case .some(true):
+                testTip = "绑定成功，电表云端绑定已自动同步；建议立即发送一条通道测试通知"
+            case .some(false):
+                testTip = "推送账号已绑定；电表配置稍后进入电表页会自动补同步，也可在电表设置手动同步一次"
+            case .none:
+                testTip = "绑定成功，建议立即发送一条通道测试通知"
+            }
         } else {
             formTip = err
         }

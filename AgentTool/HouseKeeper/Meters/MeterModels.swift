@@ -108,9 +108,10 @@ struct MeterSettings: Codable {
     var lowAlertEnabled: Bool = true  // 低电量本地通知提醒，默认开
 
     // MARK: 云端值守（gygj-cs 试验功能）
-    // 必须用 Optional 存储属性：旧版 settings.json 缺这两个键时，合成 Decodable 才不会因缺键解码失败（nil 即默认）。
+    // 必须用 Optional 存储属性：旧版 settings.json 缺这些键时，合成 Decodable 才不会因缺键解码失败（nil 即默认）。
     var cloudEnabledRaw: Bool?    // 云端值守总开关（nil/false=关，保持纯手动刷新模式）
     var cloudEndpointRaw: String? // 云端同步地址（nil/空白=回退 MeterCloudConfig.defaultEndpoint）
+    var cloudPollMinutesRaw: Int? // 云端值守服务器轮询间隔（分钟，nil=默认 30；读写统一用 cloudPollMinutes）
 
     /// 云端值守开关（UI 与同步逻辑统一使用该便利属性）
     var cloudWatchEnabled: Bool {
@@ -125,6 +126,12 @@ struct MeterSettings: Codable {
             return v.isEmpty ? MeterCloudConfig.defaultEndpoint : v
         }
         set { cloudEndpointRaw = newValue }
+    }
+
+    /// 云端值守服务器轮询间隔（分钟）：旧数据 nil 回退 30，统一夹到 5～1440 分钟
+    var cloudPollMinutes: Int {
+        get { max(5, min(1440, cloudPollMinutesRaw ?? 30)) }
+        set { cloudPollMinutesRaw = max(5, min(1440, newValue)) }
     }
 
     static let `default` = MeterSettings()
