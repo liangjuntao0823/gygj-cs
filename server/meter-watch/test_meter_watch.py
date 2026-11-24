@@ -355,5 +355,75 @@ class TestApiFlow(unittest.TestCase):
         self.assertEqual(code, 400)
 
 
+class _FakeHub:
+    """模拟 notify_hub.HubRuntime，记录 dispatch 入参并返回预设结果。"""
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def dispatch(self, user_token, module, event_type, title, body,
+                 data=None, idem_key=None, level=None):
+        self.calls.append({"user_token": user_token, "module": module, "type": event_type,
+                           "title": title, "body": body, "data": data})
+        return self.result
+
+
+class TestNotifyHubIntegration(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = mw.Store(self.tmp.name)
+        self.fake = FakePusher()
+        self.engine = mw.Engine(self.store, pusher=self.fake)  # type: ignore[arg-type]
+        self.svc = dict(self.store.svc)
+        self.store.svc["enroll_code"] = "123456"   # enroll 只读内存 svc，无需落盘
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_upsert_persists_user_token_and_keeps_on_legacy_payload(self):
+        token = self.store.enroll("123456", "iphone")
+        self.assertTrue(token)
+        self.assertIsNotNone(self.store.upsert_config(token, {"userToken": "nt_abc123"}))
+        self.assertEqual(self.store.load_tenants()[token]["notify_user_token"], "nt_abc123")
+        # 旧版 App 报文不带 userToken，不能把已建立的推送中心绑定误清
+        self.store.upsert_config(token, {"enabled": True})
+        self.assertEqual(self.store.load_tenants()[token]["notify_user_token"], "nt_abc123")
+
+    def test_push_uses_hub_without_legacy_fallback(self):
+        hub = _FakeHub({"ok": True, "sent": 1, "total": 1})
+        self.engine.hub = hub
+        tenant = {"notify_user_token": "nt_1", "bark_keys": ["k-legacy"]}
+        sent = self.engine._push_tenant(self.svc, tenant, "T", "B",
+                                        keys=["k-legacy"], event_type="low")
+        self.assertEqual(sent, 1)
+        self.assertEqual(len(hub.calls), 1)
+        self.assertEqual(hub.calls[0]["user_token"], "nt_1")
+        self.assertEqual(hub.calls[0]["module"], "meter")
+        self.assertEqual(hub.calls[0]["type"], "low")
+        self.assertEqual(self.fake.calls, [])      # hub 已受理，不再直推，避免重复
+
+    def test_push_fallback_when_hub_has_no_device(self):
+        hub = _FakeHub({"ok": False, "sent": 0, "total": 0, "reason": "no_device"})
+        self.engine.hub = hub
+        tenant = {"notify_user_token": "nt_2", "bark_keys": ["k-legacy"]}
+        sent = self.engine._push_tenant(self.svc, tenant, "T", "B", keys=["k-legacy"])
+        self.assertEqual(sent, 1)                  # FakePusher.push_many 返回 (1,1)
+        self.assertEqual(len(self.fake.calls), 1)  # 无设备可投时平滑降级旧直推
+
+    def test_push_user_disabled_does_not_fallback(self):
+        hub = _FakeHub({"ok": False, "sent": 0, "total": 0, "reason": "user_disabled"})
+        self.engine.hub = hub
+        tenant = {"notify_user_token": "nt_3", "bark_keys": ["k-legacy"]}
+        sent = self.engine._push_tenant(self.svc, tenant, "T", "B", keys=["k-legacy"])
+        self.assertEqual(sent, 0)
+        self.assertEqual(self.fake.calls, [])      # 用户主动关通道，禁止全局 key 再打扰
+
+    def test_push_without_hub_keeps_legacy_path(self):
+        tenant = {"bark_keys": ["k-legacy"]}
+        sent = self.engine._push_tenant(self.svc, tenant, "T", "B", keys=["k-legacy"])
+        self.assertEqual(sent, 1)
+        self.assertEqual(len(self.fake.calls), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

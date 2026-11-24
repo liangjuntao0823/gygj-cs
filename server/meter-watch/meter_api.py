@@ -26,12 +26,20 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 import threading
 import time
 import types
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import meter_watch as mw
+
+try:  # 生产部署：notify_hub.py 与本文件同目录（/opt/meter-watch）直接导入
+    import notify_hub as nh
+except ImportError:  # 本地源码树兜底：server/notify-hub 与 server/meter-watch 平级
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify-hub"))
+    import notify_hub as nh
 
 log = logging.getLogger("meter-watch.api")
 
@@ -126,6 +134,9 @@ class CloudHandler(BaseHTTPRequestHandler):
 
     def _route_get(self) -> None:
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if path == nh.PREFIX or path.startswith(nh.PREFIX + "/"):
+            nh.route_request(self, "GET", path, self.ctx.hub)
+            return
         if path == "/api/meter/health":
             tenants = self.ctx.store.load_tenants()
             enabled = sum(1 for t in tenants.values() if isinstance(t, dict) and t.get("enabled"))
@@ -146,6 +157,7 @@ class CloudHandler(BaseHTTPRequestHandler):
                 "updated_at": tenant.get("updated_at", ""),
                 "settings": tenant.get("settings", {}),
                 "meters": tenant.get("meters", []),
+                "notifyUserBound": bool(tenant.get("notify_user_token")),
                 "barkKeysCount": len(keys),
                 "barkKeysMasked": masked,
                 # 兼容下划线命名
@@ -210,6 +222,9 @@ class CloudHandler(BaseHTTPRequestHandler):
 
     def _route_post(self) -> None:
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if path == nh.PREFIX or path.startswith(nh.PREFIX + "/"):
+            nh.route_request(self, "POST", path, self.ctx.hub)
+            return
         if path == "/api/meter/enroll":
             ip = self._client_ip()
             if self._enroll_rate_limited(ip):
@@ -235,6 +250,25 @@ class CloudHandler(BaseHTTPRequestHandler):
                 return
             _, tenant = auth
             svc = self.ctx.store.svc
+            user_token = str(tenant.get("notify_user_token") or "")
+            # 已绑定统一推送用户：测试事件也走通知中心，顺带验证框架投递与设备隔离
+            if user_token and getattr(self.ctx, "hub", None) is not None:
+                try:
+                    res = self.ctx.hub.dispatch(
+                        user_token, "meter", "test",
+                        "公寓管家云端值守测试", "收到此条说明统一推送通道（电表告警）链路正常。")
+                    total = int(res.get("total") or 0)
+                    if total > 0:
+                        self._send({"ok": int(res.get("sent") or 0) > 0,
+                                    "sent": int(res.get("sent") or 0), "total": total,
+                                    "via": "notify-hub"})
+                        return
+                    if res.get("reason") in ("user_disabled", "module_disabled"):
+                        self._send({"ok": False, "sent": 0, "total": 0,
+                                    "error": "notify_disabled", "reason": res.get("reason")}, 409)
+                        return
+                except Exception:
+                    log.exception("test-push 通知中心异常，降级 Bark 直推")
             keys = mw.Engine.tenant_keys(svc, tenant)
             if not keys:
                 self._send({"ok": False, "sent": 0, "total": 0,
@@ -242,7 +276,7 @@ class CloudHandler(BaseHTTPRequestHandler):
                 return
             ok, total = self.ctx.engine.pusher(svc).push_many(
                 keys, "公寓管家云端值守测试", "收到此条说明云端电表告警推送链路正常。")
-            self._send({"ok": ok > 0, "sent": ok, "total": total})
+            self._send({"ok": ok > 0, "sent": ok, "total": total, "via": "legacy"})
             return
         self._send({"ok": False, "error": "not_found"}, 404)
 
@@ -288,16 +322,22 @@ def serve(store: mw.Store, engine: mw.Engine) -> int:
     host = str(svc.get("listen_host") or "0.0.0.0")
     port = int(svc.get("listen_port") or 8082)
 
+    # 统一推送中心：同进程挂载 /api/notify/*，notify.json 与租户文件同目录（600）；
+    # config 直接复用 meter service.json 的 enroll_code / bark_base，测试期不新增端口与配置文件
+    hub = nh.HubRuntime(str(store.home / "notify.json"), config=svc)
+    engine.hub = hub
+
     httpd = ThreadingHTTPServer((host, port), CloudHandler)
     httpd.daemon_threads = True
     wake = threading.Event()
     stop = threading.Event()
-    httpd.ctx = types.SimpleNamespace(store=store, engine=engine, wake=wake)  # type: ignore[attr-defined]
+    httpd.ctx = types.SimpleNamespace(store=store, engine=engine, wake=wake, hub=hub)  # type: ignore[attr-defined]
 
     server_thread = threading.Thread(target=httpd.serve_forever,
                                      kwargs={"poll_interval": 0.5}, daemon=True)
     server_thread.start()
     mw.log.info("meter-watch 同步 API 监听 http://%s:%s（探针 /api/meter/health）", host, port)
+    mw.log.info("统一推送中心已挂载：/api/notify/health（数据 %s）", store.home / "notify.json")
     mw.log.info("首次接入码 enroll_code=%s（明文存于 %s，勿提交公开仓库）",
                 mw.mask_secret(str(svc.get("enroll_code") or ""), 4, 4), store.service_path)
 

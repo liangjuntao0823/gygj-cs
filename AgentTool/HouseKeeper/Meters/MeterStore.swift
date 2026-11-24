@@ -402,12 +402,17 @@ final class MeterCloudSync {
         let metersArray: [[String: Any]] = store.meters.map { m in
             ["uid": m.uid, "room": m.room, "pinned": m.isPinned]
         }
-        return [
+        var payload: [String: Any] = [
             "enabled": enabled,
             "device": "iPhone",
             "settings": settingsDict,
             "meters": metersArray
         ]
+        // 已在「云端推送通道」建档登录：电表租户绑定该通知用户，服务端据此只投其本人设备
+        if let ut = KeychainStore.load(NotifyHubConfig.tokenKey), !ut.isEmpty {
+            payload["userToken"] = ut
+        }
+        return payload
     }
 
     @discardableResult
@@ -557,5 +562,286 @@ final class MeterCloudSync {
         } catch {
             store.cloudStatusText = "云端快照获取失败：\(error.localizedDescription)"
         }
+    }
+}
+
+// MARK: - 统一推送通道（notify-hub）
+// 架构：通道后以「用户」为单位隔离，一个用户可绑多台手机 Bark Key，只收自己业务数据；
+// 通道前各业务模块（电表先行，后续到期/收租）经服务器 dispatch 事件接入。长期用户令牌只存钥匙串。
+
+enum NotifyHubConfig {
+    static let tokenKey = "notify.hub.userToken"            // Keychain：通知中心用户长期令牌
+    static let usernameCacheKey = "notify.hub.username"    // UserDefaults：最近一次用户名（仅展示/预填，非凭据）
+    static let enrollCodeCacheKey = "notify.hub.enrollCode"// UserDefaults：测试期记住接入码方便回填
+    static let lastSyncKey = "notify.hub.lastSyncAt"
+    static let apiPrefix = "/api/notify"
+}
+
+struct NotifyHubDevice: Codable, Identifiable, Equatable {
+    let deviceId: String
+    let name: String?
+    let platform: String?
+    let serverBase: String?
+    let keyMasked: String?
+    let addedAt: String?
+    let lastOkAt: Double?
+    let lastError: String?
+    var id: String { deviceId }
+    var displayName: String {
+        let n = (name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return n.isEmpty ? "我的设备" : n
+    }
+}
+
+struct NotifyHubEvent: Codable, Identifiable, Equatable {
+    let id: String
+    let at: String?
+    let module: String?
+    let type: String?
+    let title: String?
+    let body: String?
+    let status: String?
+    let sent: Int?
+    let total: Int?
+}
+
+struct NotifyHubPrefs: Codable, Equatable {
+    var enabled: Bool?
+    var modules: [String: Bool]?
+}
+
+/// register/me/prefs/devices 返回用户档案；test 返回投递结果；字段全部可选以兼容服务器演进
+private struct NotifyHubResponse: Codable {
+    let ok: Bool?
+    let token: String?
+    let username: String?
+    let prefs: NotifyHubPrefs?
+    let devices: [NotifyHubDevice]?
+    let events: [NotifyHubEvent]?
+    let error: String?
+    let reason: String?
+    let sent: Int?
+    let total: Int?
+}
+
+@MainActor
+final class NotifyHub: ObservableObject {
+    static let shared = NotifyHub()
+
+    @Published var isBound = false
+    @Published var username = ""
+    @Published var devices: [NotifyHubDevice] = []
+    @Published var events: [NotifyHubEvent] = []
+    @Published var prefs = NotifyHubPrefs(enabled: true, modules: ["meter": true])
+    @Published var busy = false
+    @Published var statusText: String?
+    @Published var lastSyncAt: Date?
+
+    private let defaults = UserDefaults.standard
+    private init() {
+        username = defaults.string(forKey: NotifyHubConfig.usernameCacheKey) ?? ""
+        isBound = !(KeychainStore.load(NotifyHubConfig.tokenKey) ?? "").isEmpty
+        lastSyncAt = defaults.object(forKey: NotifyHubConfig.lastSyncKey) as? Date
+    }
+
+    var token: String? { KeychainStore.load(NotifyHubConfig.tokenKey) }
+    var channelEnabled: Bool { prefs.enabled ?? true }
+    var meterModuleEnabled: Bool { prefs.modules?["meter"] ?? true }
+
+    /// 与电表云端值守共用同一台服务器（8082 同进程挂载 /api/notify），地址在「电表监控设置」里改
+    var endpoint: String {
+        var s = MeterStore.shared.settings.cloudEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.isEmpty { s = MeterCloudConfig.defaultEndpoint }
+        if !s.hasPrefix("http://"), !s.hasPrefix("https://") { s = "http://" + s }
+        while s.hasSuffix("/") { s.removeLast() }
+        return s
+    }
+
+    func cachedEnrollCode() -> String {
+        let v = defaults.string(forKey: NotifyHubConfig.enrollCodeCacheKey) ?? ""
+        return v.isEmpty ? "123456" : v
+    }
+
+    func rememberEnrollCode(_ code: String) {
+        defaults.set(code, forKey: NotifyHubConfig.enrollCodeCacheKey)
+    }
+
+    // MARK: 网络
+
+    private func buildURL(_ sub: String) -> URL? {
+        URL(string: endpoint + NotifyHubConfig.apiPrefix + "/" + sub)
+    }
+
+    private func zhError(_ raw: String, httpCode: Int) -> String {
+        switch raw {
+        case "invalid_code": return "接入码不正确（测试期固定 123456）"
+        case "invalid_bark_key": return "识别不到 Bark Key，请粘贴 Bark App 首页的完整推送链接（形如 http://服务器/一串字符）"
+        case "username_exists": return "该用户名已被占用；若是本人换机绑定，请换一个用户名（测试期暂不支持换机找回）"
+        case "device_limit": return "该账号绑定设备数已达上限（10 台）"
+        case "too_many_attempts": return "失败次数过多，请 10 分钟后再试"
+        case "unauthorized": return "登录已失效，请重新绑定"
+        case "unsupported_action": return "不支持的设备操作"
+        default:
+            let r = raw.isEmpty ? "服务器错误" : raw
+            return "\(r)（HTTP \(httpCode)）"
+        }
+    }
+
+    @discardableResult
+    private func request(_ sub: String, method: String, body: [String: Any]?,
+                         auth: Bool = true) async throws -> NotifyHubResponse {
+        guard let url = buildURL(sub) else {
+            throw NSError(domain: "NotifyHub", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "服务器地址无效，可到「电表监控设置 → 云端值守」检查服务器地址"])
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = method
+        req.timeoutInterval = 12
+        req.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        if auth, let t = token, !t.isEmpty {
+            req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization")
+        }
+        if let body {
+            req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        let decoded = try? JSONDecoder().decode(NotifyHubResponse.self, from: data)
+        if code == 401 {
+            throw NSError(domain: "NotifyHub", code: code,
+                          userInfo: [NSLocalizedDescriptionKey: zhError("unauthorized", httpCode: code)])
+        }
+        guard (200..<300).contains(code), let obj = decoded else {
+            throw NSError(domain: "NotifyHub", code: code,
+                          userInfo: [NSLocalizedDescriptionKey: zhError(decoded?.error ?? decoded?.reason ?? "", httpCode: code)])
+        }
+        return obj
+    }
+
+    private func applyProfile(_ obj: NotifyHubResponse) {
+        if let t = obj.token, !t.isEmpty {
+            KeychainStore.save(t, for: NotifyHubConfig.tokenKey)
+            isBound = true
+        }
+        if let name = obj.username, !name.isEmpty {
+            username = name
+            defaults.set(name, forKey: NotifyHubConfig.usernameCacheKey)
+        }
+        if let p = obj.prefs { prefs = p }
+        if let d = obj.devices { devices = d }
+        if let e = obj.events { events = e }
+        defaults.set(Date(), forKey: NotifyHubConfig.lastSyncKey)
+        lastSyncAt = Date()
+    }
+
+    // MARK: 动作
+
+    /// 首次建档注册，或已登录时添加/更新本机设备（同一 register 端点，有 token 自动走更新）
+    func register(code: String, username inputName: String, barkText: String, deviceName: String) async -> String? {
+        busy = true
+        statusText = nil
+        defer { busy = false }
+        let body: [String: Any] = [
+            "code": code.trimmingCharacters(in: .whitespacesAndNewlines),
+            "username": inputName.trimmingCharacters(in: .whitespacesAndNewlines),
+            "barkKey": barkText.trimmingCharacters(in: .whitespacesAndNewlines),
+            "deviceName": deviceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "我的 iPhone" : deviceName.trimmingCharacters(in: .whitespacesAndNewlines),
+            "platform": "ios"
+        ]
+        do {
+            let obj = try await request("register", method: "POST", body: body)
+            applyProfile(obj)
+            rememberEnrollCode(code.trimmingCharacters(in: .whitespacesAndNewlines))
+            return nil
+        } catch {
+            statusText = error.localizedDescription
+            return error.localizedDescription
+        }
+    }
+
+    func refreshMe() async {
+        guard isBound else { return }
+        busy = true
+        defer { busy = false }
+        do {
+            let obj = try await request("me", method: "GET", body: nil)
+            applyProfile(obj)
+            statusText = nil
+        } catch {
+            statusText = error.localizedDescription
+        }
+    }
+
+    func sendTest() async -> String {
+        busy = true
+        defer { busy = false }
+        do {
+            let obj = try await request("test", method: "POST", body: [:])
+            let total = obj.total ?? 0
+            let sent = obj.sent ?? 0
+            if total == 0 {
+                switch obj.reason {
+                case "no_device": return "账号下还没有可用设备，请先绑定本机 Bark"
+                case "user_disabled": return "通道总开关已关闭，请先打开开关"
+                case "module_disabled": return "电表模块通知开关已关闭"
+                case "unknown_user": return "服务器未找到该账号，请重新绑定"
+                default: return "未实际下发（\(obj.reason ?? "未知原因")）"
+                }
+            }
+            if sent > 0 {
+                await refreshMe()
+                return "已投递 \(sent)/\(total) 台设备，请查看 iPhone 通知（仅你本人设备接收）"
+            }
+            await refreshMe()
+            return "投递失败（0/\(total)），请检查手机 Bark App 的服务器配置与通知权限"
+        } catch {
+            return "测试请求失败：\(error.localizedDescription)"
+        }
+    }
+
+    /// 总开关 / 电表模块开关；先乐观更新再以服务器档案为准回滚
+    func updatePrefs(channelEnabled: Bool? = nil, meterEnabled: Bool? = nil) async {
+        var body: [String: Any] = [:]
+        if let channelEnabled {
+            body["enabled"] = channelEnabled
+            prefs.enabled = channelEnabled
+        }
+        if let meterEnabled {
+            body["modules"] = ["meter": meterEnabled]
+            var modules = prefs.modules ?? [:]
+            modules["meter"] = meterEnabled
+            prefs.modules = modules
+        }
+        guard !body.isEmpty else { return }
+        do {
+            let obj = try await request("prefs", method: "POST", body: body)
+            applyProfile(obj)
+        } catch {
+            statusText = error.localizedDescription
+            await refreshMe()
+        }
+    }
+
+    func removeDevice(_ device: NotifyHubDevice) async {
+        busy = true
+        defer { busy = false }
+        do {
+            let obj = try await request("devices", method: "POST",
+                                        body: ["action": "remove", "deviceId": device.deviceId])
+            applyProfile(obj)
+        } catch {
+            statusText = error.localizedDescription
+        }
+    }
+
+    /// 仅清本机登录态（Keychain 写空串，KeychainStore 无删除接口，功能等价退出）；服务器档案保留
+    func logout() {
+        KeychainStore.save("", for: NotifyHubConfig.tokenKey)
+        isBound = false
+        devices = []
+        events = []
+        prefs = NotifyHubPrefs(enabled: true, modules: ["meter": true])
+        statusText = nil
     }
 }

@@ -476,6 +476,12 @@ class Store:
                     keys.append(ks)
             tenant["bark_keys"] = keys
 
+        # 统一推送中心用户绑定：App 在「云端推送通道」注册拿到 userToken 后随 config 同步；
+        # 仅非空覆盖，避免旧版 App 报文（不带该字段）把已有绑定清掉。
+        raw_user_token = payload.get("userToken", payload.get("user_token"))
+        if raw_user_token is not None and str(raw_user_token).strip():
+            tenant["notify_user_token"] = str(raw_user_token).strip()[:128]
+
         tenants[token] = tenant
         self.save_tenants(tenants)
         return tenant
@@ -552,6 +558,8 @@ class Engine:
         self.dry_run = dry_run
         self._pusher = pusher
         self._sessions: dict[str, str] = {}   # token -> 平台 wechatId（仅内存）
+        # 统一通知中心 HubRuntime：由 API 进程启动时注入；None（如纯 CLI/单测）时走旧 Bark 直推
+        self.hub: Any = None
 
     # 可替换工厂（测试注入假平台）
     def make_client(self, svc: dict[str, Any]) -> MeterPlatformClient:
@@ -766,7 +774,26 @@ class Engine:
         return sent_titles
 
     def _push_tenant(self, svc: dict[str, Any], tenant: dict[str, Any],
-                     title: str, body: str, keys: list[str] | None = None) -> int:
+                     title: str, body: str, keys: list[str] | None = None,
+                     event_type: str = "alert", data: dict[str, Any] | None = None) -> int:
+        # 优先走统一通知中心：按租户绑定的用户投到该用户自己的 Bark 设备，实现多用户隔离
+        user_token = str(tenant.get("notify_user_token") or "")
+        if user_token and self.hub is not None:
+            try:
+                res = self.hub.dispatch(user_token, "meter", event_type, title, body, data=data or {})
+                total = int(res.get("total") or 0)
+                if total > 0:
+                    # 已找到用户设备并完成投递尝试（含全部失败 sent=0），不再降级重复推
+                    return int(res.get("sent") or 0)
+                reason = str(res.get("reason") or "")
+                if reason in ("user_disabled", "module_disabled"):
+                    log.info("用户在推送中心关闭该类通知（%s），不降级直推：%s", reason, title)
+                    return 0
+                # unknown_user / no_device：测试期平滑落到旧直推（租户自带 key + 全局兜底）
+                log.info("通知中心暂无可投设备（%s），降级租户直推：%s", reason or "empty", title)
+            except Exception:
+                log.exception("通知中心投递异常，降级 Bark 直推：%s", title)
+
         keys = keys if keys is not None else self.tenant_keys(svc, tenant)
         if not keys:
             log.info("（未配置 Bark 接收设备，仅记录告警）%s %s", title, body)

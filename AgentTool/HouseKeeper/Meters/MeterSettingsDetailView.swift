@@ -186,6 +186,13 @@ private struct MeterCloudWatchSection: View {
             }
             .disabled(busy)
 
+            NavigationLink {
+                NotifyHubSettingsView()
+            } label: {
+                Label("统一推送通道（多设备 · 账号隔离）", systemImage: "bell.badge.fill")
+                    .font(.system(size: 13, weight: .semibold))
+            }
+
             if store.settings.cloudWatchEnabled || tokenSaved || busy {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("服务器地址")
@@ -370,5 +377,386 @@ private struct MeterCloudWatchSection: View {
         busy = true
         defer { busy = false }
         tip = await sync.sendTestPush(store: store)
+    }
+}
+
+// MARK: - 统一推送通道设置页（notify-hub：账号建档 / 一人多设备 Bark / 模块开关 / 最近投递）
+
+struct NotifyHubSettingsView: View {
+    @ObservedObject private var hub = NotifyHub.shared
+
+    @State private var codeInput = ""
+    @State private var usernameInput = ""
+    @State private var barkInput = ""
+    @State private var deviceNameInput = "我的 iPhone"
+    @State private var addBarkInput = ""
+    @State private var addDeviceNameInput = "我的 iPhone"
+    @State private var showAddDevice = false
+    @State private var formTip: String?
+    @State private var testTip: String?
+    @State private var confirmLogout = false
+
+    private var canBind: Bool {
+        !barkInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        && !codeInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                HStack {
+                    Label("通道服务器", systemImage: "server.rack")
+                        .font(.system(size: 13))
+                    Spacer()
+                    Text(hub.endpoint)
+                        .font(.system(size: 11))
+                        .foregroundColor(.themeText3)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: 175, alignment: .trailing)
+                }
+                HStack {
+                    Label("投递隔离", systemImage: "person.crop.circle.badge.checkmark")
+                        .font(.system(size: 13))
+                    Spacer()
+                    Text("仅发本账号设备")
+                        .font(.system(size: 12))
+                        .foregroundColor(.themeAccentDark)
+                }
+            } footer: {
+                Text("推送通道与电表云端值守共用同一台服务器，地址可在「电表监控设置 → 云端值守」修改。通道按账号隔离：服务器只把事件发到该账号绑定的手机，将来多人使用也不会互推。")
+            }
+
+            if !hub.isBound {
+                bindSection
+            } else {
+                accountSection
+                switchSection
+                devicesSection
+                testSection
+                eventsSection
+            }
+        }
+        .navigationTitle("云端推送通道")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            codeInput = hub.cachedEnrollCode()
+            if usernameInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let cosName = CloudUser.username.trimmingCharacters(in: .whitespacesAndNewlines)
+                usernameInput = cosName.isEmpty ? hub.username : cosName
+            }
+            if hub.isBound { Task { await hub.refreshMe() } }
+        }
+        .alert("退出本机通道登录？", isPresented: $confirmLogout) {
+            Button("退出", role: .destructive) { hub.logout() }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("仅清除本机登录令牌与缓存，服务器上的账号和设备绑定仍保留。")
+        }
+    }
+
+    // MARK: 首次绑定
+
+    private var bindSection: some View {
+        Section {
+            TextField("用户名（如：涛，建议与房账用户名一致）", text: $usernameInput)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .font(.system(size: 14))
+            TextField("粘贴 Bark 首页推送链接或 Key", text: $barkInput, axis: .vertical)
+                .lineLimit(1...3)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .font(.system(size: 13))
+                .padding(8)
+                .background(Color.themeBorder.opacity(0.3))
+                .clipShape(RoundedRectangle(cornerRadius: 9))
+            TextField("接入码（测试期 123456）", text: $codeInput)
+                .textInputAutocapitalization(.never)
+                .keyboardType(.numberPad)
+                .font(.system(size: 14))
+            TextField("本机名称（如：涛的 iPhone）", text: $deviceNameInput)
+                .font(.system(size: 14))
+            Button {
+                Task { await bind() }
+            } label: {
+                HStack(spacing: 8) {
+                    if hub.busy { ProgressView().controlSize(.small) }
+                    Text("绑定账号并同步本机 Bark")
+                        .font(.system(size: 14, weight: .bold))
+                }
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 10)
+                .background(canBind ? Color.themeAccentDark : Color.themeBorder)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+            .disabled(hub.busy || !canBind)
+            if let formTip, !formTip.isEmpty {
+                Text(formTip).font(.system(size: 12)).foregroundColor(.red)
+            }
+        } header: {
+            Text("首次绑定")
+        } footer: {
+            Text("先在 iPhone 的 Bark App 首页复制推送链接（形如 http://服务器地址/一串字符），整段粘贴到上面，App 会自动识别 Key。因 iOS 沙盒限制，公寓管家无法直接读取 Bark 的 Key，只需粘贴这一次。用户名用于在服务器建立独立推送档案，电表等业务事件只投到该账号名下设备；接入码测试期固定 123456，正式版可改为动态码。")
+        }
+    }
+
+    @MainActor
+    private func bind() async {
+        let err = await hub.register(code: codeInput, username: usernameInput,
+                                     barkText: barkInput, deviceName: deviceNameInput)
+        if err == nil {
+            barkInput = ""
+            formTip = nil
+            testTip = "绑定成功，建议立即发送一条通道测试通知"
+        } else {
+            formTip = err
+        }
+    }
+
+    // MARK: 账号
+
+    private var accountSection: some View {
+        Section {
+            HStack {
+                Label("当前账号", systemImage: "person.fill")
+                    .font(.system(size: 14))
+                Spacer()
+                Text(hub.username.isEmpty ? "已绑定" : hub.username)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(.themeAccentDark)
+            }
+            HStack {
+                Label("绑定设备", systemImage: "iphone")
+                    .font(.system(size: 14))
+                Spacer()
+                Text("\(hub.devices.count) 台")
+                    .font(.system(size: 13))
+                    .foregroundColor(.themeText3)
+            }
+            Button(role: .destructive) {
+                confirmLogout = true
+            } label: {
+                Label("退出本机登录", systemImage: "rectangle.portrait.and.arrow.right")
+                    .font(.system(size: 13))
+            }
+        } header: {
+            Text("我的推送账号")
+        }
+    }
+
+    // MARK: 开关
+
+    private var switchSection: some View {
+        Section {
+            Toggle("启用云端推送通道", isOn: Binding(
+                get: { hub.channelEnabled },
+                set: { on in Task { await hub.updatePrefs(channelEnabled: on) } }
+            ))
+            Toggle("电表告警（低电量 / 拉闸 / 值守）", isOn: Binding(
+                get: { hub.meterModuleEnabled },
+                set: { on in Task { await hub.updatePrefs(meterEnabled: on) } }
+            ))
+            .disabled(!hub.channelEnabled)
+        } header: {
+            Text("投递开关")
+        } footer: {
+            Text("关闭总开关后，服务器不再向你的设备推送，也不会回退到服务器全局 Key；电表是第一个接入模块，后续到期提醒、收租提醒等会在这里增加独立开关。")
+        }
+    }
+
+    // MARK: 设备
+
+    private var devicesSection: some View {
+        Section {
+            if hub.devices.isEmpty {
+                Text("暂无设备，请点下方添加本机 Bark")
+                    .font(.system(size: 12))
+                    .foregroundColor(.themeText3)
+            }
+            ForEach(hub.devices) { device in
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack {
+                        Text(device.displayName)
+                            .font(.system(size: 14, weight: .medium))
+                        Spacer()
+                        Text(device.keyMasked ?? "")
+                            .font(.system(size: 11))
+                            .foregroundColor(.themeText3)
+                    }
+                    if let err = device.lastError, !err.isEmpty {
+                        Label("最近投递异常：\(err)", systemImage: "exclamationmark.triangle.fill")
+                            .font(.system(size: 11))
+                            .foregroundColor(.red)
+                            .lineLimit(2)
+                    } else if let ok = device.lastOkAt, ok > 0 {
+                        Text("最近成功：\(Date(timeIntervalSince1970: ok).formatted(date: .abbreviated, time: .shortened))")
+                            .font(.system(size: 10))
+                            .foregroundColor(.themeText3)
+                    }
+                }
+                .swipeActions {
+                    Button(role: .destructive) {
+                        Task { await hub.removeDevice(device) }
+                    } label: {
+                        Label("删除", systemImage: "trash")
+                    }
+                }
+            }
+
+            if showAddDevice {
+                VStack(spacing: 8) {
+                    TextField("新设备 Bark 链接或 Key", text: $addBarkInput, axis: .vertical)
+                        .lineLimit(1...3)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .font(.system(size: 13))
+                        .padding(8)
+                        .background(Color.themeBorder.opacity(0.3))
+                        .clipShape(RoundedRectangle(cornerRadius: 9))
+                    TextField("设备名称（如：备用 iPhone）", text: $addDeviceNameInput)
+                        .font(.system(size: 13))
+                    Button {
+                        Task { await addDevice() }
+                    } label: {
+                        HStack(spacing: 8) {
+                            if hub.busy { ProgressView().controlSize(.small) }
+                            Text("添加这台设备").font(.system(size: 13, weight: .bold))
+                        }
+                        .foregroundColor(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                        .background(addBarkInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                   ? Color.themeBorder : Color.themeAccentDark)
+                        .clipShape(RoundedRectangle(cornerRadius: 9))
+                    }
+                    .disabled(hub.busy || addBarkInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            } else {
+                Button {
+                    withAnimation { showAddDevice = true }
+                } label: {
+                    Label("添加手机 / 设备", systemImage: "plus.circle.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                }
+            }
+
+            if let t = hub.statusText, !t.isEmpty {
+                Text(t).font(.system(size: 11)).foregroundColor(.red)
+            }
+        } header: {
+            Text("我的设备")
+        } footer: {
+            Text("同一账号最多绑 10 台手机，事件会发到每一台；在某台设备行左滑可删除。更换手机后在此添加新设备。")
+        }
+    }
+
+    @MainActor
+    private func addDevice() async {
+        let code = hub.cachedEnrollCode()
+        let err = await hub.register(code: code, username: hub.username,
+                                     barkText: addBarkInput, deviceName: addDeviceNameInput)
+        if err == nil {
+            addBarkInput = ""
+            showAddDevice = false
+        }
+    }
+
+    // MARK: 测试
+
+    private var testSection: some View {
+        Section {
+            Button {
+                Task { testTip = await hub.sendTest() }
+            } label: {
+                HStack {
+                    Label("发送通道测试通知", systemImage: "bell.badge.fill")
+                        .font(.system(size: 14, weight: .semibold))
+                    Spacer()
+                    if hub.busy { ProgressView().controlSize(.small) }
+                }
+            }
+            .disabled(hub.busy)
+            if let testTip, !testTip.isEmpty {
+                Text(testTip)
+                    .font(.system(size: 12))
+                    .foregroundColor(testTip.contains("已投递") ? .themeAccentDark : .red)
+            }
+            if let last = hub.lastSyncAt {
+                Text("最近状态刷新：\(last.formatted(date: .abbreviated, time: .shortened))")
+                    .font(.system(size: 10))
+                    .foregroundColor(.themeText3)
+            }
+        } footer: {
+            Text("测试事件只发送到你账号名下设备，用于验证整条链路：App → 服务器通知中心 → 自建 Bark → iPhone。")
+        }
+    }
+
+    // MARK: 最近投递
+
+    private var eventsSection: some View {
+        Section {
+            if hub.events.isEmpty {
+                Text("暂无投递记录")
+                    .font(.system(size: 12))
+                    .foregroundColor(.themeText3)
+            }
+            ForEach(Array(hub.events.prefix(20))) { event in
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack {
+                        Text(event.title ?? "通知")
+                            .font(.system(size: 13, weight: .medium))
+                            .lineLimit(1)
+                        Spacer()
+                        Text(statusLabel(event.status))
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(statusColor(event.status))
+                    }
+                    if let body = event.body, !body.isEmpty {
+                        Text(body)
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                            .lineLimit(2)
+                    }
+                    Text("\(event.at ?? "") · \(moduleLabel(event.module)) · 成功 \(event.sent ?? 0)/\(event.total ?? 0)")
+                        .font(.system(size: 10))
+                        .foregroundColor(.themeText3)
+                }
+                .padding(.vertical, 2)
+            }
+        } header: {
+            Text("最近投递")
+        }
+    }
+
+    private func moduleLabel(_ module: String?) -> String {
+        switch module {
+        case "meter": return "电表"
+        case "system": return "通道"
+        default: return module ?? "通知"
+        }
+    }
+
+    private func statusLabel(_ status: String?) -> String {
+        switch status {
+        case "sent": return "已送达"
+        case "partial": return "部分送达"
+        case "failed": return "发送失败"
+        case "no_device": return "无设备"
+        case "user_disabled": return "总开关关"
+        case "module_disabled": return "模块关闭"
+        case "pending": return "发送中"
+        default: return status ?? ""
+        }
+    }
+
+    private func statusColor(_ status: String?) -> Color {
+        switch status {
+        case "sent": return .themeAccentDark
+        case "partial": return .orange
+        case "failed": return .red
+        default: return .themeText3
+        }
     }
 }

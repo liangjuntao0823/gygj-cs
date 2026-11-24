@@ -1,0 +1,8 @@
+# Python
+__pycache__/
+*.py[cod]
+*.tmp
+
+# 运行期数据与机密（严禁提交：用户 token、Bark key、设备、投递事件、接入码）
+notify.json
+service.json

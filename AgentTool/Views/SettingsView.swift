@@ -680,6 +680,20 @@ struct SettingsView: View {
     private var servicesSection: some View {
         Section {
             NavigationLink {
+                NotifyHubSettingsView()
+            } label: {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("云端推送通道")
+                        Text("账号隔离 · 多设备 Bark · 电表/到期/收租")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                } icon: {
+                    Image(systemName: "bell.badge.fill")
+                }
+            }
+            NavigationLink {
                 MeterSettingsDetailView()
             } label: {
                 Label {
