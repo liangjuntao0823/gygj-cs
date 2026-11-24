@@ -98,7 +98,8 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
             q = _q(handler)
             since = int(q["since"]) if q.get("since", "").isdigit() else None
             include_deleted = q.get("includeDeleted") in ("1", "true")
-            return send(200, store.list_houses(since=since, include_deleted=include_deleted))
+            payload = store.list_houses(since=since, include_deleted=include_deleted)
+            return send(200, {"ok": True, **payload})
 
         if path in (f"{PREFIX}/houses", f"{PREFIX}/houses:batch") and method == "POST":
             if not handler._require_auth():

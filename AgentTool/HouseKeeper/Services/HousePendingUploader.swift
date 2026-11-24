@@ -42,7 +42,8 @@ final class HousePendingUploader {
         let keys = pendingKeys
         guard !keys.isEmpty else { return 0 }
         let houses = (try? context.fetch(FetchDescriptor<House>())) ?? []
-        let byKey = Dictionary(uniqueKeysWithValues: houses.map { ($0.mediaRoomKey, $0) })
+        let byKey = Dictionary(houses.map { ($0.mediaRoomKey, $0) },
+                               uniquingKeysWith: { a, _ in a })
         var done = 0
         for key in keys {
             guard let h = byKey[key] else {
