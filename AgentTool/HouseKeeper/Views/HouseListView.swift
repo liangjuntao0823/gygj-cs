@@ -1647,6 +1647,32 @@ struct HouseListView: View {
     /// 把单套房源推送到云端账本（读改写，同房号覆盖）。无云存储配置则跳过（仅本地）。
     /// v1.72（#7）：动作按场景命名（切换状态同步…）；（#8）账本上传也驱动卡片进度条；（#6）写本地账本镜像。
     private func pushHouseToCloud(_ house: House, action: String = "同步房源（本地→云端）", changeText: String = "") {
+        // 服务器模式：状态切换直接推服务器权威库，不走旧 COS 账本链路；失败入待补传队列
+        if HouseServerMode.ready {
+            let roomKey = house.mediaRoomKey
+            let roomNo = house.displayRoomNo
+            Task {
+                do {
+                    _ = try await HouseSyncEngine.shared.pushHouse(house)
+                    await MainActor.run {
+                        HouseActionNotifier.shared.send(
+                            key: "status.\(roomKey)",
+                            title: "状态已同步",
+                            body: "\(roomNo) 已改为\(house.status.label)，服务器已更新")
+                    }
+                } catch {
+                    await MainActor.run {
+                        HousePendingUploader.shared.markPending(roomKey)
+                        HouseActionNotifier.shared.send(
+                            key: "statusfail.\(roomKey)",
+                            title: "状态同步失败",
+                            body: "\(roomNo) 已改本机，服务器没同步上：\(error.localizedDescription)",
+                            silent: true)
+                    }
+                }
+            }
+            return
+        }
         guard let config = CosConfig.load() else { return }
         let record = CloudHouseSync.record(from: house, username: CloudUser.username)
         let roomKey = house.mediaRoomKey
@@ -2891,7 +2917,39 @@ struct HouseListView: View {
         }
         try? ctx.save()
         // v2.24：批量已租也要推云端（此前只改本地，下次同步被云端旧状态回滚回去）
-        if let config = CosConfig.load(), config.isValid, !rentedHouses.isEmpty {
+        // 服务器模式：逐套推服务器权威库，失败入待补传；旧 COS 链路仅在非服务器模式走
+        if HouseServerMode.ready, !rentedHouses.isEmpty {
+            let toPush = rentedHouses
+            Task {
+                var okRooms: [String] = []
+                var failRooms: [String] = []
+                for house in toPush {
+                    let roomKey = house.mediaRoomKey
+                    let roomNo = house.displayRoomNo
+                    do {
+                        _ = try await HouseSyncEngine.shared.pushHouse(house)
+                        okRooms.append(roomNo)
+                    } catch {
+                        await MainActor.run { HousePendingUploader.shared.markPending(roomKey) }
+                        failRooms.append(roomNo)
+                    }
+                }
+                await MainActor.run {
+                    if failRooms.isEmpty {
+                        HouseActionNotifier.shared.send(
+                            key: "batch.rented",
+                            title: "批量改已租完成",
+                            body: "\(okRooms.count) 套已改为已租，服务器同步 \(okRooms.count)/\(okRooms.count)")
+                    } else {
+                        HouseActionNotifier.shared.send(
+                            key: "batch.rented",
+                            title: "部分房源没传上",
+                            body: "\(okRooms.count) 套同步成功，\(failRooms.count) 套失败（\(failRooms.joined(separator: "、"))），联网后自动重试",
+                            silent: true)
+                    }
+                }
+            }
+        } else if let config = CosConfig.load(), config.isValid, !rentedHouses.isEmpty {
             let toPush = rentedHouses
             Task {
                 var okRooms: [String] = []
