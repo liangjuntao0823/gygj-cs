@@ -566,6 +566,14 @@ struct HouseListView: View {
         }
         .onAppear {
             reloadHouses()
+            // 服务器模式：进页面静默增量拉取权威库（小 JSON，失败不打扰、不打断操作）
+            if HouseServerMode.ready, let ctx = houseModelContext {
+                Task {
+                    if let n = try? await HouseSyncEngine.shared.pull(context: ctx), n > 0 {
+                        reloadHouses()
+                    }
+                }
+            }
             // v2.58（#3）：整次云端同步的重试入口——页面必须回报真实结果（成功/失败/等确认）
             TaskRetryPerformer.shared.cloudPull = { retryTaskID in
                 await syncCloudHouses(retryTaskID: retryTaskID)
@@ -1947,6 +1955,8 @@ struct HouseListView: View {
     private func runServerSync(context ctx: ModelContext) async -> CloudPullRunOutcome {
         let progressID = syncCenter.beginTransient(kind: .cloudPull, title: "同步房源", total: 1)
         do {
+            // 先补传本地离线写，再拉取服务器增量，保证两端最终一致
+            _ = await HousePendingUploader.shared.flush(context: ctx)
             let changed = try await HouseSyncEngine.shared.pull(context: ctx)
             showToast(changed > 0 ? "已同步 \(changed) 套房源" : "房源已是最新")
             syncCenter.endTransient(id: progressID)

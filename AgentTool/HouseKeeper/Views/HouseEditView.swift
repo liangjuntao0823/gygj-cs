@@ -1219,10 +1219,12 @@ struct HouseEditView: View {
             } catch {
                 await MainActor.run {
                     if !mediaSnapshots.isEmpty { SyncTaskCenter.shared.discard(id: taskID) }
+                    // 标记待补传，联网后自动重试，不丢改动
+                    HousePendingUploader.shared.markPending(target.mediaRoomKey)
                     HouseActionNotifier.shared.send(
                         key: "fail.\(target.mediaRoomKey)",
                         title: "已存本机",
-                        body: "服务器同步失败：\(error.localizedDescription)，联网后可在同步入口重试")
+                        body: "服务器同步失败：\(error.localizedDescription)，联网后自动补传")
                 }
             }
         }

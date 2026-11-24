@@ -78,6 +78,17 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
                 return True
             return send(200, {"ok": True, **store.stats()})
 
+        # ---- COS 临时凭证：服务器签发，客户端按需取用，永久密钥不落 App ----
+        if path == f"{PREFIX}/cos-credentials" and method == "GET":
+            if not handler._require_auth():
+                return True
+            try:
+                import cos_sts
+                return send(200, cos_sts.credentials_for_client())
+            except Exception as e:
+                return send(503, {"ok": False, "error": "sts_unavailable",
+                                  "detail": str(e)[:200]})
+
         # ---- 集合级 ----
         if path == f"{PREFIX}/houses" and method == "GET":
             if not handler._require_auth():
