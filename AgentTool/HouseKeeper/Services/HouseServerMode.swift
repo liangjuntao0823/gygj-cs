@@ -9,6 +9,7 @@
 
 import Foundation
 
+@MainActor
 enum HouseServerMode {
     private static let modeKey = "house.serverMode.v1"
 

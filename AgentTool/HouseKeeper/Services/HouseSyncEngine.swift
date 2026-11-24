@@ -197,10 +197,10 @@ final class HouseSyncEngine: ObservableObject {
         return s
     }
 
-    private func snapshot(_ h: House) -> [String: Any] {
-        ["roomNo": h.roomNo, "tower": h.tower, "landlord": h.landlord,
-         "layout": h.layout, "price": h.price, "password": h.password,
-         "remark": h.remark, "status": h.statusRaw, "deleted": h.isTrashed,
-         "media": h.mediaItems.map { $0.fileName }.sorted()]
+    private func snapshot(_ h: House) -> [String: String] {
+        ["roomNo": h.roomNo, "tower": String(h.tower), "landlord": h.landlord,
+         "layout": h.layout, "price": String(h.price), "password": h.password,
+         "remark": h.remark, "status": h.statusRaw, "deleted": String(h.isTrashed),
+         "media": h.mediaItems.map { $0.fileName }.sorted().joined(separator: "|")]
     }
 }
