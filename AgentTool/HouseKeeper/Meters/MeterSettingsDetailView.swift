@@ -164,9 +164,7 @@ private struct MeterCloudWatchSection: View {
     @State private var tip: String?
     @State private var busy = false
     @State private var tokenSaved = false
-    @State private var pollTag: Int = 30          // 云端轮询预设：30/60/120 分钟，0=自定义
-    @State private var customPollInput = ""
-    @State private var pollTip: String?
+    @State private var pollTag: Int = 1          // 云端轮询间隔：1–12 小时
     @State private var runningNow = false         // 「立即轮询一次」请求中
 
     @MainActor
@@ -300,13 +298,8 @@ private struct MeterCloudWatchSection: View {
         .onAppear {
             endpointInput = store.settings.cloudEndpoint
             tokenSaved = sync.hasToken
-            let minutes = store.settings.cloudPollMinutes
-            if [30, 60, 120].contains(minutes) {
-                pollTag = minutes
-            } else {
-                pollTag = 0
-                customPollInput = String(minutes)
-            }
+            let hours = store.settings.cloudPollMinutes / 60
+            pollTag = (1...12).contains(hours) ? hours : 1
         }
     }
 
@@ -319,61 +312,24 @@ private struct MeterCloudWatchSection: View {
                 .font(.system(size: 12))
                 .foregroundColor(.themeText3)
             Picker("服务器轮询间隔", selection: $pollTag) {
-                Text("30 分钟").tag(30)
-                Text("1 小时").tag(60)
-                Text("2 小时").tag(120)
-                Text("自定义").tag(0)
+                ForEach(1...12, id: \.self) { h in
+                    Text("\(h) 小时").tag(h)
+                }
             }
             .pickerStyle(.menu)
             .font(.system(size: 13))
             .onChange(of: pollTag) { _, tag in
-                guard tag != 0 else {
-                    customPollInput = String(store.settings.cloudPollMinutes)
-                    return
-                }
-                pollTip = nil
-                store.settings.cloudPollMinutes = tag
+                store.settings.cloudPollMinutes = tag * 60
                 store.saveSettings()   // 防抖全量同步，pollIntervalSeconds 随 config 下发
             }
 
-            if pollTag == 0 {
-                HStack(spacing: 8) {
-                    TextField("自定义分钟（5–1440）", text: $customPollInput)
-                        .keyboardType(.numberPad)
-                        .font(.system(size: 13))
-                        .padding(8)
-                        .background(Color.themeBorder.opacity(0.3))
-                        .clipShape(RoundedRectangle(cornerRadius: 9))
-                    Button("应用") { applyCustomPoll() }
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(.themeAccentDark)
-                }
-                if let pollTip, !pollTip.isEmpty {
-                    Text(pollTip)
-                        .font(.system(size: 11))
-                        .foregroundColor(.red)
-                }
-            }
-
-            Text("云端轮询开启并同步后，由服务器按此频率代你查询电表平台；未开启时选择先保存在本机。它与本页上方仅在 App 打开时生效的「定时自动刷新」是两套机制。保存并同步后服务器约半分钟内按新间隔调度、无需重启；间隔越短查询越频繁，建议不低于 10–30 分钟，避免被电表平台限流。")
+            Text("云端轮询开启并同步后，由服务器按此频率（1–12 小时）代你查询电表平台；未开启时选择先保存在本机。它与本页上方仅在 App 打开时生效的「定时自动刷新」是两套机制。保存并同步后服务器下一轮即按新间隔调度，无需重启。")
                 .font(.system(size: 10))
                 .foregroundColor(.themeText3)
         }
         .padding(9)
         .background(Color.themeBorder.opacity(0.18))
         .clipShape(RoundedRectangle(cornerRadius: 9))
-    }
-
-    @MainActor
-    private func applyCustomPoll() {
-        let raw = customPollInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let minutes = Int(raw), (5...1440).contains(minutes) else {
-            pollTip = "请输入 5–1440 之间的整数分钟"
-            return
-        }
-        pollTip = nil
-        store.settings.cloudPollMinutes = minutes
-        store.saveSettings()   // 开启云端值守时由同步钩子防抖上报；未开启则先存本机
     }
 
     // MARK: 动作
@@ -416,6 +372,11 @@ private struct MeterCloudWatchSection: View {
     @discardableResult
     @MainActor
     private func performEnroll() async -> Bool {
+        if sync.hasToken {
+            // 已有令牌绝不重复接入，从源头杜绝重复 enroll 产生重复租户
+            tokenSaved = true
+            return true
+        }
         do {
             _ = try await sync.enroll(store: store, code: codeInput)
             codeInput = ""
@@ -901,6 +862,26 @@ struct CloudPushSettingsView: View {
             } footer: {
                 Text("通道按账号隔离，事件只投到本账号绑定的手机；首次使用先进入上方绑定 Bark 首页推送链接。电表“要不要服务器轮询查询”在「电表监控设置 → 云端轮询」里控制，与本页“要不要接收通知”相互独立。后续到期、收租、待办等提醒会在本页增加独立开关。")
             }
+
+            Section {
+                NavigationLink {
+                    MeterTemplateEditView(eventKey: "low", navTitle: "低电量文案")
+                } label: {
+                    Label("低电量通知文案", systemImage: "battery.25")
+                        .font(.system(size: 13))
+                }
+                NavigationLink {
+                    MeterTemplateEditView(eventKey: "off", navTitle: "拉闸文案")
+                } label: {
+                    Label("拉闸通知文案", systemImage: "power")
+                        .font(.system(size: 13))
+                }
+            } header: {
+                Text("自定义文案")
+            } footer: {
+                Text("自定义主标题、副标题、正文与时间显示，支持占位符，可先预览真实推送；留空字段自动回退默认文案。需先绑定推送通道。")
+            }
+            .disabled(!hub.isBound)
         }
         .navigationTitle("云端推送")
         .navigationBarTitleDisplayMode(.inline)
@@ -923,5 +904,118 @@ struct CloudPushSettingsView: View {
             return "推送通道总开关已关闭；请先到下方「通道账号、设备、测试与投递记录」打开总开关，再设置电表推送。"
         }
         return "控制服务器云端轮询产生的低电量、拉闸、值守告警是否推送到本账号设备。关闭后服务器仍会按「电表监控设置 → 云端轮询」的开关与间隔查询并更新云端快照，但不发通知；重新打开即恢复推送。"
+    }
+}
+
+struct MeterTemplateEditView: View {
+    let eventKey: String
+    let navTitle: String
+
+    @ObservedObject private var hub = NotifyHub.shared
+    @State private var title = ""
+    @State private var subtitle = ""
+    @State private var bodyText = ""
+    @State private var showTime = true
+    @State private var loaded = false
+    @State private var busy = false
+    @State private var message: String?
+
+    var body: some View {
+        Form {
+            Section {
+                TextField("主标题", text: $title)
+                TextField("副标题（可留空）", text: $subtitle)
+            } header: {
+                Text("标题")
+            }
+
+            Section {
+                TextEditor(text: $bodyText)
+                    .frame(minHeight: 110)
+                    .font(.system(size: 13))
+            } header: {
+                Text("正文")
+            }
+
+            Section {
+                Toggle("通知中显示时间", isOn: $showTime)
+            } header: {
+                Text("时间")
+            } footer: {
+                Text("关闭后正文中的 {time} 自动隐藏，并清理多余空格与标点。")
+            }
+
+            Section {
+                Text("可用占位符：{label} 房号、{uid} 户号、{remain} 剩余电量、{threshold} 阈值、{time} 时间。留空字段自动回退默认文案。")
+                    .font(.system(size: 11))
+                    .foregroundColor(.themeText3)
+            }
+
+            Section {
+                Button {
+                    Task { await save() }
+                } label: {
+                    Label("保存文案", systemImage: "square.and.arrow.down")
+                }
+                .disabled(busy || !hub.isBound)
+
+                Button {
+                    Task {
+                        busy = true
+                        message = await hub.previewMeterTemplate(eventKey)
+                        busy = false
+                    }
+                } label: {
+                    Label("预览（真实推一条）", systemImage: "paperplane.fill")
+                }
+                .disabled(busy || !hub.isBound)
+
+                if let message {
+                    Text(message)
+                        .font(.system(size: 11))
+                        .foregroundColor(.themeText3)
+                }
+            }
+        }
+        .navigationTitle(navTitle)
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            guard !loaded else { return }
+            loaded = true
+            Task { await load() }
+        }
+    }
+
+    private func load() async {
+        busy = true
+        do {
+            let set = try await hub.loadMeterTemplates()
+            if let tpl = eventKey == "off" ? set.off : set.low {
+                title = tpl.title
+                subtitle = tpl.subtitle
+                bodyText = tpl.body
+                showTime = tpl.showTime
+            }
+            message = nil
+        } catch {
+            message = "加载失败：\(error.localizedDescription)"
+        }
+        busy = false
+    }
+
+    private func save() async {
+        busy = true
+        let tpl = MeterTemplate(
+            title: title.trimmingCharacters(in: .whitespacesAndNewlines),
+            subtitle: subtitle.trimmingCharacters(in: .whitespacesAndNewlines),
+            body: bodyText.trimmingCharacters(in: .whitespacesAndNewlines),
+            showTime: showTime)
+        do {
+            _ = try await hub.saveMeterTemplate(eventKey, tpl: tpl)
+            message = "已保存并在后续通知生效"
+        } catch {
+            message = "保存失败：\(error.localizedDescription)"
+        }
+        busy = false
     }
 }

@@ -82,9 +82,9 @@ MAX_METERS_PER_TENANT = 500
 MAX_BARK_KEYS = 10
 
 # 租户级云端轮询间隔（App「服务器轮询间隔」下发，单位秒）：快捷档 30/60/120 分钟，允许自定义 5～1440 分钟
-DEFAULT_TENANT_POLL_SECONDS = 1800
-MIN_TENANT_POLL_SECONDS = 300
-MAX_TENANT_POLL_SECONDS = 86400
+DEFAULT_TENANT_POLL_SECONDS = 3600
+MIN_TENANT_POLL_SECONDS = 3600
+MAX_TENANT_POLL_SECONDS = 43200
 
 logging.basicConfig(
     level=logging.INFO,
@@ -399,13 +399,22 @@ class Store:
             return None, None
         return token, tenant
 
-    def enroll(self, code: str, device: str = "") -> str | None:
+    def enroll(self, code: str, device: str = "", user_token: str = "") -> str | None:
         expected = str(self.svc.get("enroll_code") or "")
         if not expected or not code or not hmac.compare_digest(str(code).strip(), expected):
             return None
         import secrets
-        token = secrets.token_hex(24)
         tenants = self.load_tenants()
+        user_token = str(user_token or "").strip()
+        # 幂等：同一通知用户 + 同一设备重复接入时复用既有租户，避免反复 enroll 产生重复租户各自轮询轰炸
+        if user_token:
+            for existing_token, existing in tenants.items():
+                if (str(existing.get("notify_user_token") or "") == user_token
+                        and str(existing.get("device") or "") == str(device or "")):
+                    log.info("重复接入复用既有租户 device=%s token=%s",
+                             str(device or "")[:40], mask_secret(existing_token, 6, 4))
+                    return existing_token
+        token = secrets.token_hex(24)
         tenants[token] = {
             "enabled": False,           # App 打开云端值守开关并 PUT config 后才置 true
             "created_at": iso_now(),
@@ -420,6 +429,7 @@ class Store:
             },
             "meters": [],
             "bark_keys": [],
+            "notify_user_token": user_token,
         }
         self.save_tenants(tenants)
         log.info("新租户登记 device=%s token=%s", str(device or "")[:40], mask_secret(token, 6, 4))
@@ -703,7 +713,8 @@ class Engine:
                 m["shijian"] = str(data.get("shijian") or m["shijian"] or "")
                 m["last_ok_ts"] = now_ts()
                 ok_count += 1
-                self.evaluate_meter(svc, tenant, uid, m, threshold, now_ts())
+                self.evaluate_meter(svc, tenant, uid, m, threshold, now_ts(),
+                                    period_seconds=float(self.tenant_poll_interval(svc, tenant)))
                 if idx < len(targets) - 1:
                     time.sleep(float(svc.get("request_interval_seconds", 1.5)))
 
@@ -759,8 +770,30 @@ class Engine:
             )
 
     # ---- 判定与推送（纯状态迁移，便于单测直接调用）----
+    @staticmethod
+    def _within_period(m: dict[str, Any], push_key: str, now: float, period_seconds: float) -> bool:
+        # 同一轮询期内已推送过：抑制重复（run-now 连点、状态重置、重复唤醒都不再发）
+        last = float(m.get(push_key) or 0)
+        return period_seconds > 0 and last > 0 and now - last < period_seconds
+
+    def _render_alert(self, tenant: dict[str, Any], event_key: str, uid: str,
+                      label: str, shengyu: float, threshold: float) -> tuple[str, str, str] | None:
+        # 经统一推送中心按用户自定义模板渲染；未绑定/无模板/异常都返回 None 走默认硬编码
+        user_token = str(tenant.get("notify_user_token") or "")
+        if not user_token or self.hub is None:
+            return None
+        try:
+            return self.hub.render_meter(user_token, event_key, {
+                "label": label, "uid": uid,
+                "remain": f"{shengyu:g}", "threshold": f"{threshold:g}",
+            })
+        except Exception:
+            log.exception("通知模板渲染失败，改用默认文案 event=%s uid=%s", event_key, uid)
+            return None
+
     def evaluate_meter(self, svc: dict[str, Any], tenant: dict[str, Any],
-                       uid: str, m: dict[str, Any], threshold: float, now: float) -> list[str]:
+                       uid: str, m: dict[str, Any], threshold: float, now: float,
+                       period_seconds: float = 0.0) -> list[str]:
         sent_titles: list[str] = []
         keys = self.tenant_keys(svc, tenant)
         label = meter_label(uid, m.get("room") or "")
@@ -774,13 +807,22 @@ class Engine:
             if not m.get("off_active"):
                 m["off_active"] = True
                 m["off_since"] = now
-                title, body = "【电表拉闸】", f"{label} 电表已拉闸，请及时处理。"
-                if self._push_tenant(svc, tenant, title, body, keys=keys) > 0:
-                    m["last_off_push"] = now
-                    sent_titles.append(title)
+                if not self._within_period(m, "last_off_push", now, period_seconds):
+                    rendered = self._render_alert(tenant, "off", uid, label, shengyu, threshold)
+                    if rendered:
+                        title, subtitle, body = rendered
+                    else:
+                        title, subtitle, body = "【电表拉闸】", "", f"{label} 电表已拉闸，请及时处理。"
+                    if self._push_tenant(svc, tenant, title, body, keys=keys, subtitle=subtitle) > 0:
+                        m["last_off_push"] = now
+                        sent_titles.append(title)
             elif now - float(m.get("last_off_push") or 0) >= float(svc.get("off_remind_hours", 24)) * 3600:
-                title, body = "【电表拉闸提醒】", f"{label} 仍处于拉闸状态，请尽快处理。"
-                if self._push_tenant(svc, tenant, title, body, keys=keys) > 0:
+                rendered = self._render_alert(tenant, "off", uid, label, shengyu, threshold)
+                if rendered:
+                    title, subtitle, body = rendered
+                else:
+                    title, subtitle, body = "【电表拉闸提醒】", "", f"{label} 仍处于拉闸状态，请尽快处理。"
+                if self._push_tenant(svc, tenant, title, body, keys=keys, subtitle=subtitle) > 0:
                     m["last_off_push"] = now
                     sent_titles.append(title)
             # 拉闸期间挂起低电量状态，避免重复噪音
@@ -797,15 +839,22 @@ class Engine:
             if not m.get("low_active"):
                 m["low_active"] = True
                 m["low_since"] = now
-                title = "【电表低电量】"
-                body = f"{label} 剩余 {shengyu:g} 度（阈值 {threshold:g} 度），请及时充值。"
-                if self._push_tenant(svc, tenant, title, body, keys=keys) > 0:
-                    m["last_low_push"] = now
-                    sent_titles.append(title)
+                if not self._within_period(m, "last_low_push", now, period_seconds):
+                    rendered = self._render_alert(tenant, "low", uid, label, shengyu, threshold)
+                    if rendered:
+                        title, subtitle, body = rendered
+                    else:
+                        title, subtitle, body = "【电表低电量】", "", f"{label} 剩余 {shengyu:g} 度（阈值 {threshold:g} 度），请及时充值。"
+                    if self._push_tenant(svc, tenant, title, body, keys=keys, subtitle=subtitle) > 0:
+                        m["last_low_push"] = now
+                        sent_titles.append(title)
             elif now - float(m.get("last_low_push") or 0) >= float(svc.get("low_remind_hours", 24)) * 3600:
-                title = "【电表低电量提醒】"
-                body = f"{label} 仍剩 {shengyu:g} 度（阈值 {threshold:g} 度），请尽快充值。"
-                if self._push_tenant(svc, tenant, title, body, keys=keys) > 0:
+                rendered = self._render_alert(tenant, "low", uid, label, shengyu, threshold)
+                if rendered:
+                    title, subtitle, body = rendered
+                else:
+                    title, subtitle, body = "【电表低电量提醒】", "", f"{label} 仍剩 {shengyu:g} 度（阈值 {threshold:g} 度），请尽快充值。"
+                if self._push_tenant(svc, tenant, title, body, keys=keys, subtitle=subtitle) > 0:
                     m["last_low_push"] = now
                     sent_titles.append(title)
         elif m.get("low_active") and not is_off:
@@ -819,12 +868,14 @@ class Engine:
 
     def _push_tenant(self, svc: dict[str, Any], tenant: dict[str, Any],
                      title: str, body: str, keys: list[str] | None = None,
-                     event_type: str = "alert", data: dict[str, Any] | None = None) -> int:
+                     event_type: str = "alert", data: dict[str, Any] | None = None,
+                     subtitle: str = "") -> int:
         # 优先走统一通知中心：按租户绑定的用户投到该用户自己的 Bark 设备，实现多用户隔离
         user_token = str(tenant.get("notify_user_token") or "")
         if user_token and self.hub is not None:
             try:
-                res = self.hub.dispatch(user_token, "meter", event_type, title, body, data=data or {})
+                res = self.hub.dispatch(user_token, "meter", event_type, title, body,
+                                        data=data or {}, subtitle=subtitle)
                 total = int(res.get("total") or 0)
                 if total > 0:
                     # 已找到用户设备并完成投递尝试（含全部失败 sent=0），不再降级重复推

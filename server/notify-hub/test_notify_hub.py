@@ -252,5 +252,64 @@ class TestHttpRoute(unittest.TestCase):
         self.assertEqual(h.sent[-1][0], 401)
 
 
+class TestMeterTemplates(unittest.TestCase):
+    def setUp(self):
+        self.tmp, self.hub, self.sender = make_hub()
+        view, _ = self.hub.register(code="123456", username="涛", bark_key=KEY_A)
+        self.token = view["token"]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_render_text_placeholder_and_cleanup(self):
+        self.assertEqual(
+            nh.render_text("{label} 剩余 {remain} 度", {"label": "101", "remain": "12.5"}),
+            "101 剩余 12.5 度")
+        # 时间隐藏后遗留的空括号 / 悬空空格与标点要清理干净
+        self.assertEqual(nh.render_text("（{x}）", {"x": ""}), "")
+        self.assertEqual(nh.render_text("充值。 {time}", {"time": ""}), "充值。")
+
+    def test_normalize_template_fallback_and_trim(self):
+        dflt = nh.DEFAULT_TEMPLATES["meter"]["low"]
+        tpl = nh.normalize_template({}, dflt)
+        self.assertEqual(tpl["title"], dflt["title"])
+        self.assertEqual(tpl["subtitle"], "")
+        self.assertTrue(tpl["showTime"])
+        custom = nh.normalize_template({"title": "  自定义标题  ", "subtitle": "快处理"}, dflt)
+        self.assertEqual(custom["title"], "自定义标题")
+        self.assertEqual(custom["subtitle"], "快处理")
+
+    def test_get_default_templates(self):
+        tpls = self.hub.get_templates(self.token)
+        self.assertEqual(set(tpls.keys()), {"low", "off"})
+        self.assertEqual(tpls["low"]["title"], "【电表低电量】")
+
+    def test_set_and_render_custom_template(self):
+        res = self.hub.set_templates(self.token, "meter", {
+            "low": {"title": "自定义低电", "body": "{label} 剩 {remain} 度", "showTime": False}})
+        self.assertEqual(res["low"]["title"], "自定义低电")
+        # 未改动的 off 仍回默认
+        self.assertEqual(res["off"]["title"], "【电表拉闸】")
+        title, subtitle, body = self.hub.render_meter(
+            self.token, "low", {"label": "201", "remain": "8", "threshold": "30"})
+        self.assertEqual(title, "自定义低电")
+        self.assertEqual(subtitle, "")
+        self.assertEqual(body, "201 剩 8 度")
+
+    def test_render_unknown_user_returns_none(self):
+        self.assertIsNone(self.hub.render_meter("nt_nope", "low", {}))
+        self.assertIsNone(self.hub.get_templates("nt_nope"))
+        self.assertIsNone(self.hub.set_templates("nt_nope", "meter", {}))
+
+    def test_preview_dispatches_one_event(self):
+        before = len(self.sender.calls)
+        res = self.hub.preview_template(self.token, "meter", "low")
+        self.assertTrue(res.get("ok"))
+        self.assertEqual(len(self.sender.calls), before + 1)
+        base, key, payload = self.sender.calls[-1]
+        self.assertEqual(payload["title"], "【电表低电量】")
+        self.assertIn("示例房号", payload["body"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

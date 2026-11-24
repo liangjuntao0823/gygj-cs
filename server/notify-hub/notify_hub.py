@@ -55,6 +55,53 @@ _KEY_RE = re.compile(r"^[A-Za-z0-9._-]{8,128}$")
 _BARK_RESERVED = {"push", "info", "ping", "devices", "register", "health", "api", "notify"}
 _UNSET = object()
 
+# 通知文案模板：用户可在 App 内自定义主标题/副标题/正文/是否显示时间；未自定义时用下列默认值。
+# 正文支持占位符：{label} 房号、{remain} 剩余电量、{threshold} 阈值、{uid} 户号、{time} 时间。
+_PLACEHOLDER_RE = re.compile(r"\{([a-zA-Z_]+)\}")
+
+DEFAULT_TEMPLATES: dict[str, dict[str, dict[str, Any]]] = {
+    "meter": {
+        "low": {
+            "title": "【电表低电量】",
+            "subtitle": "",
+            "body": "{label} 剩余 {remain} 度（阈值 {threshold} 度），请及时充值。{time}",
+            "showTime": True,
+        },
+        "off": {
+            "title": "【电表拉闸】",
+            "subtitle": "",
+            "body": "{label} 电表已拉闸，请及时处理。{time}",
+            "showTime": True,
+        },
+    }
+}
+
+
+def normalize_template(raw: Any, default: dict[str, Any]) -> dict[str, Any]:
+    raw = raw if isinstance(raw, dict) else {}
+    return {
+        "title": str(raw.get("title") or default["title"]).strip()[:120],
+        "subtitle": str(raw.get("subtitle") or "").strip()[:120],
+        "body": str(raw.get("body") or default["body"]).strip()[:1000],
+        "showTime": bool(raw.get("showTime", default.get("showTime", True))),
+    }
+
+
+def render_text(text: str, variables: dict[str, Any]) -> str:
+    """占位符替换 + 清理时间隐藏后遗留的空格/空括号/悬空标点。"""
+    def _repl(m: re.Match) -> str:
+        return str(variables.get(m.group(1), ""))
+    s = _PLACEHOLDER_RE.sub(_repl, str(text or ""))
+    s = s.replace("（ ）", "").replace("( )", "")
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"\s+([，。；：、）])", r"\1", s)
+    s = re.sub(r"（\s*）|\(\s*\)", "", s)
+    return s.strip()
+
+
+def time_string(ts: float | None = None) -> str:
+    return time.strftime("%m-%d %H:%M", time.localtime(ts if ts is not None else time.time()))
+
 
 # ---------------------------------------------------------------------------
 # 小工具
@@ -439,7 +486,7 @@ class HubRuntime:
 
     def dispatch(self, user_token: str, module: str, event_type: str, title: str, body: str,
                  data: dict[str, Any] | None = None, idem_key: str | None = None,
-                 level: str | None = None) -> dict[str, Any]:
+                 level: str | None = None, subtitle: str = "") -> dict[str, Any]:
         """业务模块统一入口：只按 user_token 投该用户名下设备，绝不跨用户群发。"""
         module = str(module or "generic")[:32]
         event_type = str(event_type or "alert")[:32]
@@ -502,6 +549,8 @@ class HubRuntime:
                 "device_key": key, "title": title, "body": body,
                 "group": group, "isArchive": 1,
             }
+            if subtitle:
+                payload["subtitle"] = subtitle[:120]
             if level:
                 payload["level"] = level
             try:
@@ -550,6 +599,65 @@ class HubRuntime:
         return self.dispatch(
             user_token, "system", "test", "公寓管家推送通道测试",
             f"通道正常 · {iso_now()} · 本条仅发送到你账号绑定的设备。", level="active")
+
+    # ---- 通知文案模板（用户级，存 notify.json）----
+
+    def get_templates(self, user_token: str, module: str = "meter") -> dict[str, dict] | None:
+        defaults = DEFAULT_TEMPLATES.get(module)
+        if defaults is None:
+            return None
+        with self.store.lock:
+            user = self.store.doc()["users"].get(user_token)
+            if not isinstance(user, dict):
+                return None
+            saved_m = (user.get("templates") or {}).get(module, {})
+            saved_m = saved_m if isinstance(saved_m, dict) else {}
+            return {key: normalize_template(saved_m.get(key), dflt)
+                    for key, dflt in defaults.items()}
+
+    def set_templates(self, user_token: str, module: str, raw: Any) -> dict[str, dict] | None:
+        defaults = DEFAULT_TEMPLATES.get(module)
+        if defaults is None:
+            return None
+        raw = raw if isinstance(raw, dict) else {}
+        with self.store.lock:
+            doc = self.store.doc()
+            user = doc["users"].get(user_token)
+            if not isinstance(user, dict):
+                return None
+            saved_m = user.setdefault("templates", {}).setdefault(module, {})
+            for key, dflt in defaults.items():
+                if key in raw and isinstance(raw[key], dict):
+                    saved_m[key] = normalize_template(raw[key], dflt)
+            user["updated_at"] = iso_now()
+            doc["users"][user_token] = user
+            self.store.save(doc)
+            return {key: normalize_template(saved_m.get(key), dflt)
+                    for key, dflt in defaults.items()}
+
+    def render_meter(self, user_token: str, event_key: str,
+                     variables: dict[str, Any]) -> tuple[str, str, str] | None:
+        """返回渲染后的 (title, subtitle, body)；用户不存在返回 None，调用方走硬编码兜底。"""
+        tpls = self.get_templates(user_token, "meter")
+        if not tpls or event_key not in tpls:
+            return None
+        tpl = tpls[event_key]
+        vars_copy = dict(variables)
+        vars_copy["time"] = time_string() if tpl["showTime"] else ""
+        return (render_text(tpl["title"], vars_copy),
+                render_text(tpl["subtitle"], vars_copy),
+                render_text(tpl["body"], vars_copy))
+
+    def preview_template(self, user_token: str, module: str, event_key: str) -> dict[str, Any]:
+        if event_key not in DEFAULT_TEMPLATES.get(module, {}):
+            return {"ok": False, "error": "unknown_event"}
+        sample = {"label": "示例房号", "uid": "012334", "remain": "12.5", "threshold": "30"}
+        rendered = self.render_meter(user_token, event_key, sample)
+        if rendered is None:
+            return {"ok": False, "error": "unauthorized"}
+        title, subtitle, body = rendered
+        return self.dispatch(user_token, module, "preview_" + event_key, title, body,
+                             subtitle=subtitle, data={"preview": True})
 
 
 # ---------------------------------------------------------------------------
@@ -679,6 +787,28 @@ def route_request(handler: Any, method: str, path: str, hub: HubRuntime) -> bool
                     return send(401, {"ok": False, "error": "unauthorized"})
                 return send(200, view)
             return send(400, {"ok": False, "error": "unsupported_action"})
+
+        # 通知文案模板：读取 / 保存 / 预览（预览会按当前模板真实推送到该用户设备）
+        if sub == "templates/meter" and method == "GET":
+            tpls = hub.get_templates(token, "meter")
+            if tpls is None:
+                return send(404, {"ok": False, "error": "module_not_found"})
+            return send(200, {"ok": True, "module": "meter", "templates": tpls})
+
+        if sub == "templates/meter" and method == "POST":
+            body = handler._read_json()
+            if body is None:
+                return send(400, {"ok": False, "error": "bad_json"})
+            raw_tpls = body.get("templates") if isinstance(body.get("templates"), dict) else body
+            tpls = hub.set_templates(token, "meter", raw_tpls)
+            if tpls is None:
+                return send(404, {"ok": False, "error": "module_not_found"})
+            return send(200, {"ok": True, "module": "meter", "templates": tpls})
+
+        if sub == "templates/meter/preview" and method == "POST":
+            body = handler._read_json()
+            event_key = str((body or {}).get("eventKey") or "low")
+            return send(200, hub.preview_template(token, "meter", event_key))
 
         if sub.startswith("register") or sub in ("me", "events", "test", "prefs", "devices", "health"):
             return send(405, {"ok": False, "error": "method_not_allowed"})

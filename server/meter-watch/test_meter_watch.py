@@ -291,7 +291,7 @@ class TestTenantPollSchedule(unittest.TestCase):
 
     def test_upsert_poll_interval_default_clamp_keep_alias_bad(self):
         _, tenant = self._enroll_enabled()
-        self.assertEqual(tenant["settings"]["pollIntervalSeconds"], 1800)  # 缺省 30 分钟
+        self.assertEqual(tenant["settings"]["pollIntervalSeconds"], 3600)  # 缺省 1 小时
 
         token, _ = self._enroll_enabled(poll=3600)
         self.assertEqual(self.store.load_tenants()[token]["settings"]["pollIntervalSeconds"], 3600)
@@ -308,12 +308,12 @@ class TestTenantPollSchedule(unittest.TestCase):
         self.assertEqual(tenant["settings"]["openId"], "ox-keep")
 
         # 兼容下划线命名
-        tenant = self.store.upsert_config(token, {"settings": {"poll_interval_seconds": 600}})
-        self.assertEqual(tenant["settings"]["pollIntervalSeconds"], 600)
+        tenant = self.store.upsert_config(token, {"settings": {"poll_interval_seconds": 7200}})
+        self.assertEqual(tenant["settings"]["pollIntervalSeconds"], 7200)
 
         # 脏值回退内置默认
         tenant = self.store.upsert_config(token, {"settings": {"pollIntervalSeconds": "abc"}})
-        self.assertEqual(tenant["settings"]["pollIntervalSeconds"], 1800)
+        self.assertEqual(tenant["settings"]["pollIntervalSeconds"], 3600)
 
     def test_tenant_poll_interval_priority_and_global_fallback(self):
         tenant = {"settings": {"pollIntervalSeconds": 7200}}
@@ -323,10 +323,10 @@ class TestTenantPollSchedule(unittest.TestCase):
             mw.Engine.tenant_poll_interval({"poll_interval_seconds": 7200}, {"settings": {}}), 7200)
         self.assertEqual(mw.Engine.tenant_poll_interval({"poll_interval_seconds": 7200}, {}), 7200)
         # 全局也没有 → 内置默认
-        self.assertEqual(mw.Engine.tenant_poll_interval({}, {}), 1800)
+        self.assertEqual(mw.Engine.tenant_poll_interval({}, {}), 3600)
         # 读取时同样 clamp
         self.assertEqual(
-            mw.Engine.tenant_poll_interval({}, {"settings": {"pollIntervalSeconds": 10}}), 300)
+            mw.Engine.tenant_poll_interval({}, {"settings": {"pollIntervalSeconds": 10}}), 3600)
 
     def test_run_all_only_due_filters_by_tenant_interval(self):
         now = mw.now_ts()
@@ -535,9 +535,9 @@ class _FakeHub:
         self.calls = []
 
     def dispatch(self, user_token, module, event_type, title, body,
-                 data=None, idem_key=None, level=None):
+                 data=None, idem_key=None, level=None, subtitle=""):
         self.calls.append({"user_token": user_token, "module": module, "type": event_type,
-                           "title": title, "body": body, "data": data})
+                           "title": title, "body": body, "data": data, "subtitle": subtitle})
         return self.result
 
 
@@ -596,6 +596,61 @@ class TestNotifyHubIntegration(unittest.TestCase):
         sent = self.engine._push_tenant(self.svc, tenant, "T", "B", keys=["k-legacy"])
         self.assertEqual(sent, 1)
         self.assertEqual(len(self.fake.calls), 1)
+
+
+class TestPeriodDedupAndEnrollIdempotent(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = mw.Store(self.tmp.name)
+        self.fake = FakePusher()
+        self.engine = mw.Engine(self.store, pusher=self.fake)  # type: ignore[arg-type]
+        self.store.svc["enroll_code"] = "123456"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_within_period_guard(self):
+        within = mw.Engine._within_period
+        self.assertFalse(within({}, "last_low_push", 1000, 3600))
+        self.assertFalse(within({"last_low_push": 500}, "last_low_push", 1000, 0))
+        self.assertTrue(within({"last_low_push": 500}, "last_low_push", 1000, 3600))
+        self.assertFalse(within({"last_low_push": 500}, "last_low_push", 4200, 3600))
+
+    def _low_meter(self):
+        return {"shengyu": 10, "zhuangtai": "合闸"}
+
+    def test_low_alert_only_once_within_period(self):
+        svc, tenant = {}, {"bark_keys": ["k1"]}
+        m = self._low_meter()
+        first = self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 1000, period_seconds=3600)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(m["last_low_push"], 1000)
+        # 状态被重置后同一轮询期内再次轮询：周期 guard 抑制，不重复推
+        m["low_active"] = False
+        second = self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 1500, period_seconds=3600)
+        self.assertEqual(second, [])
+        self.assertEqual(len(self.fake.calls), 1)
+
+    def test_low_alert_again_after_period(self):
+        svc, tenant = {}, {"bark_keys": ["k1"]}
+        m = self._low_meter()
+        self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 1000, period_seconds=3600)
+        m["low_active"] = False
+        again = self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 5000, period_seconds=3600)
+        self.assertEqual(len(again), 1)
+        self.assertEqual(len(self.fake.calls), 2)
+
+    def test_enroll_idempotent_same_user_and_device(self):
+        t1 = self.store.enroll("123456", "iphone", user_token="nt_x")
+        t2 = self.store.enroll("123456", "iphone", user_token="nt_x")
+        self.assertEqual(t1, t2)
+        self.assertEqual(len(self.store.load_tenants()), 1)
+        # 同用户不同设备 → 独立租户
+        t3 = self.store.enroll("123456", "ipad", user_token="nt_x")
+        self.assertNotEqual(t1, t3)
+        # 不带 user_token 的旧链路 → 每次新建
+        t4 = self.store.enroll("123456", "iphone")
+        self.assertNotEqual(t1, t4)
 
 
 if __name__ == "__main__":

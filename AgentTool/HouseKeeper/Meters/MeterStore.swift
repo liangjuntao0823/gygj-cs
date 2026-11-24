@@ -477,7 +477,12 @@ final class MeterCloudSync {
         req.httpMethod = "POST"
         req.timeoutInterval = 12
         req.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try JSONSerialization.data(withJSONObject: ["code": trimmedCode, "device": "iPhone"])
+        var enrollPayload: [String: Any] = ["code": trimmedCode, "device": "iPhone"]
+        // 已在通知中心建档则带上 userToken，服务端据此对同用户同设备做 enroll 幂等
+        if let ut = KeychainStore.load(NotifyHubConfig.tokenKey), !ut.isEmpty {
+            enrollPayload["userToken"] = ut
+        }
+        req.httpBody = try JSONSerialization.data(withJSONObject: enrollPayload)
         let (data, resp) = try await URLSession.shared.data(for: req)
         let httpCode = (resp as? HTTPURLResponse)?.statusCode ?? 0
         let obj = try? JSONDecoder().decode(MeterEnrollResponse.self, from: data)
@@ -486,7 +491,11 @@ final class MeterCloudSync {
             if httpCode == 429 { throw MeterCloudError.server("尝试过于频繁，请稍后再试") }
             throw MeterCloudError.server(obj?.error ?? "接入失败（服务器 \(httpCode)）")
         }
-        KeychainStore.save(t, for: MeterCloudConfig.tokenKey)
+        let saved = KeychainStore.save(t, for: MeterCloudConfig.tokenKey)
+        // 伪签/侧载环境钥匙串可能缺 entitlement：必须回读校验，否则会“假成功”并反复 enroll 产生重复租户
+        guard saved, KeychainStore.load(MeterCloudConfig.tokenKey) == t else {
+            throw MeterCloudError.server("本机钥匙串写入失败，请检查 App 签名或重装后重试")
+        }
         lastPayloadData = nil
         return t
     }
@@ -650,6 +659,18 @@ struct NotifyHubPrefs: Codable, Equatable {
     var modules: [String: Bool]?
 }
 
+struct MeterTemplate: Codable, Equatable {
+    var title: String
+    var subtitle: String
+    var body: String
+    var showTime: Bool
+}
+
+struct MeterTemplateSet: Codable, Equatable {
+    var low: MeterTemplate?
+    var off: MeterTemplate?
+}
+
 /// register/me/prefs/devices 返回用户档案；test 返回投递结果；字段全部可选以兼容服务器演进
 private struct NotifyHubResponse: Codable {
     let ok: Bool?
@@ -658,6 +679,7 @@ private struct NotifyHubResponse: Codable {
     let prefs: NotifyHubPrefs?
     let devices: [NotifyHubDevice]?
     let events: [NotifyHubEvent]?
+    let templates: MeterTemplateSet?
     let error: String?
     let reason: String?
     let sent: Int?
@@ -879,6 +901,34 @@ final class NotifyHub: ObservableObject {
         } catch {
             statusText = error.localizedDescription
             await refreshMe()
+        }
+    }
+
+    // MARK: 电表通知文案模板
+
+    func loadMeterTemplates() async throws -> MeterTemplateSet {
+        let obj = try await request("templates/meter", method: "GET", body: nil)
+        return obj.templates ?? MeterTemplateSet()
+    }
+
+    func saveMeterTemplate(_ eventKey: String, tpl: MeterTemplate) async throws -> MeterTemplateSet {
+        let obj = try await request("templates/meter", method: "POST", body: [
+            eventKey: [
+                "title": tpl.title, "subtitle": tpl.subtitle,
+                "body": tpl.body, "showTime": tpl.showTime
+            ]
+        ])
+        return obj.templates ?? MeterTemplateSet()
+    }
+
+    func previewMeterTemplate(_ eventKey: String) async -> String {
+        do {
+            let obj = try await request("templates/meter/preview", method: "POST",
+                                        body: ["eventKey": eventKey])
+            if obj.ok == true { return "预览已真实推送，请查看 iPhone 通知" }
+            return "预览失败（\(obj.error ?? "未知原因")）"
+        } catch {
+            return "预览失败：\(error.localizedDescription)"
         }
     }
 

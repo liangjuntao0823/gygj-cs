@@ -255,7 +255,8 @@ class CloudHandler(BaseHTTPRequestHandler):
                 return
             code = str(body.get("code") or "")
             device = str(body.get("device") or "")
-            token = self.ctx.store.enroll(code, device)
+            user_token = str(body.get("userToken") or body.get("user_token") or "")
+            token = self.ctx.store.enroll(code, device, user_token=user_token)
             if not token:
                 self._enroll_add_fail(ip)
                 self._send({"ok": False, "error": "invalid_code"}, 403)
