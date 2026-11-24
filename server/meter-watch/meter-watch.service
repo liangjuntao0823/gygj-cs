@@ -1,0 +1,23 @@
+[Unit]
+Description=Gongyu Meter Watch (cloud duty poller + sync API)
+After=network-online.target bark-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/meter-watch
+ExecStart=/usr/bin/python3 /opt/meter-watch/meter_api.py --config-dir /opt/meter-watch
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/meter-watch
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

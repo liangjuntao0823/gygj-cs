@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""meter-watch 离线单元测试：python3 -m unittest -v test_meter_watch"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+import threading
+import time
+import types
+import unittest
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import meter_watch as mw  # noqa: E402
+from meter_api import CloudHandler  # noqa: E402
+
+
+class FakeResp:
+    def __init__(self, payload: dict):
+        self._raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    def read(self) -> bytes:
+        return self._raw
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class FakePusher:
+    def __init__(self):
+        self.calls: list[tuple[list[str], str, str]] = []
+
+    def push_many(self, keys, title, body, opts=None, interval=0.0):
+        keys = list(keys or [])
+        self.calls.append((keys, title, body))
+        return len(keys), len(keys)
+
+    def titles(self) -> list[str]:
+        return [t for _, t, _ in self.calls]
+
+
+class TestPlatformClient(unittest.TestCase):
+    def test_parse_index_bind_query(self):
+        client = mw.MeterPlatformClient(request_interval=0, sleeper=lambda _s: None)
+        seen = {}
+
+        def fake_open(req, timeout):
+            seen["url"] = req.full_url
+            seen["data"] = req.data.decode("utf-8")
+            seen["ua"] = req.headers.get("User-agent", "")
+            if req.full_url.endswith(mw.PATH_INDEX):
+                return FakeResp({"code": 0, "data": {"wechatId": 123456}})
+            if req.full_url.endswith(mw.PATH_BIND_LIST):
+                return FakeResp({"code": 0, "data": [{"bindMeterId": "1001"}, {"bindMeterId": "1002"}]})
+            return FakeResp({"code": 0, "data": {
+                "shengyu": "20.5", "leiji": "123.4", "zhuangtai": "合闸",
+                "shijian": "2026-11-24 13:00:00"}})
+
+        client._open = fake_open  # type: ignore[method-assign]
+
+        self.assertEqual(client.index_open_id("ox-secret"), "123456")
+        self.assertIn("openId=ox-secret", seen["data"])
+        self.assertIn("MicroMessenger", seen["ua"])
+
+        self.assertEqual(client.fetch_bindings("123456"), ["1001", "1002"])
+        q = client.query_meter("123456", "1001")
+        self.assertEqual(q["shengyu"], "20.5")
+        self.assertEqual(q["zhuangtai"], "合闸")
+
+    def test_business_error_raises(self):
+        client = mw.MeterPlatformClient(timeout=2)
+        client._open = lambda req, timeout: FakeResp({"code": 500, "msg": "获取用户失败请重新打开!"})  # type: ignore
+        with self.assertRaises(mw.PlatformError):
+            client.index_open_id("bad")
+
+
+class TestEvaluator(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = mw.Store(self.tmp.name)
+        self.fake = FakePusher()
+        self.engine = mw.Engine(self.store, pusher=self.fake)  # type: ignore[arg-type]
+        self.svc = dict(self.store.svc)
+        self.svc.update({"low_remind_hours": 24, "off_remind_hours": 24, "notify_recovery": True})
+        self.tenant = {"bark_keys": ["k-iphone"]}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_low_edge_dedup_remind_recover(self):
+        now = 1_000_000.0
+        m = mw._new_meter_state("1-2334上")
+        m["zhuangtai"] = "合闸"
+        m["shengyu"] = 20.0
+
+        titles = self.engine.evaluate_meter(self.svc, self.tenant, "u1", m, 30.0, now)
+        self.assertEqual(len(titles), 1)
+        self.assertIn("低电量", titles[0])
+        self.assertIn("1-2334上", self.fake.calls[-1][2])
+        self.assertIn("20 度", self.fake.calls[-1][2])
+        self.assertTrue(m["low_active"])
+        self.assertEqual(m["last_low_push"], now)
+
+        # 1 分钟内不重复
+        self.assertEqual(self.engine.evaluate_meter(self.svc, self.tenant, "u1", m, 30.0, now + 60), [])
+
+        # 25 小时后持续低电量复提醒
+        titles = self.engine.evaluate_meter(self.svc, self.tenant, "u1", m, 30.0, now + 25 * 3600)
+        self.assertEqual(len(titles), 1)
+        self.assertIn("提醒", titles[0])
+
+        # 电量回升推恢复并复位
+        m["shengyu"] = 60.0
+        titles = self.engine.evaluate_meter(self.svc, self.tenant, "u1", m, 30.0, now + 25 * 3600 + 60)
+        self.assertEqual(len(titles), 1)
+        self.assertIn("恢复", titles[0])
+        self.assertFalse(m["low_active"])
+
+    def test_off_edge_and_recover(self):
+        now = 2_000_000.0
+        m = mw._new_meter_state("2-1418下")
+        m["zhuangtai"] = "拉闸"
+        titles = self.engine.evaluate_meter(self.svc, self.tenant, "u2", m, 30.0, now)
+        self.assertEqual(titles, ["【电表拉闸】"])
+        self.assertEqual(self.engine.evaluate_meter(self.svc, self.tenant, "u2", m, 30.0, now + 30), [])
+        m["zhuangtai"] = "合闸"
+        titles = self.engine.evaluate_meter(self.svc, self.tenant, "u2", m, 30.0, now + 60)
+        self.assertEqual(titles, ["【电表恢复】"])
+        self.assertFalse(m["off_active"])
+
+    def test_no_keys_no_raise(self):
+        svc = {**self.svc, "default_bark_keys": []}
+        m = mw._new_meter_state()
+        m["zhuangtai"] = "合闸"
+        m["shengyu"] = 1.0
+        titles = self.engine.evaluate_meter(svc, {"bark_keys": []}, "u3", m, 30.0, 3_000_000.0)
+        self.assertEqual(titles, [])
+
+    def test_zero_reading_protected(self):
+        m = mw._new_meter_state()
+        m["zhuangtai"] = "合闸"
+        m["shengyu"] = 0.0
+        titles = self.engine.evaluate_meter(self.svc, self.tenant, "u4", m, 30.0, 4_000_000.0)
+        self.assertEqual(titles, [])
+        self.assertFalse(m["low_active"])
+
+
+class _FakePlatform:
+    def __init__(self):
+        self.fail = True
+        self.index_calls = 0
+
+    def index_open_id(self, open_id):
+        self.index_calls += 1
+        return "w1"
+
+    def query_with_retry(self, wechat_id, uid, retries=1):
+        if self.fail:
+            raise mw.PlatformError("模拟平台故障")
+        return {"shengyu": "50", "leiji": "9.0", "zhuangtai": "合闸", "shijian": "2026-11-24 13:10:00"}
+
+
+class TestFailureRound(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = mw.Store(self.tmp.name)
+        self.fake = FakePusher()
+        self.engine = mw.Engine(self.store, pusher=self.fake)  # type: ignore[arg-type]
+        self.platform = _FakePlatform()
+        self.engine.make_client = lambda svc: self.platform  # type: ignore[method-assign]
+        self.store.svc["failure_alert_rounds"] = 3
+        self.tenant = {
+            "enabled": True,
+            "settings": {"openId": "ox", "lowThreshold": 30.0, "lowAlertEnabled": True},
+            "meters": [{"uid": "u1", "room": "1-2423"}],
+            "bark_keys": ["k1"],
+        }
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_alert_after_three_rounds_then_recovery(self):
+        ts = mw._new_tenant_state()
+        for _ in range(2):
+            self.engine.run_tenant("tok", self.store.svc, self.tenant, ts, False)
+        self.assertFalse(any("监控异常" in t for t in self.fake.titles()))
+        self.engine.run_tenant("tok", self.store.svc, self.tenant, ts, False)
+        self.assertTrue(any("监控异常" in t for t in self.fake.titles()))
+        self.assertEqual(ts["consecutive_failures"], 3)
+
+        self.platform.fail = False
+        self.engine.run_tenant("tok", self.store.svc, self.tenant, ts, False)
+        self.assertEqual(ts["consecutive_failures"], 0)
+        self.assertTrue(any("监控恢复" in t for t in self.fake.titles()))
+
+
+class TestStore(unittest.TestCase):
+    def test_enroll_upsert_clean(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = mw.Store(d)
+            token = store.enroll(str(store.svc["enroll_code"]), "iphone-test")
+            self.assertTrue(token and len(token) >= 32)
+            tenant = store.load_tenants()[token]
+            self.assertFalse(tenant["enabled"])
+
+            updated = store.upsert_config(token, {
+                "enabled": True,
+                "settings": {"openId": "ox2", "lowThreshold": 0, "lowAlertEnabled": False},
+                "meters": [{"uid": "a", "room": "r"}, {"uid": "a"}, {"uid": "b"}],
+            })
+            self.assertTrue(updated["enabled"])
+            self.assertEqual(updated["settings"]["lowThreshold"], 1.0)  # 下限保护
+            self.assertEqual(len(updated["meters"]), 2)               # 同 uid 去重
+            self.assertFalse(updated["settings"]["lowAlertEnabled"])
+
+            self.assertIsNone(store.tenant_for_token(None)[0])
+            self.assertIsNone(store.tenant_for_token("Bearer nope")[0])
+
+    def test_parse_open_id(self):
+        link = "http://wy.mlh-china.com/electricmeter/?openId=abc123&from=wx"
+        self.assertEqual(mw.parse_open_id(link), "abc123")
+        self.assertEqual(mw.parse_open_id("not a link"), "")
+
+
+class TestApiFlow(unittest.TestCase):
+    def setUp(self):
+        CloudHandler._enroll_fails.clear()
+        self.tmp = tempfile.TemporaryDirectory()
+        atomic = Path(self.tmp.name) / "service.json"
+        mw.atomic_write_json(atomic, {**mw.DEFAULT_SERVICE, "enroll_code": "code-123",
+                                      "default_bark_keys": []})
+        self.store = mw.Store(self.tmp.name)
+        self.engine = mw.Engine(self.store, dry_run=True)
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), CloudHandler)
+        self.port = self.httpd.server_address[1]
+        self.httpd.ctx = types.SimpleNamespace(  # type: ignore[attr-defined]
+            store=self.store, engine=self.engine, wake=threading.Event())
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.port}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=2)
+        self.tmp.cleanup()
+        CloudHandler._enroll_fails.clear()
+
+    def _req(self, method, path, body=None, token=None, raw=None):
+        data = None
+        headers = {}
+        if raw is not None:
+            data = raw.encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        elif body is not None:
+            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        req = urllib.request.Request(self.base + path, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode("utf-8"))
+
+    def test_health_auth_enroll_sync_snapshot(self):
+        code, obj = self._req("GET", "/api/meter/health")
+        self.assertEqual(code, 200)
+        self.assertTrue(obj["ok"])
+
+        code, _ = self._req("GET", "/api/meter/config")
+        self.assertEqual(code, 401)
+
+        code, obj = self._req("POST", "/api/meter/enroll", {"code": "wrong"})
+        self.assertEqual(code, 403)
+        code, obj = self._req("POST", "/api/meter/enroll", {"code": "code-123", "device": "iphone"})
+        self.assertEqual(code, 200)
+        token = obj["token"]
+
+        code, obj = self._req("GET", "/api/meter/config", token=token)
+        self.assertEqual(code, 200)
+        self.assertFalse(obj["enabled"])
+
+        code, obj = self._req("PUT", "/api/meter/config", token=token, body={
+            "enabled": True,
+            "settings": {"openId": "ox-api", "lowThreshold": 50, "lowAlertEnabled": True},
+            "meters": [{"uid": "u1", "room": "1-2334上"}, {"uid": "u2", "room": ""}],
+        })
+        self.assertEqual(code, 200)
+        self.assertEqual(obj["meters"], 2)
+        self.assertTrue(self.httpd.ctx.wake.is_set())  # type: ignore[attr-defined]
+
+        saved = self.store.load_tenants()[token]
+        self.assertEqual(saved["settings"]["lowThreshold"], 50.0)
+        self.assertEqual(saved["settings"]["openId"], "ox-api")
+        self.assertEqual([m["uid"] for m in saved["meters"]], ["u1", "u2"])
+
+        code, obj = self._req("GET", "/api/meter/state", token=token)
+        self.assertEqual(code, 200)
+        self.assertEqual(len(obj["meters"]), 2)
+        self.assertEqual(obj["meters"][0]["room"], "1-2334上")
+
+        code, _ = self._req("GET", "/api/meter/state", token="bad-token")
+        self.assertEqual(code, 401)
+
+        code, obj = self._req("PUT", "/api/meter/config", token=token, raw="{not-json")
+        self.assertEqual(code, 400)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
