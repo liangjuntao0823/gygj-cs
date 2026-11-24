@@ -346,9 +346,20 @@ final class MeterCloudSync {
     private var pushTask: Task<Void, Never>?
     private var lastPayloadData: Data?
     private var lastPullAt: Date?
+    // 内存缓存：真机侧载/伪签环境钥匙串单次读取可能抖动，缓存保证一次会话内 hasToken 稳定，不闪断
+    private var cachedToken: String?
     private init() {}
 
-    var token: String? { KeychainStore.load(MeterCloudConfig.tokenKey) }
+    /// 令牌读取：优先内存缓存；缓存缺失再读钥匙串并回填。两者都为空才视为无令牌，
+    /// 避免点同步/轮询时某次钥匙串读取失败被误判成“令牌已清除”。
+    var token: String? {
+        if let c = cachedToken, !c.isEmpty { return c }
+        if let k = KeychainStore.load(MeterCloudConfig.tokenKey), !k.isEmpty {
+            cachedToken = k
+            return k
+        }
+        return nil
+    }
     var hasToken: Bool {
         (token ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
     }
@@ -496,13 +507,15 @@ final class MeterCloudSync {
         guard saved, KeychainStore.load(MeterCloudConfig.tokenKey) == t else {
             throw MeterCloudError.server("本机钥匙串写入失败，请检查 App 签名或重装后重试")
         }
+        cachedToken = t
         lastPayloadData = nil
         return t
     }
 
     func clearToken() {
-        // KeychainStore 未提供删除接口：写入空串后 hasToken=false，功能等价退出登录（不会用于请求）
-        KeychainStore.save("", for: MeterCloudConfig.tokenKey)
+        // 真正删除钥匙串条目，并同步清空内存缓存，功能等价退出登录（不会用于请求）
+        KeychainStore.delete(MeterCloudConfig.tokenKey)
+        cachedToken = nil
         lastPayloadData = nil
     }
 

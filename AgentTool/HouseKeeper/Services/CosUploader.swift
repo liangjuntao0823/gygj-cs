@@ -97,21 +97,44 @@ enum KeychainKey {
 enum KeychainStore {
     private static let service = "com.zfgj.housekeeper"
 
+    /// 仅用于定位条目（删除/更新）的精简 query，不含 data/accessible，
+    /// 避免额外属性导致 SecItemDelete/Update 匹配不到旧项。
+    private static func identityQuery(_ key: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: key
+        ]
+    }
+
     /// v1.20：返回写入结果（true=成功）。此前写入失败被静默吞掉，用户以为保存成功实际没写入。
     /// kSecAttrAccessibleAfterFirstUnlock 提高开机解锁前访问的可靠性
     @discardableResult
     static func save(_ value: String, for key: String) -> Bool {
         let data = Data(value.utf8)
-        let query: [String: Any] = [
+        // 先用精简 query 彻底删除同 service+account 的旧项
+        SecItemDelete(identityQuery(key) as CFDictionary)
+        let addQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: key,
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
         ]
-        SecItemDelete(query as CFDictionary)
-        let status = SecItemAdd(query as CFDictionary, nil)
-        return status == errSecSuccess || status == errSecDuplicateItem
+        let status = SecItemAdd(addQuery as CFDictionary, nil)
+        if status == errSecSuccess { return true }
+        if status == errSecDuplicateItem {
+            // 旧项极端情况下仍在：改用 Update 真正写入，而不是把 duplicate 当成功
+            let updateStatus = SecItemUpdate(
+                identityQuery(key) as CFDictionary,
+                [
+                    kSecValueData as String: data,
+                    kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
+                ] as CFDictionary
+            )
+            return updateStatus == errSecSuccess
+        }
+        return false
     }
 
     static func load(_ key: String) -> String? {
@@ -126,6 +149,13 @@ enum KeychainStore {
         guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
               let data = item as? Data else { return nil }
         return String(data: data, encoding: .utf8)
+    }
+
+    /// 真正删除条目；不存在也视为成功（幂等）
+    @discardableResult
+    static func delete(_ key: String) -> Bool {
+        let status = SecItemDelete(identityQuery(key) as CFDictionary)
+        return status == errSecSuccess || status == errSecItemNotFound
     }
 }
 
