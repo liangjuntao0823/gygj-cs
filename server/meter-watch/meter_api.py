@@ -63,8 +63,19 @@ class CloudHandler(BaseHTTPRequestHandler):
     RUN_NOW_MIN_INTERVAL_SEC = 10.0
 
     # ---- 基础 ----
-    def log_message(self, fmt: str, *args) -> None:  # 走统一日志，不刷默认 stderr
-        mw.log.debug("http %s - %s", self.address_string(), fmt % args)
+    def log_message(self, fmt: str, *args) -> None:
+        # 成功请求保持 DEBUG 不刷屏；4xx/5xx 与错误行提升到 INFO，便于真机问题在 journal 定位。
+        # 仅记录请求行/状态码/字节数，Authorization 令牌头与请求体不落日志。
+        try:
+            code = args[1] if len(args) >= 2 else None
+            noisy = not (isinstance(code, int) and 200 <= code < 400)
+            line = "http %s - %s" % (self.address_string(), fmt % args)
+            if noisy:
+                mw.log.info(line)
+            else:
+                mw.log.debug(line)
+        except Exception:
+            mw.log.debug("http log render failed: %r", args)
 
     @property
     def ctx(self):
@@ -356,6 +367,37 @@ class CloudHandler(BaseHTTPRequestHandler):
         self._send({"ok": True, "enabled": bool(tenant.get("enabled")),
                     "meters": len(tenant.get("meters") or []),
                     "updated_at": tenant.get("updated_at", "")})
+
+    # ---- 非常用方法：统一 JSON，避免 BaseHTTPRequestHandler 对未实现方法回裸 HTML 501（客户端解不出错误码，只会显示“服务器错误 HTTP 501”）----
+    def do_DELETE(self) -> None:  # noqa: N802
+        self._route_nonstandard("DELETE")
+
+    def do_PATCH(self) -> None:  # noqa: N802
+        self._route_nonstandard("PATCH")
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        # 原生 App 不发 CORS 预检；这里兜底返回 Allow，避免默认 501
+        self.send_response(204)
+        self.send_header("Allow", "GET, POST, PUT, DELETE, PATCH, OPTIONS")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _route_nonstandard(self, method: str) -> None:
+        try:
+            path = self.path.split("?", 1)[0].rstrip("/") or "/"
+            if path == nh.PREFIX or path.startswith(nh.PREFIX + "/"):
+                hub = getattr(self.ctx, "hub", None)
+                if hub is None:
+                    self._send({"ok": False, "error": "hub_unavailable"}, 503)
+                    return
+                # hub 对不支持的方法/子路径会回 JSON 401/405/404，保证客户端可解码
+                nh.route_request(self, method, path, hub)
+                return
+            self._send({"ok": False, "error": "method_not_allowed"}, 405,
+                       extra_headers={"Allow": "GET, POST, PUT, OPTIONS"})
+        except Exception:
+            log.exception("%s 处理异常 path=%s", method, self.path)
+            self._send({"ok": False, "error": "server_error"}, 500)
 
 
 # ---------------------------------------------------------------------------

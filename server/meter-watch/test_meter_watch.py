@@ -498,6 +498,35 @@ class TestApiFlow(unittest.TestCase):
         self.assertEqual(code, 429)
         self.assertEqual(obj["error"], "too_frequent")
 
+    def test_nonstandard_methods_return_json_not_html_501(self):
+        # DELETE 非 notify 路径：JSON 405 + Allow，而不是 text/html 501
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request(self.base + "/api/meter/config", method="DELETE"), timeout=5)
+            self.fail("DELETE /api/meter/config 应返回 405")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 405)
+            obj = json.loads(e.read().decode("utf-8"))
+            self.assertEqual(obj["error"], "method_not_allowed")
+            self.assertIn("GET", e.headers.get("Allow", ""))
+
+        # PATCH 同样兜底为 JSON 405
+        code, obj = self._req("PATCH", "/api/meter/state", body={})
+        self.assertEqual(code, 405)
+        self.assertEqual(obj["error"], "method_not_allowed")
+
+        # OPTIONS 兜底 204 + Allow（空响应体，单独发原始请求）
+        with urllib.request.urlopen(
+                urllib.request.Request(self.base + "/api/meter/health", method="OPTIONS"),
+                timeout=5) as resp:
+            self.assertEqual(resp.status, 204)
+            self.assertIn("OPTIONS", resp.headers.get("Allow", ""))
+
+        # notify 前缀：测试 ctx 未装配 hub 时给 JSON 503，而不是裸 HTML 501（生产装配 hub 后正常转发）
+        code, obj = self._req("DELETE", "/api/notify/devices/dv_x")
+        self.assertEqual(code, 503)
+        self.assertEqual(obj["error"], "hub_unavailable")
+
 
 class _FakeHub:
     """模拟 notify_hub.HubRuntime，记录 dispatch 入参并返回预设结果。"""
