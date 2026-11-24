@@ -56,6 +56,9 @@
 		A10000010000000000000302 /* HouseSyncGuard.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000302 /* HouseSyncGuard.swift */; };
 		A10000010000000000000303 /* HouseClipboardImport.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000303 /* HouseClipboardImport.swift */; };
 		A10000010000000000000304 /* HouseActionNotifier.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000304 /* HouseActionNotifier.swift */; };
+		A10000010000000000000501 /* HouseRemoteClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000501 /* HouseRemoteClient.swift */; };
+		A10000010000000000000502 /* HouseSyncEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000502 /* HouseSyncEngine.swift */; };
+		A10000010000000000000503 /* HouseServerMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000503 /* HouseServerMode.swift */; };
 		A10000010000000000000305 /* HouseLedger.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000305 /* HouseLedger.swift */; };
 		A10000010000000000000306 /* HouseLedgerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000306 /* HouseLedgerView.swift */; };
 		A10000010000000000000117 /* NetworkMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000117 /* NetworkMonitor.swift */; };
@@ -166,6 +169,9 @@
 		B10000010000000000000302 /* HouseSyncGuard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseSyncGuard.swift; sourceTree = "<group>"; };
 		B10000010000000000000303 /* HouseClipboardImport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseClipboardImport.swift; sourceTree = "<group>"; };
 		B10000010000000000000304 /* HouseActionNotifier.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseActionNotifier.swift; sourceTree = "<group>"; };
+		B10000010000000000000501 /* HouseRemoteClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseRemoteClient.swift; sourceTree = "<group>"; };
+		B10000010000000000000502 /* HouseSyncEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseSyncEngine.swift; sourceTree = "<group>"; };
+		B10000010000000000000503 /* HouseServerMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseServerMode.swift; sourceTree = "<group>"; };
 		B10000010000000000000305 /* HouseLedger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseLedger.swift; sourceTree = "<group>"; };
 		B10000010000000000000306 /* HouseLedgerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseLedgerView.swift; sourceTree = "<group>"; };
 		B10000010000000000000117 /* NetworkMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkMonitor.swift; sourceTree = "<group>"; };
@@ -414,6 +420,9 @@
 				SF01 /* SharedBridge.swift */,
 				SF02 /* ShareModels.swift */,
 				SF12 /* ShareLocalInbox.swift */,
+				B10000010000000000000501 /* HouseRemoteClient.swift */,
+				B10000010000000000000502 /* HouseSyncEngine.swift */,
+				B10000010000000000000503 /* HouseServerMode.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -612,6 +621,9 @@
 				A10000010000000000000141 /* SyncTaskCenter.swift in Sources */,
 				A10000010000000000000150 /* GlobalAlertCenter.swift in Sources */,
 				A10000010000000000000401 /* HouseUploadRollbacker.swift in Sources */,
+				A10000010000000000000501 /* HouseRemoteClient.swift in Sources */,
+				A10000010000000000000502 /* HouseSyncEngine.swift in Sources */,
+				A10000010000000000000503 /* HouseServerMode.swift in Sources */,
 				A10000010000000000000140 /* MediaPendingView.swift in Sources */,
 				A10000010000000000000202 /* MeterModels.swift in Sources */,
 				A10000010000000000000203 /* MeterStore.swift in Sources */,

@@ -1434,6 +1434,12 @@ struct HouseListView: View {
             return
         }
 
+        // 服务器模式：双端删除走服务器软删除（进回收站，可恢复），逐套同步
+        if HouseServerMode.ready {
+            runServerDelete(keys: keys, ctx: ctx)
+            return
+        }
+
         // 双端删除：无云端配置 → 云端本来就没有，只删本地
         guard let config = CosConfig.load(), config.isValid else {
             for h in houses where keys.contains(h.mediaRoomKey) {
@@ -1465,6 +1471,40 @@ struct HouseListView: View {
     /// v2.57（P1-2）：双端删除执行体——先逐套删云端，成功一套删一套本地；全部云端成功的房本地立即清、
     /// 界面马上见效；云端失败的房本地保留（同步不会把它拉回来，因为云端已删/在删），挂任务中心
     /// 「删云端」任务标注失败环节，retryCloudDelete 成功后自动清掉本地残留。
+    /// 服务器模式双端删除：逐套调服务器软删除（进回收站），本地同步标记；失败的房本地保留可重试
+    private func runServerDelete(keys: [String], ctx: ModelContext) {
+        deleteTotal = keys.count
+        deleteDone = 0
+        deleteRunning = true
+        deleteCurrentRoom = ""
+        Task {
+            var ok = 0
+            for key in keys {
+                await MainActor.run { deleteCurrentRoom = key }
+                if let h = houses.first(where: { $0.mediaRoomKey == key }) {
+                    do {
+                        try await HouseSyncEngine.shared.pushDelete(h)
+                        ok += 1
+                    } catch {
+                        showToast("删除失败 \(key)：\(error.localizedDescription)", isError: true)
+                    }
+                }
+                await MainActor.run { deleteDone += 1 }
+            }
+            await MainActor.run {
+                try? ctx.save()
+                deleteRunning = false
+                deleteCurrentRoom = ""
+                deleteTarget = nil
+                if isBatchDelete { exitMultiSelect() }
+                isBatchDelete = false
+                for key in keys { HouseMediaUploadQueue.removeRoom(key) }
+                NotificationCenter.default.post(name: Self.houseStoreChanged, object: nil)
+                if ok > 0 { showToast("已移入回收站 \(ok) 套") }
+            }
+        }
+    }
+
     private func runCloudThenLocalDelete(keys: [String], config: CosConfig, ctx: ModelContext) {
         deleteTotal = keys.count
         deleteDone = 0
@@ -1903,6 +1943,22 @@ struct HouseListView: View {
     /// v1.83：同步失败自动重试一次——网络瞬断/弱网（如电梯信号切换）时第一次失败会在 1 秒后自动重跑，
     /// 第二次仍失败才提示。retriedOnce 防止重试套娃无限递归。
     @discardableResult
+    /// 服务器模式同步：增量拉取权威库并直接应用到本地（服务器已做合并，无需本地 diff 预览）
+    private func runServerSync(context ctx: ModelContext) async -> CloudPullRunOutcome {
+        let progressID = syncCenter.beginTransient(kind: .cloudPull, title: "同步房源", total: 1)
+        do {
+            let changed = try await HouseSyncEngine.shared.pull(context: ctx)
+            showToast(changed > 0 ? "已同步 \(changed) 套房源" : "房源已是最新")
+            syncCenter.endTransient(id: progressID)
+            return .finished
+        } catch {
+            let msg = "服务器同步失败：\(error.localizedDescription)"
+            showToast(msg, isError: true)
+            syncCenter.endTransient(id: progressID)
+            return .failed(msg)
+        }
+    }
+
     private func syncCloudHouses(retriedOnce: Bool = false, retryTaskID: UUID? = nil, deep: Bool = false) async -> CloudPullRunOutcome {
         // v2.63：重入保护——连点/长按两次不再并发跑两份云端同步（并发会重复拉清单、进度互相覆盖）
         guard !isSyncing else { return .failed("正在同步中，请稍候") }
@@ -1915,6 +1971,10 @@ struct HouseListView: View {
         // v2.63：标记「手动云端同步进行中」——自动检测看到这个标记直接跳过，两边不会同时拉清单
         await MainActor.run { CloudDetectActivity.shared.beginManualSync() }
         defer { DispatchQueue.main.async { CloudDetectActivity.shared.endManualSync() } }
+        // 服务器模式：房源读写走 8082 house-keeper 权威接口，短路旧 COS 直连链路
+        if HouseServerMode.ready, let ctx = houseModelContext {
+            return await runServerSync(context: ctx)
+        }
         let config = CosConfig.load()
         guard let config else {
             let message = RemoteConfig.tip("noCloudConfig", "未配置云存储，无法同步云端房源")

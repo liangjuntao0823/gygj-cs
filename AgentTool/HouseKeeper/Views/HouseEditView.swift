@@ -1140,6 +1140,13 @@ struct HouseEditView: View {
             added: addedRefs, removed: removedRefs, ledgerEventIds: ledgerEventIds)
         // 账本记录在主线程抽好（值类型），连同媒体小抄一起进后台协调推送
         let ledgerRecord = CloudHouseSync.record(from: target, username: CloudUser.username)
+        if HouseServerMode.ready {
+            launchServerPush(target: target, mediaSnapshots: mediaSnapshots,
+                             kind: cloudPushKind, oldRoomKey: oldRoomKeyForPurge)
+            NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
+            dismiss()
+            return
+        }
         launchCloudPush(mediaSnapshots: mediaSnapshots,
                         record: ledgerRecord,
                         removedMedia: removedMedia,
@@ -1170,6 +1177,58 @@ struct HouseEditView: View {
 
     /// performSave 落盘后唯一的云端推送入口：在主线程抽好小抄，再进一个后台 Task 按场景顺序执行。
     /// 后台全程只看值类型（小抄 + CloudHouseRecord），不读 SwiftData 模型对象。
+    /// 服务器模式推送：媒体文件继续传 COS（P3 切临时凭证），文本与媒体引用走服务器权威接口。
+    /// 本机沿用现有本地通知文案；服务器再向其他接入设备广播。
+    private func launchServerPush(target: House, mediaSnapshots: [MediaUploadSnapshot],
+                                  kind: CloudPushKind, oldRoomKey: String) {
+        let taskID = UUID()
+        if !mediaSnapshots.isEmpty {
+            Task { @MainActor in
+                SyncTaskCenter.shared.begin(
+                    id: taskID, kind: .media, title: "上传媒体",
+                    roomKeys: [target.mediaRoomKey], total: mediaSnapshots.count,
+                    note: "准备上传", files: mediaSnapshots.map { $0.fileName },
+                    isHouseUpload: true, rollback: nil)
+            }
+        }
+        let work = Task {
+            // 媒体实体仍在 COS：有 COS 配置就先传文件，失败不阻塞文本权威同步
+            if let config = CosConfig.load(), config.isValid {
+                await MediaActivityGate.shared.beginUpload()
+                defer { Task { await MediaActivityGate.shared.endUpload() } }
+                _ = try? await uploadMedia(snapshots: mediaSnapshots, config: config,
+                                           writeSuccessLog: false, taskID: taskID)
+            }
+            do {
+                let remote = try await HouseSyncEngine.shared.pushHouse(target)
+                await MainActor.run {
+                    if !mediaSnapshots.isEmpty { SyncTaskCenter.shared.discard(id: taskID) }
+                    let roomKey = remote.roomKey
+                    switch kind {
+                    case .newHouse:
+                        HouseActionNotifier.shared.send(key: "new.\(roomKey)",
+                            title: "房源已上传", body: "\(roomKey) 已保存并同步到服务器")
+                    case .rename:
+                        HouseActionNotifier.shared.send(key: "rename.\(roomKey)",
+                            title: "房号已迁移", body: "\(oldRoomKey) → \(roomKey)，已同步到服务器")
+                    case .plainEdit:
+                        HouseActionNotifier.shared.send(key: "edit.\(roomKey)",
+                            title: "修改已同步", body: "\(roomKey) 的改动已保存并同步")
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    if !mediaSnapshots.isEmpty { SyncTaskCenter.shared.discard(id: taskID) }
+                    HouseActionNotifier.shared.send(
+                        key: "fail.\(target.mediaRoomKey)",
+                        title: "已存本机",
+                        body: "服务器同步失败：\(error.localizedDescription)，联网后可在同步入口重试")
+                }
+            }
+        }
+        Task { @MainActor in UploadTaskRegistry.shared.register(taskID, task: work) }
+    }
+
     private func launchCloudPush(
         mediaSnapshots: [MediaUploadSnapshot],
         record: CloudHouseRecord,

@@ -482,7 +482,108 @@ class HubRuntime:
 
     @staticmethod
     def _group(module: str) -> str:
-        return {"system": "公寓管家-通道", "meter": "公寓管家-电表"}.get(module, f"公寓管家-{module}")
+        return {"system": "公寓管家-通道", "meter": "公寓管家-电表",
+                "house": "公寓管家-房源"}.get(module, f"公寓管家-{module}")
+
+    def broadcast(self, module: str, event_type: str, title: str, body: str,
+                  exclude_device_id: str = "", data: dict[str, Any] | None = None,
+                  level: str | None = None, subtitle: str = "") -> dict[str, Any]:
+        """房源板块广播：投给所有 enabled、模块未禁用、有设备的用户名下设备；
+        exclude_device_id 为发起本次修改的设备，跳过它（本机走本地通知，沿用现有文案）。
+        改一条推一条，不做合并。"""
+        module = str(module or "house")[:32]
+        event_type = str(event_type or "change")[:32]
+        title = str(title or "通知")[:120]
+        body = str(body or "")[:1000]
+
+        # 阶段 A：锁内收集每个用户的投递设备快照（跨用户）
+        targets: list[tuple[str, dict, list]] = []
+        with self.store.lock:
+            doc = self.store.doc()
+            for user_token, user in doc["users"].items():
+                if not isinstance(user, dict):
+                    continue
+                prefs = user.get("prefs") if isinstance(user.get("prefs"), dict) else {}
+                if prefs.get("enabled") is False:
+                    continue
+                modules = prefs.get("modules") if isinstance(prefs.get("modules"), dict) else {}
+                if modules.get(module, True) is False:
+                    continue
+                devices = [d for d in user.get("devices", [])
+                           if isinstance(d, dict) and d.get("bark_key")
+                           and d.get("enabled") is not False
+                           and str(d.get("device_id")) != str(exclude_device_id)]
+                if not devices:
+                    continue
+                event = {
+                    "id": "ev_" + secrets.token_hex(8), "ts": now_ts(), "at": iso_now(),
+                    "module": module, "type": event_type, "title": title, "body": body,
+                    "data": data if isinstance(data, dict) else {},
+                    "status": "pending", "sent": 0, "total": len(devices), "results": [],
+                }
+                user.setdefault("events", []).append(event)
+                self._trim_events(user)
+                snap = [(event["id"], str(d.get("device_id")), str(d.get("bark_key")),
+                         str(d.get("name") or "")) for d in devices]
+                targets.append((user_token, event, snap))
+            self.store.save(doc)
+
+        # 阶段 B：锁外逐用户逐设备投递
+        base = self.bark_base()
+        timeout = float(self._cfg("bark_timeout_seconds") or HTTP_TIMEOUT)
+        group = self._group(module)
+        total_sent = total_dev = 0
+        reach_users = 0
+        for user_token, event, snap in targets:
+            results, updates = [], []
+            sent = 0
+            for _, device_id, key, name in snap:
+                payload = {"device_key": key, "title": title, "body": body,
+                           "group": group, "isArchive": 1}
+                if subtitle:
+                    payload["subtitle"] = subtitle[:120]
+                if level:
+                    payload["level"] = level
+                ok, status, resp = self._sender(base, key, payload, timeout)
+                err = "" if ok else str((resp or {}).get("error") or (resp or {}).get("message")
+                                        or f"Bark 返回状态 {status}")[:200]
+                if ok:
+                    sent += 1
+                results.append({"deviceId": device_id, "name": name,
+                                "keyMasked": mask_key(key), "ok": bool(ok),
+                                "status": int(status or 0), "error": err, "at": iso_now()})
+                updates.append((device_id, bool(ok), err))
+                time.sleep(float(self._cfg("device_interval_seconds") or 0.15))
+            # 阶段 C：写回该用户事件结果
+            with self.store.lock:
+                d = self.store.doc()
+                u = d["users"].get(user_token)
+                if isinstance(u, dict):
+                    for dev in u.get("devices", []):
+                        for device_id, ok, err in updates:
+                            if dev.get("device_id") == device_id:
+                                if ok:
+                                    dev["last_ok_at"] = now_ts()
+                                    dev["last_error"] = ""
+                                else:
+                                    dev["last_error"] = err
+                    for ev in u.get("events", []):
+                        if ev.get("id") == event["id"]:
+                            ev["results"] = results
+                            ev["sent"] = sent
+                            ev["total"] = len(snap)
+                            ev["status"] = "sent" if sent == len(snap) else (
+                                "partial" if sent > 0 else "failed")
+                            break
+                    self.store.save(doc)
+            total_sent += sent
+            total_dev += len(snap)
+            if sent > 0:
+                reach_users += 1
+        log.info("房源广播 %s/%s 投递 %d/%d，触达用户 %d",
+                 module, event_type, total_sent, total_dev, reach_users)
+        return {"ok": total_sent > 0, "sent": total_sent, "total": total_dev,
+                "users": len(targets), "reachUsers": reach_users}
 
     def dispatch(self, user_token: str, module: str, event_type: str, title: str, body: str,
                  data: dict[str, Any] | None = None, idem_key: str | None = None,

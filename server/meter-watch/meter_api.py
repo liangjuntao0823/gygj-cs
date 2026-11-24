@@ -42,6 +42,14 @@ except ImportError:  # 本地源码树兜底：server/notify-hub 与 server/mete
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify-hub"))
     import notify_hub as nh
 
+try:  # 房源板块（house-keeper）：生产同目录导入，本地源码树兜底
+    import house_api as ha
+    import house_store as hs
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "house-keeper"))
+    import house_api as ha
+    import house_store as hs
+
 log = logging.getLogger("meter-watch.api")
 
 BODY_LIMIT = 65536
@@ -156,6 +164,9 @@ class CloudHandler(BaseHTTPRequestHandler):
         if path == nh.PREFIX or path.startswith(nh.PREFIX + "/"):
             nh.route_request(self, "GET", path, self.ctx.hub)
             return
+        if path == ha.PREFIX or path.startswith(ha.PREFIX + "/"):
+            ha.route_request(self, "GET", path, self.ctx.house_store, self.ctx.hub)
+            return
         if path == "/api/meter/health":
             tenants = self.ctx.store.load_tenants()
             enabled = sum(1 for t in tenants.values() if isinstance(t, dict) and t.get("enabled"))
@@ -243,6 +254,9 @@ class CloudHandler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if path == nh.PREFIX or path.startswith(nh.PREFIX + "/"):
             nh.route_request(self, "POST", path, self.ctx.hub)
+            return
+        if path == ha.PREFIX or path.startswith(ha.PREFIX + "/"):
+            ha.route_request(self, "POST", path, self.ctx.house_store, self.ctx.hub)
             return
         if path == "/api/meter/enroll":
             ip = self._client_ip()
@@ -396,8 +410,11 @@ class CloudHandler(BaseHTTPRequestHandler):
                 # hub 对不支持的方法/子路径会回 JSON 401/405/404，保证客户端可解码
                 nh.route_request(self, method, path, hub)
                 return
+            if path == ha.PREFIX or path.startswith(ha.PREFIX + "/"):
+                ha.route_request(self, method, path, self.ctx.house_store, self.ctx.hub)
+                return
             self._send({"ok": False, "error": "method_not_allowed"}, 405,
-                       extra_headers={"Allow": "GET, POST, PUT, OPTIONS"})
+                       extra_headers={"Allow": "GET, POST, PUT, DELETE, OPTIONS"})
         except Exception:
             log.exception("%s 处理异常 path=%s", method, self.path)
             self._send({"ok": False, "error": "server_error"}, 500)
@@ -417,11 +434,15 @@ def serve(store: mw.Store, engine: mw.Engine) -> int:
     hub = nh.HubRuntime(str(store.home / "notify.json"), config=svc)
     engine.hub = hub
 
+    # 房源板块：SQLite 权威库（house.db，600），与租户文件同目录
+    house_store = hs.HouseStore(str(store.home / "house.db"))
+
     httpd = ThreadingHTTPServer((host, port), CloudHandler)
     httpd.daemon_threads = True
     wake = threading.Event()
     stop = threading.Event()
-    httpd.ctx = types.SimpleNamespace(store=store, engine=engine, wake=wake, hub=hub,  # type: ignore[attr-defined]
+    httpd.ctx = types.SimpleNamespace(store=store, engine=engine, wake=wake, hub=hub,
+                                      house_store=house_store,
                                       kick_lock=threading.Lock(), kick_tokens=set())
 
     server_thread = threading.Thread(target=httpd.serve_forever,
@@ -480,6 +501,7 @@ def serve(store: mw.Store, engine: mw.Engine) -> int:
         else:
             try:
                 engine.run_all(startup=False, only_due=True)
+                ha.deliver_pending(house_store, hub)  # 兜底：异步投递失败的 outbox 下轮补发
             except Exception:
                 mw.log.exception("值守调度异常，下一 tick 重试")
 
