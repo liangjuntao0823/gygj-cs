@@ -71,7 +71,8 @@ CREATE TABLE IF NOT EXISTS media_refs (
   UNIQUE(room_key, object_key)
 );
 CREATE TABLE IF NOT EXISTS ledger_events (
-  id TEXT PRIMARY KEY,
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
   room_key TEXT NOT NULL,
   ts TEXT NOT NULL,
   operator TEXT NOT NULL,
@@ -234,7 +235,7 @@ class HouseStore:
     def ledger(self, room_key: str) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM ledger_events WHERE room_key=? ORDER BY id DESC",
+                "SELECT * FROM ledger_events WHERE room_key=? ORDER BY seq DESC",
                 (room_key,)).fetchall()
             out = []
             for r in rows:
