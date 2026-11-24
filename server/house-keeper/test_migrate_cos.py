@@ -65,5 +65,25 @@ class TestRunMigration(unittest.TestCase):
         self.assertEqual(len(store.upserts), 1)
 
 
+class TestCosXmlList(unittest.TestCase):
+    def test_parse_real_cos_list_xml(self):
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+            '<Contents><Key>h/1-2334/info.json</Key></Contents>'
+            '<Contents><Key>h/1-2334/photo.jpg</Key></Contents>'
+            '<Contents><Key>h/2-1418/info.json</Key></Contents>'
+            '<IsTruncated>false</IsTruncated>'
+            '</ListBucketResult>'
+        ).encode("utf-8")
+        client = migrate_cos.CosXMLClient(
+            secret_id="sid", secret_key="skey", bucket="b", region="ap-guangzhou")
+        client._request = lambda method, path, query="": xml  # type: ignore[assignment]
+        keys = client.list_info_keys()
+        self.assertEqual(
+            sorted(keys),
+            ["h/1-2334/info.json", "h/2-1418/info.json"])
+
+
 if __name__ == "__main__":
     unittest.main()

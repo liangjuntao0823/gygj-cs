@@ -114,7 +114,7 @@ class CosXMLClient:
                 q += "&continuation-token=" + urllib.parse.quote(marker)
             import xml.etree.ElementTree as ET
             root = ET.fromstring(self._request("GET", "/", q))
-            ns = "{http://doc.amazonaws.com/doc/2006-03-01/}"
+            ns = "{http://s3.amazonaws.com/doc/2006-03-01/}"
             for c in root.findall(f"{ns}Contents"):
                 k = c.find(f"{ns}Key").text
                 if k and k.endswith("/info.json"):
