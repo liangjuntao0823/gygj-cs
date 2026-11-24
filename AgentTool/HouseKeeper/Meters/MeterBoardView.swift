@@ -96,6 +96,10 @@ struct MeterBoardView: View {
             }
         }
         .navigationBarHidden(true)
+        .onAppear {
+            // 云端值守开启时：每次进入电表页节流拉取云端最近一轮快照；开关关闭时该方法直接返回，保持纯手动模式
+            Task { await store.cloudBoardAppearRefresh() }
+        }
         .sheet(isPresented: $showSort) { MeterSortSheet(mode: $sortMode) }
         .sheet(isPresented: $showFilter) { MeterFilterSheet(mode: $filterMode, threshold: $threshold) }
         .sheet(isPresented: $showAdd) { MeterAddSheet() }
