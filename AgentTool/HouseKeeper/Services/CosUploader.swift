@@ -167,9 +167,21 @@ struct CosConfig {
     let secretId: String
     let secretKey: String
     let customDomain: String   // v1.19：自定义域名（如 cdn.example.com），空 = 用默认域名
+    /// 临时凭证（STS）会话令牌；永久密钥场景为空串。非空时预签名会带上
+    /// x-cos-security-token 并参与签名，secretId/secretKey 此时为临时密钥。
+    let sessionToken: String = ""
+
+    var isUsingSTS: Bool { !sessionToken.isEmpty }
 
     var isValid: Bool {
         !bucket.isEmpty && !region.isEmpty && !secretId.isEmpty && !secretKey.isEmpty
+    }
+
+    /// 从服务器签发的临时凭证构造（媒体上传专用；App 不持久化任何永久密钥）
+    static func sts(_ c: HouseCosCredential) -> CosConfig {
+        CosConfig(bucket: c.bucket, region: c.region, secretId: c.secretId,
+                  secretKey: c.secretKey, customDomain: "",
+                  sessionToken: c.sessionToken)
     }
 
     /// 从钥匙串读取配置（自动去掉首尾空格，避免复制粘贴带入空白导致签名失败）
@@ -2085,7 +2097,12 @@ enum CosUploader {
         let headerValue = pairs.map { "\($0.key)=\($0.value)" }.joined(separator: "&")
 
         // v1.13：URL query 参数（ListObjects 等）——key 原样（已小写）、value RFC3986 编码，按字典序
-        let sortedParams = params.map { (key: $0.0.lowercased(), value: urlEncode($0.1)) }.sorted { $0.key < $1.key }
+        // 临时凭证：x-cos-security-token 必须作为 URL 参数参与签名，COS 才认可
+        var allParams = params
+        if config.isUsingSTS {
+            allParams.append(("x-cos-security-token", config.sessionToken))
+        }
+        let sortedParams = allParams.map { (key: $0.0.lowercased(), value: urlEncode($0.1)) }.sorted { $0.key < $1.key }
         let paramList = sortedParams.map(\.key).joined(separator: ";")
         let paramValue = sortedParams.map { "\($0.key)=\($0.value)" }.joined(separator: "&")
 

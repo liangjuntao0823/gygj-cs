@@ -218,13 +218,19 @@ final class HouseRemoteClient {
             throw HouseAPIError(message: "登录已失效，请重新接入服务器")
         }
         let result = try decode(HouseWriteResult.self, data: data)
-        if let r = result.results?.first, r.ok == false {
+        guard let r = result.results?.first else {
+            throw HouseAPIError(message: "服务器返回格式异常")
+        }
+        if r.ok == false {
             if r.error == "revision_conflict" {
                 throw HouseAPIError(message: "该房源刚被其他人修改，请刷新后再编辑")
             }
             throw HouseAPIError(message: r.detail ?? "保存失败")
         }
-        return try decode(RemoteHouse.self, data: data)
+        guard let house = r.house else {
+            throw HouseAPIError(message: "服务器未回写房源数据")
+        }
+        return house
     }
 
     func delete(_ roomKey: String) async throws -> RemoteHouse {
@@ -259,6 +265,7 @@ private struct WriteItem: Codable {
     let ok: Bool?
     let error: String?
     let detail: String?
+    let house: RemoteHouse?
 }
 
 // MARK: - 上送载荷（本地 House 转换）

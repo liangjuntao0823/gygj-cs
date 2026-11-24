@@ -1192,12 +1192,16 @@ struct HouseEditView: View {
             }
         }
         let work = Task {
-            // 媒体实体仍在 COS：有 COS 配置就先传文件，失败不阻塞文本权威同步
-            if let config = CosConfig.load(), config.isValid {
+            // 媒体实体仍在 COS：服务器模式下用服务器签发的临时凭证上传，App 不持永久密钥；
+            // 媒体失败不阻塞文本权威同步，未传成功的文件由媒体补传队列后续重试。
+            if !mediaSnapshots.isEmpty {
                 await MediaActivityGate.shared.beginUpload()
                 defer { Task { await MediaActivityGate.shared.endUpload() } }
-                _ = try? await uploadMedia(snapshots: mediaSnapshots, config: config,
-                                           writeSuccessLog: false, taskID: taskID)
+                if let cred = try? await HouseCosCredentialStore.shared.credential() {
+                    let stsConfig = CosConfig.sts(cred)
+                    _ = try? await uploadMedia(snapshots: mediaSnapshots, config: stsConfig,
+                                               writeSuccessLog: false, taskID: taskID)
+                }
             }
             do {
                 let remote = try await HouseSyncEngine.shared.pushHouse(target)

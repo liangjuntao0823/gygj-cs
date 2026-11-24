@@ -117,8 +117,10 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
                     doc = store.upsert_house(
                         it, operator=operator, origin_device_id=origin,
                         expected_revision=expected)
+                    # 带回完整权威 doc，客户端一次请求即拿到服务器回写的 revision/
+                    # 时间戳/媒体，无需再 getObject，单条与 batch 结构一致
                     results.append({"ok": True, "roomKey": doc["roomKey"],
-                                    "revision": doc["revision"]})
+                                    "revision": doc["revision"], "house": doc})
                 except Exception as e:  # 冲突等回传错误码，客户端刷新重试
                     code = "revision_conflict" if "RevisionConflict" in type(e).__name__ else "bad_request"
                     results.append({"ok": False, "error": code, "detail": str(e)[:200]})

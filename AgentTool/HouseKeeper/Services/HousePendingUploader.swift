@@ -40,7 +40,7 @@ final class HousePendingUploader {
     @discardableResult
     func flush(context: ModelContext) async -> Int {
         let keys = pendingKeys
-        guard !keys else { return 0 }
+        guard !keys.isEmpty else { return 0 }
         let houses = (try? context.fetch(FetchDescriptor<House>())) ?? []
         let byKey = Dictionary(uniqueKeysWithValues: houses.map { ($0.mediaRoomKey, $0) })
         var done = 0
