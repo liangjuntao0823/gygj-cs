@@ -268,6 +268,13 @@ class TestMeterTemplates(unittest.TestCase):
         # 时间隐藏后遗留的空括号 / 悬空空格与标点要清理干净
         self.assertEqual(nh.render_text("（{x}）", {"x": ""}), "")
         self.assertEqual(nh.render_text("充值。 {time}", {"time": ""}), "充值。")
+        # 正文换行要保留：占位符替换后按行渲染，不把换行压成空格
+        self.assertEqual(
+            nh.render_text("{label}\n剩余 {remain} 度", {"label": "101", "remain": "12.5"}),
+            "101\n剩余 12.5 度")
+        # 占位符清空后整行剔除，不留下空行
+        self.assertEqual(
+            nh.render_text("{label}\n{time}", {"label": "101", "time": ""}), "101")
 
     def test_normalize_template_fallback_and_trim(self):
         dflt = nh.DEFAULT_TEMPLATES["meter"]["low"]

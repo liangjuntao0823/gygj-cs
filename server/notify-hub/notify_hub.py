@@ -88,15 +88,24 @@ def normalize_template(raw: Any, default: dict[str, Any]) -> dict[str, Any]:
 
 
 def render_text(text: str, variables: dict[str, Any]) -> str:
-    """占位符替换 + 清理时间隐藏后遗留的空格/空括号/悬空标点。"""
+    """占位符替换 + 清理时间隐藏后遗留的空格/空括号/悬空标点。
+
+    保留用户在正文里打的换行（\\n）：只对单行内部折叠多余空白、清理悬空标点，
+    不再把跨行的换行压成空格；占位符被清空后变空的整行直接剔除。
+    """
     def _repl(m: re.Match) -> str:
         return str(variables.get(m.group(1), ""))
     s = _PLACEHOLDER_RE.sub(_repl, str(text or ""))
-    s = s.replace("（ ）", "").replace("( )", "")
-    s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"\s+([，。；：、）])", r"\1", s)
-    s = re.sub(r"（\s*）|\(\s*\)", "", s)
-    return s.strip()
+    lines: list[str] = []
+    for ln in s.split("\n"):
+        ln = re.sub(r"[ \t]+", " ", ln)
+        ln = ln.replace("（ ）", "").replace("( )", "")
+        ln = re.sub(r"\s+([，。；：、）])", r"\1", ln)
+        ln = re.sub(r"（\s*）|\(\s*\)", "", ln)
+        ln = ln.rstrip()
+        if ln.strip():
+            lines.append(ln)
+    return "\n".join(lines).strip()
 
 
 def time_string(ts: float | None = None) -> str:
