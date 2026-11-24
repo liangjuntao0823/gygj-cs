@@ -169,7 +169,7 @@ struct CosConfig {
     let customDomain: String   // v1.19：自定义域名（如 cdn.example.com），空 = 用默认域名
     /// 临时凭证（STS）会话令牌；永久密钥场景为空串。非空时预签名会带上
     /// x-cos-security-token 并参与签名，secretId/secretKey 此时为临时密钥。
-    let sessionToken: String = ""
+    let sessionToken: String
 
     var isUsingSTS: Bool { !sessionToken.isEmpty }
 
