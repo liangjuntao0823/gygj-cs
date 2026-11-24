@@ -284,6 +284,9 @@ private struct MeterCloudWatchSection: View {
                     }
                 }
                 .padding(.vertical, 2)
+                // 关键修复：Form 内同 cell 多个 Button 默认走 cell 级样式，点击会被错误路由到「清除」。
+                // 用 borderless 让每个按钮只响应自身 label 范围，互不干扰。
+                .buttonStyle(.borderless)
 
             let diag = sync.tokenDiagnostic
             VStack(alignment: .leading, spacing: 3) {
