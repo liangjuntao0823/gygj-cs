@@ -50,6 +50,20 @@ except ImportError:
     import house_api as ha
     import house_store as hs
 
+try:  # 管理后台（admin-console）：生产同目录导入，本地源码树兜底
+    import admin_web as aw
+    import admin_auth as aauth
+    import admin_sys as asym
+    import admin_meter as amet
+    import admin_house as ahou
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "admin-console"))
+    import admin_web as aw
+    import admin_auth as aauth
+    import admin_sys as asym
+    import admin_meter as amet
+    import admin_house as ahou
+
 log = logging.getLogger("meter-watch.api")
 
 BODY_LIMIT = 65536
@@ -151,6 +165,12 @@ class CloudHandler(BaseHTTPRequestHandler):
         with CloudHandler._enroll_lock:
             CloudHandler._enroll_fails.pop(ip, None)
 
+    def _admin_route(self, method: str, path: str) -> bool:
+        admin = getattr(self.ctx, "admin", None)
+        if admin is None:
+            return False
+        return aw.route_request(self, method, path, admin)
+
     # ---- GET ----
     def do_GET(self) -> None:  # noqa: N802
         try:
@@ -161,6 +181,8 @@ class CloudHandler(BaseHTTPRequestHandler):
 
     def _route_get(self) -> None:
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if self._admin_route("GET", path):
+            return
         if path == nh.PREFIX or path.startswith(nh.PREFIX + "/"):
             nh.route_request(self, "GET", path, self.ctx.hub)
             return
@@ -252,6 +274,8 @@ class CloudHandler(BaseHTTPRequestHandler):
 
     def _route_post(self) -> None:
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if self._admin_route("POST", path):
+            return
         if path == nh.PREFIX or path.startswith(nh.PREFIX + "/"):
             nh.route_request(self, "POST", path, self.ctx.hub)
             return
@@ -363,6 +387,8 @@ class CloudHandler(BaseHTTPRequestHandler):
 
     def _route_put(self) -> None:
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if self._admin_route("PUT", path):
+            return
         if path != "/api/meter/config":
             self._send({"ok": False, "error": "not_found"}, 404)
             return
@@ -402,6 +428,8 @@ class CloudHandler(BaseHTTPRequestHandler):
     def _route_nonstandard(self, method: str) -> None:
         try:
             path = self.path.split("?", 1)[0].rstrip("/") or "/"
+            if self._admin_route(method, path):
+                return
             if path == nh.PREFIX or path.startswith(nh.PREFIX + "/"):
                 hub = getattr(self.ctx, "hub", None)
                 if hub is None:
@@ -437,12 +465,20 @@ def serve(store: mw.Store, engine: mw.Engine) -> int:
     # 房源板块：SQLite 权威库（house.db，600），与租户文件同目录
     house_store = hs.HouseStore(str(store.home / "house.db"))
 
+    # 管理后台：鉴权会话 + 服务器看板 + 电表值守 + 房源管理，复用现有 store/hub/house_store
+    admin_auth = aauth.AdminAuth(store.home)
+    admin_sys = asym.SystemBoard()
+    admin_meter = amet.MeterConsole(store, hub)
+    admin_house = ahou.HouseConsole(house_store)
+    admin_ctx = types.SimpleNamespace(auth=admin_auth, sys=admin_sys,
+                                       meter=admin_meter, house=admin_house, hub=hub)
+
     httpd = ThreadingHTTPServer((host, port), CloudHandler)
     httpd.daemon_threads = True
     wake = threading.Event()
     stop = threading.Event()
     httpd.ctx = types.SimpleNamespace(store=store, engine=engine, wake=wake, hub=hub,
-                                      house_store=house_store,
+                                      house_store=house_store, admin=admin_ctx,
                                       kick_lock=threading.Lock(), kick_tokens=set())
 
     server_thread = threading.Thread(target=httpd.serve_forever,
