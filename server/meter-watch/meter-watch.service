@@ -8,6 +8,7 @@ Type=simple
 User=ubuntu
 Group=ubuntu
 WorkingDirectory=/opt/meter-watch
+EnvironmentFile=/opt/meter-watch/.env
 ExecStart=/usr/bin/python3 /opt/meter-watch/meter_api.py --config-dir /opt/meter-watch
 Restart=always
 RestartSec=5
