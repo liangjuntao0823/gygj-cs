@@ -45,8 +45,10 @@ def deliver_pending(store: Any, hub: Any) -> None:
             res = hub.broadcast(
                 "house", item["action"], item["title"], item["body"],
                 exclude_device_id=item["originDeviceId"], data=item["data"])
-            if res.get("ok") or res.get("total", 0) >= 0:
-                # 无任何设备（total=0）也标记 sent，避免永久堆积；事件仍可在账本追溯
+            # 标记 sent 的两种情形：①至少一台设备投递成功(ok)；②无任何目标设备
+            # (total=0)，事件已在账本可追溯，不永久堆积。有设备却全部失败则保留
+            # pending，交由 worker 定时分支下轮重试，避免丢推送。
+            if res.get("ok") or res.get("total", 0) == 0:
                 store.mark_outbox(item["id"], "sent")
     except Exception:  # 单条失败不影响其余，下轮兜底继续
         import logging
