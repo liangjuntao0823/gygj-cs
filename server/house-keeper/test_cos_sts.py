@@ -19,7 +19,7 @@ class TestCosSts(unittest.TestCase):
         self.assertEqual(stmt["effect"], "allow")
         self.assertEqual(
             stmt["resource"],
-            "qcs::cos:1250000000:house-1250000000/h/*")
+            "qcs::cos:ap-hongkong:uid/1250000000:house-1250000000/h/*")
         self.assertIn("name/cos:PutObject", stmt["action"])
         self.assertIn("name/cos:GetObject", stmt["action"])
         # 不应包含高权限动作
@@ -29,23 +29,23 @@ class TestCosSts(unittest.TestCase):
         p = cos_sts._build_policy(FAKE_CONF, "h/2-1006/")
         self.assertEqual(
             p["statement"][0]["resource"],
-            "qcs::cos:1250000000:house-1250000000/h/2-1006/*")
+            "qcs::cos:ap-hongkong:uid/1250000000:house-1250000000/h/2-1006/*")
 
     def test_authorization_header_format_and_deterministic(self):
         payload = '{"a":1}'
         ts = 1_800_000_000
-        a1 = cos_sts._authorization(FAKE_CONF, payload, ts, cos_sts.STS_HOST)
-        a2 = cos_sts._authorization(FAKE_CONF, payload, ts, cos_sts.STS_HOST)
+        a1 = cos_sts._authorization(FAKE_CONF, payload, ts, cos_sts.STS_HOST, "ap-hongkong")
+        a2 = cos_sts._authorization(FAKE_CONF, payload, ts, cos_sts.STS_HOST, "ap-hongkong")
         self.assertTrue(a1.startswith("TC3-HMAC-SHA256 Credential=AKIDfake"))
-        self.assertIn("SignedHeaders=content-type;host;x-tc-action", a1)
+        self.assertIn("SignedHeaders=content-type;host;x-tc-action;x-tc-region", a1)
         self.assertIn("Signature=", a1)
         # 同输入确定
         self.assertEqual(a1, a2)
 
     def test_signature_changes_with_payload(self):
         ts = 1_800_000_000
-        a1 = cos_sts._authorization(FAKE_CONF, '{"a":1}', ts, cos_sts.STS_HOST)
-        a2 = cos_sts._authorization(FAKE_CONF, '{"a":2}', ts, cos_sts.STS_HOST)
+        a1 = cos_sts._authorization(FAKE_CONF, '{"a":1}', ts, cos_sts.STS_HOST, "ap-hongkong")
+        a2 = cos_sts._authorization(FAKE_CONF, '{"a":2}', ts, cos_sts.STS_HOST, "ap-hongkong")
         self.assertNotEqual(a1, a2)
 
     def test_missing_config_raises(self):

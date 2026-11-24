@@ -61,8 +61,11 @@ def load_cos_config() -> dict[str, str]:
 
 
 def _build_policy(conf: dict[str, str], prefix: str) -> dict[str, Any]:
-    # 资源：限定到桶内指定前缀（房源媒体 h/）
-    resource = f"qcs::cos:{conf['appId']}:{conf['bucket']}/{prefix}*"
+    # 资源六段式：qcs::cos:<region>:uid/<appId>:<bucket>/<prefix>*（限定房源媒体前缀 h/）
+    resource = (
+        f"qcs::cos:{conf['region']}:uid/{conf['appId']}:"
+        f"{conf['bucket']}/{prefix}*"
+    )
     statement = {
         "effect": "allow",
         "action": MEDIA_ACTIONS,
@@ -84,10 +87,10 @@ def _tc3_signature(secret_key: str, date: str, service: str,
 
 
 def _authorization(conf: dict[str, str], payload: str, timestamp: int,
-                   host: str) -> str:
+                   host: str, region: str) -> str:
     date = datetime.datetime.fromtimestamp(
         timestamp, datetime.timezone.utc).strftime("%Y-%m-%d")
-    # 1. 规范请求
+    # 1. 规范请求（TC3 v3 公共参数 Region 走 X-TC-Region 头并纳入签名）
     http_method = "POST"
     canonical_uri = "/"
     canonical_query = ""
@@ -95,8 +98,9 @@ def _authorization(conf: dict[str, str], payload: str, timestamp: int,
         f"content-type:application/json; charset=utf-8\n"
         f"host:{host}\n"
         f"x-tc-action:getfederationtoken\n"
+        f"x-tc-region:{region}\n"
     )
-    signed_headers = "content-type;host;x-tc-action"
+    signed_headers = "content-type;host;x-tc-action;x-tc-region"
     hashed_payload = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     canonical_request = "\n".join([
         http_method, canonical_uri, canonical_query,
@@ -127,22 +131,26 @@ def fetch_credentials(conf: dict[str, str] | None = None,
     conf = conf or load_cos_config()
     timestamp = int(time.time())
     policy = _build_policy(conf, prefix)
+    region = conf["region"]
+    sts_host = STS_HOST
+    sts_endpoint = STS_ENDPOINT
     request_payload = json.dumps({
         "Name": name,
         "Policy": json.dumps(policy, ensure_ascii=False),
         "DurationSeconds": duration_seconds,
     })
-    authorization = _authorization(conf, request_payload, timestamp, STS_HOST)
+    authorization = _authorization(conf, request_payload, timestamp, sts_host, region)
     headers = {
         "Authorization": authorization,
         "Content-Type": "application/json; charset=utf-8",
-        "Host": STS_HOST,
+        "Host": sts_host,
         "X-TC-Action": "GetFederationToken",
         "X-TC-Version": "2018-08-13",
+        "X-TC-Region": region,
         "X-TC-Timestamp": str(timestamp),
     }
     req = urllib.request.Request(
-        STS_ENDPOINT, data=request_payload.encode("utf-8"),
+        sts_endpoint, data=request_payload.encode("utf-8"),
         headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=10) as resp:
         body = json.loads(resp.read().decode("utf-8"))
