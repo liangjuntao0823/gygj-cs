@@ -166,6 +166,7 @@ private struct MeterCloudWatchSection: View {
     @State private var tokenSaved = false
     @State private var pollTag: Int = 1          // 云端轮询间隔：1–12 小时
     @State private var runningNow = false         // 「立即轮询一次」请求中
+    @State private var appearCount = 0           // 诊断：onAppear 触发次数
 
     @MainActor
     private var sync: MeterCloudSync { MeterCloudSync.shared }
@@ -284,6 +285,20 @@ private struct MeterCloudWatchSection: View {
                 }
                 .padding(.vertical, 2)
 
+            let diag = sync.tokenDiagnostic
+            VStack(alignment: .leading, spacing: 3) {
+                Text("【测试诊断·正式版移除】onAppear=\(appearCount)次 tokenSaved=\(tokenSaved ? "T" : "F")")
+                Text("内存=\(diag.memory ? "有" : "无") 钥匙串=\(diag.keychain ? "有" : "无") 文件=\(diag.file ? "有" : "无")(exists=\(diag.fileExists)) 判定=\(diag.resolved ? "有令牌" : "无令牌")")
+                Text("路径: \(diag.filePath)")
+                    .lineLimit(2)
+            }
+            .font(.system(size: 9, design: .monospaced))
+            .foregroundColor(.red)
+            .padding(6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.red.opacity(0.08))
+            .cornerRadius(8)
+
             NavigationLink {
                 CloudPushSettingsView()
             } label: {
@@ -296,6 +311,7 @@ private struct MeterCloudWatchSection: View {
             Text("这个开关只决定服务器要不要按间隔替你查询电表（查询链接/openId、阈值、间隔与电表清单会自动同步；开启时进电表首页自动拉取云端快照，关闭后保持纯手动刷新）。查出来的告警要不要推送到手机，由「设置 → 云端推送 → 电表推送」开关控制（需先在下方接入电表云端，并在云端推送页绑定 Bark）。长期令牌只存本机（钥匙串优先、私有目录兜底），不上云、不进备份。")
         }
         .onAppear {
+            appearCount += 1
             endpointInput = store.settings.cloudEndpoint
             tokenSaved = sync.hasToken
             let hours = store.settings.cloudPollMinutes / 60

@@ -393,6 +393,25 @@ final class MeterCloudSync {
         (token ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
     }
 
+    // 测试诊断：分别读取三个来源的原始状态，不依赖 token 的缓存逻辑，用于定位真机令牌丢失环节
+    struct TokenDiagnostic {
+        let memory: Bool
+        let keychain: Bool
+        let file: Bool
+        let fileExists: Bool
+        let filePath: String
+        let resolved: Bool
+    }
+    var tokenDiagnostic: TokenDiagnostic {
+        TokenDiagnostic(
+            memory: !(cachedToken ?? "").isEmpty,
+            keychain: !(KeychainStore.load(MeterCloudConfig.tokenKey) ?? "").isEmpty,
+            file: loadFileToken() != nil,
+            fileExists: FileManager.default.fileExists(atPath: tokenFileURL.path),
+            filePath: tokenFileURL.path,
+            resolved: hasToken)
+    }
+
     // MARK: 变更后防抖全量同步（saveSettings / saveMeters 统一出口）
 
     func scheduleAfterChange(store: MeterStore) {
