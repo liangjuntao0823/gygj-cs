@@ -259,7 +259,7 @@ final class MeterStore: ObservableObject {
 // MARK: - 云端值守：看板快照合并（#236 双模式）
 
 extension MeterStore {
-    /// 电表首页出现时调用：仅“云端值守”开启才节流拉取云端快照；关闭时直接返回，完全保持手动模式。
+    /// 电表首页出现时调用：仅“云端值守”开启才自动拉取云端快照（3s 仅去重同次进入的重复回调）；关闭时直接返回，完全保持手动模式。
     func cloudBoardAppearRefresh() async {
         await MeterCloudSync.shared.pullSnapshotIfNeeded(store: self, force: false)
     }
@@ -516,7 +516,7 @@ final class MeterCloudSync {
         }
     }
 
-    // MARK: 看板进入时拉取云端快照（60s 节流；开关关闭时直接返回，不改变手动模式）
+    // MARK: 看板进入时拉取云端快照（3s 仅去重同一次进入的重复 onAppear，等同每次进入都拉；开关关闭直接返回，保持纯手动模式）
 
     func pullSnapshotIfNeeded(store: MeterStore, force: Bool) async {
         guard store.settings.cloudWatchEnabled else { return }

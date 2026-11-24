@@ -136,5 +136,5 @@ enum MeterCloudConfig {
     static let tokenKey = "meter.cloud.token"             // KeychainStore account
     static let wasEnabledKey = "meter.cloud.wasEnabled"   // UserDefaults：关开关时补发一次 enabled=false
     static let dirtyKey = "meter.cloud.dirty"             // UserDefaults：上次同步失败、待补推
-    static let enterPullThrottle: TimeInterval = 60       // 看板 onAppear 自动拉云端快照的最小间隔（秒）
+    static let enterPullThrottle: TimeInterval = 3        // 仅合并同一次进入的重复 onAppear；用户每次进看板都自动拉取云端快照
 }
