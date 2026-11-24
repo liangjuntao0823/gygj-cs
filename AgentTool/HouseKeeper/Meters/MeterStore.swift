@@ -507,7 +507,7 @@ final class MeterCloudSync {
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             let ack = try? JSONDecoder().decode(MeterAckResponse.self, from: data)
             if code == 200, ack?.ok == true {
-                return "测试推送已发送（\(ack.sent ?? 0)/\(ack.total ?? 0) 台设备），请查看手机通知"
+                return "测试推送已发送（\(ack?.sent ?? 0)/\(ack?.total ?? 0) 台设备），请查看手机通知"
             }
             if (ack?.total ?? 0) == 0 { return "服务器暂未绑定 Bark 设备，请先在服务器配置 Bark Key" }
             return "测试推送失败（服务器 \(code)）"

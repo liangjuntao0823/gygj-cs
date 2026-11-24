@@ -192,7 +192,7 @@ private struct MeterCloudWatchSection: View {
                         .font(.system(size: 12))
                         .foregroundColor(.themeText3)
                     HStack(spacing: 8) {
-                        TextField(MeterCloudConfig.defaultEndpoint, text: $endpointInput)
+                        TextField("http://114.132.93.85:8082", text: $endpointInput)
                             .keyboardType(.URL)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
