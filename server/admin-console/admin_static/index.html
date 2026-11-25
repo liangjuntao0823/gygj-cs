@@ -170,17 +170,19 @@ let STATE={meta:null, meterTenants:[], houses:[]};
 
 async function api(path, opts={}){
   const r=await fetch(path,{headers:{'Content-Type':'application/json'},...opts});
-  if(r.status===401){location.reload();throw new Error('unauthorized')}
+  if(r.status===401){handleUnauthorized();throw new Error('unauthorized')}
   const ct=r.headers.get('content-type')||'';
   if(ct.includes('application/json')){return r.json()}
   return {_raw:await r.text(), _status:r.status};
 }
+function handleUnauthorized(){STATE.meta=null;show('view-login')}
 
 // ---------- 登录 / 会话 ----------
 async function boot(){
   try{
     const m=await api('/admin/api/meta');
     STATE.meta=m;
+    if(!m.authenticated){show('view-login');return}
     if(m.mustChange){show('view-changepw');return}
     enterApp();
   }catch(e){show('view-login')}
@@ -196,9 +198,9 @@ $('li-btn').onclick=async()=>{
 $('np-btn').onclick=async()=>{
   $('np-err').textContent='';
   const r=await api('/admin/api/password',{method:'POST',body:JSON.stringify({newPassword:$('np-pass').value})});
-  if(r.ok){location.reload()}else{$('np-err').textContent=r.error==='password_required'?'密码不能为空':'修改失败'}
+  if(r.ok){STATE.meta={...(STATE.meta||{}),mustChange:false,username:r.username};enterApp()}else{$('np-err').textContent=r.error==='password_required'?'密码不能为空':'修改失败'}
 };
-$('btn-out').onclick=async()=>{await api('/admin/api/logout',{method:'POST'});location.reload()};
+$('btn-out').onclick=async()=>{await api('/admin/api/logout',{method:'POST'});STATE.meta=null;show('view-login')};
 $('btn-pw').onclick=()=>openModal(`<h3>修改密码</h3>
   <div class="field"><label>新密码</label><input id="mp-pass" type="password"></div>
   <div class="row"><button id="mp-ok">保存</button><button class="ghost" onclick="closeModal()">取消</button></div>`,

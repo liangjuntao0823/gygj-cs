@@ -330,6 +330,7 @@ class NotifyScopeTests(unittest.TestCase):
 
 class FakeHandler:
     def __init__(self, path: str, body: dict[str, Any] | None = None, cookie: str = ""):
+        import io
         self.path = path
         self._body = body
         raw = json.dumps(body or {}).encode("utf-8")
@@ -339,6 +340,7 @@ class FakeHandler:
         self.sent: dict[str, Any] = {}
         self.cookies: dict[str, str] = {}
         self._raw = raw
+        self._buf = io.BytesIO()
 
     def send_response(self, code: int) -> None:
         self.status = code
@@ -357,15 +359,12 @@ class FakeHandler:
         import io
         return io.BytesIO(self._raw)
 
-    def wfile_write(self, data: bytes) -> None:
-        self._data = data
-
     @property
     def wfile(self) -> Any:
-        import io
-        buf = io.BytesIO()
-        self.wfile_write = lambda d: buf.write(d)
-        return buf
+        return self._buf
+
+    def json_body(self) -> dict[str, Any]:
+        return json.loads(self._buf.getvalue().decode("utf-8"))
 
 
 class RouteTests(unittest.TestCase):
@@ -385,11 +384,15 @@ class RouteTests(unittest.TestCase):
         self.assertTrue(aw.route_request(h, "GET", "/admin/", self._admin()))
         self.assertEqual(h.status, 200)
 
-    def test_meta_requires_auth(self) -> None:
+    def test_meta_public_when_unauthenticated(self) -> None:
         h = FakeHandler("/admin/api/meta")
         done = aw.route_request(h, "GET", "/admin/api/meta", self._admin())
         self.assertTrue(done)
-        self.assertEqual(h.status, 401)
+        self.assertEqual(h.status, 200)
+        doc = h.json_body()
+        self.assertFalse(doc["authenticated"])
+        self.assertIsNone(doc["username"])
+        self.assertFalse(doc["mustChange"])
 
     def test_login_then_meta(self) -> None:
         admin = self._admin()
@@ -400,6 +403,10 @@ class RouteTests(unittest.TestCase):
         h2 = FakeHandler("/admin/api/meta", cookie=cookie)
         aw.route_request(h2, "GET", "/admin/api/meta", admin)
         self.assertEqual(h2.status, 200)
+        doc = h2.json_body()
+        self.assertTrue(doc["authenticated"])
+        self.assertEqual(doc["username"], "admin")
+        self.assertTrue(doc["mustChange"])
 
     def test_non_admin_path_returns_false(self) -> None:
         self.assertFalse(aw.route_request(FakeHandler("/api/meter/health"), "GET",

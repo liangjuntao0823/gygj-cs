@@ -164,6 +164,18 @@ def route_request(handler: Any, method: str, path: str, admin: Any) -> bool:
         _send_json(handler, 200, {"ok": True}, cookies={SESSION_COOKIE: ""})
         return True
 
+    # 会话探针（公开）：未登录也返回 200，由前端决定展示登录页，避免 401 触发前端刷新循环
+    if path == PREFIX + "/api/meta" and method == "GET":
+        uname = auth.verify(token)
+        if not uname:
+            _send_json(handler, 200, {"ok": True, "authenticated": False,
+                                      "username": None, "mustChange": False})
+        else:
+            _send_json(handler, 200, {"ok": True, "authenticated": True,
+                                      "username": uname,
+                                      "mustChange": auth.must_change(uname)})
+        return True
+
     username = auth.verify(token)
     if not username:
         _send_json(handler, 401, {"ok": False, "error": "unauthorized"})
@@ -174,11 +186,6 @@ def route_request(handler: Any, method: str, path: str, admin: Any) -> bool:
         body = _read_body(handler)
         res = auth.change_password(token, str(body.get("newPassword") or ""))
         _send_json(handler, 200 if res.get("ok") else 400, res)
-        return True
-
-    if path == PREFIX + "/api/meta" and method == "GET":
-        _send_json(handler, 200, {"ok": True, "username": username,
-                                  "mustChange": auth.must_change(username)})
         return True
 
     # ---- 服务器管理 ----
