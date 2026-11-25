@@ -107,6 +107,51 @@ class HouseStoreTests(unittest.TestCase):
         self.assertEqual(s["tower1"], 1)
         self.assertEqual(s["tower2"], 1)
 
+    def test_import_house_preserves_fields_no_outbox(self):
+        payload = {
+            "roomKey": "1-1004", "roomNo": "1004", "tower": 1,
+            "landlord": "业主", "layout": "复式", "price": 1500,
+            "password": "", "remark": "全屋定制", "status": "rented",
+            "updatedBy": "pc端", "updatedAt": "2026-11-01T10:00:00+08:00",
+            "media": [{"objectKey": "h/1-1004/a.jpg", "fileName": "a.jpg",
+                       "kind": "image"}]}
+        events = [{"id": "EV-1", "ts": "2026-11-01T10:00:00+08:00",
+                   "operator": "pc端", "action": "新增房源", "detail": "",
+                   "fieldChanges": [{"field": "price", "oldValue": "0",
+                                      "newValue": "1500"}]}]
+        doc = self.store.import_house(payload, ledger_events=events)
+        self.assertEqual(doc["updatedBy"], "pc端")
+        self.assertTrue(doc["updatedAt"].startswith("2026-11-01"))
+        self.assertEqual(doc["media"][0]["fileName"], "a.jpg")
+        led = self.store.ledger("1-1004")
+        self.assertEqual(len(led), 1)
+        self.assertTrue(led[0]["migrated"])
+        self.assertEqual(led[0]["fieldChanges"][0]["newValue"], "1500")
+        # 存量迁移不产生待投递广播
+        self.assertEqual(len(self.store.pending_outbox()), 0)
+
+    def test_import_house_idempotent(self):
+        payload = {"roomKey": "1-1004", "roomNo": "1004", "tower": 1,
+                   "price": 1500, "status": "available", "media": []}
+        events = [{"id": "EV-1", "ts": "2026-11-01T10:00:00+08:00",
+                   "operator": "pc端", "action": "新增房源", "detail": "",
+                   "fieldChanges": [{"field": "price", "oldValue": "0",
+                                      "newValue": "1500"}]}]
+        first = self.store.import_house(payload, ledger_events=events)
+        self.store.import_house(payload, ledger_events=events)
+        led = self.store.ledger("1-1004")
+        self.assertEqual(len(led), 1)  # 账本事件不重复
+        self.assertEqual(len(led[0]["fieldChanges"]), 1)  # 字段变更不重复
+        again = self.store.get_house("1-1004")
+        self.assertEqual(again["revision"], first["revision"])  # 修订号不推进
+
+    def test_import_house_dedupes_media_refs(self):
+        dup = {"objectKey": "h/1-1004/a.jpg", "fileName": "a.jpg", "kind": "image"}
+        payload = {"roomKey": "1-1004", "tower": 1, "price": 1500,
+                   "status": "available", "media": [dup, dict(dup)]}
+        doc = self.store.import_house(payload)
+        self.assertEqual(len(doc["media"]), 1)
+
 
 class BroadcastTests(unittest.TestCase):
     def setUp(self):

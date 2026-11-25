@@ -19,8 +19,12 @@ import json
 import time
 import urllib.parse
 import urllib.request
+from datetime import timezone, timedelta
 from pathlib import Path
 from typing import Any, Callable
+
+# 服务器统一东八区时间，与 house_store.now_local 口径一致
+_CST = timezone(timedelta(hours=8))
 
 # 与客户端 MediaNaming 同口径：视频 .mov -> .mp4
 FIELD_KEYS = ["roomNo", "tower", "landlord", "layout", "price",
@@ -37,24 +41,72 @@ def _infer_kind(media_name: str) -> str:
     return "video" if media_name.lower().endswith((".mp4", ".mov")) else "image"
 
 
+def _epoch_to_iso(value: Any) -> str | None:
+    """旧记录 updatedAt/date 是 epoch 秒（float），转东八区 ISO8601；无效返回 None。"""
+    try:
+        ts = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if ts <= 0:
+        return None
+    return datetime.datetime.fromtimestamp(ts, tz=_CST).strftime(
+        "%Y-%m-%dT%H:%M:%S+08:00")
+
+
 def record_to_payload(record: dict[str, Any]) -> dict[str, Any]:
-    """把旧 info.json（CloudHouseRecord）转成 HouseStore.upsert_house 的 payload。"""
+    """把旧 info.json（CloudHouseRecord）转成 HouseStore.import_house 的 payload。"""
     room_key = str(record["roomKey"])
-    media = []
+    media: list[dict[str, Any]] = []
+    seen: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
     for name in record.get("mediaNames", []):
         kind = _infer_kind(name)
         cloud_name = cloud_media_name(name, kind)
-        media.append({
-            "objectKey": f"h/{room_key}/{cloud_name}",
-            "fileName": name,
-            "kind": kind,
-        })
+        object_key = f"h/{room_key}/{cloud_name}"
+        item = {"objectKey": object_key, "fileName": name, "kind": kind}
+        if object_key in seen:
+            # 旧记录可能 mov 与转码后 mp4 同名残留；同实体优先保留 .mp4 文件名
+            if name.lower().endswith(".mp4"):
+                seen[object_key] = item
+            continue
+        seen[object_key] = item
+        order.append(object_key)
+    media = [seen[k] for k in order]
     payload: dict[str, Any] = {"media": media}
     for k in FIELD_KEYS:
         if k in record:
             payload[k] = record[k]
     payload["roomKey"] = room_key
+    # tower 兜底：旧记录缺 tower 时，按房号前缀 2- 判定 2 座，否则 1 座
+    if not payload.get("tower"):
+        payload["tower"] = 2 if room_key.startswith("2-") else 1
+    # 保真原始操作人与更新时间（修订号由服务端权威重排，不沿用旧值）
+    if record.get("updatedBy"):
+        payload["updatedBy"] = str(record["updatedBy"])
+    iso_ts = _epoch_to_iso(record.get("updatedAt"))
+    if iso_ts:
+        payload["updatedAt"] = iso_ts
     return payload
+
+
+def ledger_events(record: dict[str, Any]) -> list[dict[str, Any]]:
+    """把旧 ledger.json 的 events[] 转成 HouseStore.import_house 的账本入参。"""
+    out: list[dict[str, Any]] = []
+    for ev in record.get("events") or []:
+        changes = [{
+            "field": str(c.get("field") or ""),
+            "oldValue": str(c.get("oldValue") or ""),
+            "newValue": str(c.get("newValue") or ""),
+        } for c in ev.get("fieldChanges") or []]
+        out.append({
+            "id": str(ev.get("id") or ""),
+            "ts": _epoch_to_iso(ev.get("date")) or "",
+            "operator": str(ev.get("operatorName") or ""),
+            "action": str(ev.get("action") or ""),
+            "detail": str(ev.get("detail") or ""),
+            "fieldChanges": changes,
+        })
+    return out
 
 
 class CosXMLClient:
@@ -139,18 +191,38 @@ class CosXMLClient:
 
 def run_migration(store: Any, client: CosXMLClient,
                   logger: Callable[[str], None] = print) -> dict[str, int]:
-    """拉取全部 info.json 并导入 SQLite，返回对账计数。"""
+    """拉取全部 info.json（连同账本）导入 SQLite，返回对账计数。
+
+    媒体实体不搬运，只写 objectKey 引用；走 import_house 迁移专用落库，
+    不产生 outbox 广播；账本缺失或读取失败不阻断房源导入。
+    """
     keys = client.list_info_keys()
-    result = {"total": len(keys), "imported": 0, "skipped": 0, "failed": 0}
+    result = {"total": len(keys), "imported": 0, "skipped": 0, "failed": 0,
+              "ledgerEvents": 0, "mediaRefs": 0}
     for key in keys:
         try:
             record = json.loads(client.get_object(key).decode("utf-8"))
             payload = record_to_payload(record)
-            operator = str(record.get("updatedBy") or "迁移")
-            store.upsert_house(payload, operator=operator,
-                               origin_device_id="migration")
+            room_key = payload["roomKey"]
+            if not room_key:
+                result["skipped"] += 1
+                logger(f"跳过无 roomKey: {key}")
+                continue
+            events: list[dict[str, Any]] = []
+            ledger_key = key.replace("/info.json", "/ledger.json")
+            try:
+                led = json.loads(client.get_object(ledger_key).decode("utf-8"))
+                events = ledger_events(led)
+            except Exception:
+                events = []  # 无账本或读取失败：不阻断房源导入
+            doc = store.import_house(
+                payload, ledger_events=events,
+                operator=str(record.get("updatedBy") or "迁移"))
             result["imported"] += 1
-            logger(f"导入 {payload['roomKey']}")
+            result["ledgerEvents"] += len(events)
+            result["mediaRefs"] += len(doc.get("media") or [])
+            logger(f"导入 {room_key}（账本 {len(events)} 条，媒体引用 "
+                   f"{len(doc.get('media') or [])}）")
         except Exception as e:  # 单套失败不阻断其余，最后统一核对
             result["failed"] += 1
             logger(f"失败 {key}: {e}")

@@ -284,6 +284,86 @@ class HouseStore:
             return self._update(conn, existing, room_key, fields, media, operator,
                                 origin_device_id, now, expected_revision)
 
+    def import_house(self, payload: dict[str, Any],
+                     ledger_events: list[dict[str, Any]] | None = None,
+                     operator: str = "迁移") -> dict[str, Any]:
+        """存量迁移专用落库（一次性从旧 COS 搬入）。
+
+        - 只落结构化数据 + 媒体引用，媒体实体仍在 COS；
+        - 保留原始 updatedAt/updatedBy（ISO 字符串，由迁移侧换算），不套用当前时间；
+        - 写历史账本（migrated=1），但**不写 outbox、不触发广播**，避免存量 229 套
+          各推一条「新增房源」轰炸在线设备；
+        - 幂等：重复运行不产生重复账本事件、不推进修订号；已存在的房保留原 revision。
+        """
+        room_key = str(payload.get("roomKey") or "").strip()
+        if not room_key:
+            raise ValueError("roomKey required")
+        fields = {
+            "roomNo": str(payload.get("roomNo") or room_key),
+            "tower": int(payload.get("tower") or 1),
+            "landlord": str(payload.get("landlord") or ""),
+            "layout": str(payload.get("layout") or ""),
+            "price": int(payload.get("price") or 0),
+            "password": str(payload.get("password") or ""),
+            "remark": str(payload.get("remark") or ""),
+            "status": str(payload.get("status") or "available"),
+        }
+        media = payload.get("media") or []
+        created_at = str(payload.get("createdAt") or "") or iso(now_local())
+        updated_at = str(payload.get("updatedAt") or "") or created_at
+        updated_by = str(payload.get("updatedBy") or operator)
+        with self._lock:
+            conn = self._conn
+            existing = conn.execute(
+                "SELECT * FROM houses WHERE room_key=?", (room_key,)).fetchone()
+            if existing is None:
+                top = conn.execute(
+                    "SELECT COALESCE(MAX(revision),0) AS m FROM houses"
+                ).fetchone()["m"]
+                new_rev = int(top) + 1
+                conn.execute(
+                    "INSERT INTO houses (room_key,room_no,tower,landlord,layout,price,"
+                    "password,remark,status,revision,is_deleted,created_at,updated_at,"
+                    "updated_by) VALUES (?,?,?,?,?,?,?,?,?,?,0,?,?,?)",
+                    (room_key, fields["roomNo"], fields["tower"], fields["landlord"],
+                     fields["layout"], fields["price"], fields["password"],
+                     fields["remark"], fields["status"], new_rev,
+                     created_at, updated_at, updated_by))
+            else:
+                conn.execute(
+                    "UPDATE houses SET room_no=?,tower=?,landlord=?,layout=?,price=?,"
+                    "password=?,remark=?,status=?,updated_at=?,updated_by=? "
+                    "WHERE room_key=?",
+                    (fields["roomNo"], fields["tower"], fields["landlord"],
+                     fields["layout"], fields["price"], fields["password"],
+                     fields["remark"], fields["status"], updated_at, updated_by,
+                     room_key))
+            self._replace_media(conn, room_key, media)
+            for ev in ledger_events or []:
+                event_id = str(ev.get("id") or "")
+                if not event_id:
+                    continue
+                already = conn.execute(
+                    "SELECT 1 FROM ledger_events WHERE id=?",
+                    (event_id,)).fetchone()
+                if already:
+                    continue  # 幂等：历史事件已在，字段变更一并跳过
+                conn.execute(
+                    "INSERT OR IGNORE INTO ledger_events "
+                    "(id,room_key,ts,operator,action,detail,migrated) "
+                    "VALUES (?,?,?,?,?,?,1)",
+                    (event_id, room_key, str(ev.get("ts") or updated_at),
+                     str(ev.get("operator") or updated_by),
+                     str(ev.get("action") or ""), str(ev.get("detail") or "")))
+                for ch in ev.get("fieldChanges") or []:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO field_changes "
+                        "(event_id,field,old_value,new_value) VALUES (?,?,?,?)",
+                        (event_id, str(ch.get("field") or ""),
+                         str(ch.get("oldValue") or ""), str(ch.get("newValue") or "")))
+            conn.commit()
+            return self.get_house(room_key)  # type: ignore[return-value]
+
     def _insert(self, conn, room_key, fields, media, operator,
                 origin_device_id, now) -> dict[str, Any]:
         event_id = "ev_" + secrets.token_hex(10)
@@ -399,12 +479,19 @@ class HouseStore:
     # ------------------------------------------------------------------
     def _replace_media(self, conn, room_key: str, media: list[dict[str, Any]]) -> None:
         conn.execute("DELETE FROM media_refs WHERE room_key=?", (room_key,))
-        for idx, m in enumerate(media):
+        seen: set[str] = set()
+        idx = 0
+        for m in media:
+            object_key = str(m.get("objectKey") or "")
+            if not object_key or object_key in seen:
+                continue  # 防御性去重，避免同实体重复引用撞唯一约束
+            seen.add(object_key)
             conn.execute(
                 "INSERT INTO media_refs (room_key,object_key,file_name,kind,sort_order) "
                 "VALUES (?,?,?,?,?)",
-                (room_key, str(m.get("objectKey") or ""), str(m.get("fileName") or ""),
+                (room_key, object_key, str(m.get("fileName") or ""),
                  str(m.get("kind") or "image"), int(m.get("sortOrder") or idx)))
+            idx += 1
 
     def _media_changed(self, conn, room_key: str, media: list[dict[str, Any]]) -> dict | None:
         cur = self._media(conn, room_key)
