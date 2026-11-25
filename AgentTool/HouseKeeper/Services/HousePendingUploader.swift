@@ -40,24 +40,52 @@ final class HousePendingUploader {
     @discardableResult
     func flush(context: ModelContext) async -> Int {
         let keys = pendingKeys
-        guard !keys.isEmpty else { return 0 }
-        let houses = (try? context.fetch(FetchDescriptor<House>())) ?? []
-        let byKey = Dictionary(houses.map { ($0.mediaRoomKey, $0) },
-                               uniquingKeysWith: { a, _ in a })
         var done = 0
-        for key in keys {
-            guard let h = byKey[key] else {
-                // 本地已无此房（被彻底删除），无需再补传
-                clearPending(key)
+        if !keys.isEmpty {
+            let houses = (try? context.fetch(FetchDescriptor<House>())) ?? []
+            let byKey = Dictionary(houses.map { ($0.mediaRoomKey, $0) },
+                                   uniquingKeysWith: { a, _ in a })
+            for key in keys {
+                guard let h = byKey[key] else {
+                    // 本地已无此房（被彻底删除），无需再补传
+                    clearPending(key)
+                    continue
+                }
+                do {
+                    _ = try await HouseSyncEngine.shared.pushHouse(h)
+                    clearPending(key)
+                    done += 1
+                } catch {
+                    // 仍失败（断网/冲突），保留待下轮，不影响其余房源
+                    break
+                }
+            }
+        }
+        // 文本补传后顺带把待传媒体二进制补到服务器磁盘
+        await flushMedia()
+        return done
+    }
+
+    /// 服务器模式：把待传媒体队列逐个补传到服务器磁盘；成功清条目，本地文件已失则清条目，失败保留待下轮
+    @discardableResult
+    func flushMedia() async -> Int {
+        let items = HouseMediaUploadQueue.pendingItems()
+        guard !items.isEmpty else { return 0 }
+        var done = 0
+        for item in items {
+            let localURL = MediaStore.url(for: item.fileName, roomKey: item.roomKey)
+            guard FileManager.default.fileExists(atPath: localURL.path),
+                  let data = try? Data(contentsOf: localURL) else {
+                HouseMediaUploadQueue.remove(roomKey: item.roomKey, fileName: item.fileName)
                 continue
             }
             do {
-                _ = try await HouseSyncEngine.shared.pushHouse(h)
-                clearPending(key)
+                _ = try await HouseRemoteClient.shared.uploadMedia(
+                    roomKey: item.roomKey, fileName: item.fileName, kind: item.kind, data: data)
+                HouseMediaUploadQueue.remove(roomKey: item.roomKey, fileName: item.fileName)
                 done += 1
             } catch {
-                // 仍失败（断网/冲突），保留待下轮，不影响其余房源
-                break
+                // 保留条目，下轮同步再试
             }
         }
         return done
