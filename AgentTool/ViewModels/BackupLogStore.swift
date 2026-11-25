@@ -27,24 +27,15 @@ enum BackupLogStore {
     }
 
     static func log(category: String, action: String, result: String, detail: String = "", checksum: String = "", username: String? = nil, room: String = "", cloud: Bool = false) {
-        // v2.7（P1⑦ 跨账号日志公共区）：云端操作同时写本地日志——
-        // 此前 cloud:true 直接 return 不写本地，导致本机日志区只有 cloud:false 的操作，
-        // 跨账号同步回来的别人操作本机完全看不到。现在本机日志始终完整，云端日志区拉公共区。
-        if cloud {
-            CloudOps.log(category: category, action: action, result: result, detail: detail, room: room)
-        }
+        // 旧桶公共日志上行已随 COS 链路下线；操作日志只保留本机留痕（cloud 参数保留兼容旧调用）。
         writeLocal(makeEntry(category: category, action: action, result: result, detail: detail,
                              checksum: checksum, username: username, room: room))
     }
 
-    /// v2.71：分享扩展可靠版——本地留痕同 log()，公共日志改「先入待补队→await 发送→成功出队」。
-    /// 扩展进程可能在发送途中被系统回收，fire-and-forget 会丢日志；入队在先则 App 启动/回前台必补推。
+    /// 分享扩展可靠版：本地留痕同 log()。旧桶公共日志上行已随 COS 链路下线。
     static func logAwait(category: String, action: String, result: String, detail: String = "", checksum: String = "", username: String? = nil, room: String = "", cloud: Bool = false) async {
         writeLocal(makeEntry(category: category, action: action, result: result, detail: detail,
                              checksum: checksum, username: username, room: room))
-        if cloud {
-            await CloudOps.logAwait(category: category, action: action, result: result, detail: detail, room: room)
-        }
     }
 
     private static func makeEntry(category: String, action: String, result: String, detail: String, checksum: String, username: String?, room: String) -> BackupLogEntry {

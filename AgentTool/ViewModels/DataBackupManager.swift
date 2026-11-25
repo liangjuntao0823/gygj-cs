@@ -667,14 +667,13 @@ class DataBackupManager {
     }
 
     /// v1.13 需求16：一次性目录迁移（App 启动时调用，幂等，可重复执行不产生重复文件）
-    /// ① Documents 根目录的旧分区备份文件夹（成交备份/收租备份/包租备份/总备份）
-    ///    → 整体迁入 备份/旧版备份/<板块>/；原目录内若只剩 JSON（已全部迁走）则删除空目录
-    /// ② 备份/ 根目录下的 COS 配置 json → 备份/CosConfig/
+    /// Documents 根目录的旧分区备份文件夹（成交备份/收租备份/包租备份/总备份）
+    /// → 整体迁入 备份/旧版备份/<板块>/；原目录内若只剩 JSON（已全部迁走）则删除空目录
     static func migrateLegacyDirectories() {
         let fm = FileManager.default
         let docs = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
 
-        // ① 旧分区备份：Documents/<板块>/ → 备份/旧版备份/<板块>/
+        // 旧分区备份：Documents/<板块>/ → 备份/旧版备份/<板块>/
         for type in [BackupType.deals, .properties, .payouts, .total] {
             let legacyDir = docs.appendingPathComponent(type.rawValue, isDirectory: true)
             guard fm.fileExists(atPath: legacyDir.path) else { continue }
@@ -694,21 +693,6 @@ class DataBackupManager {
             // 目录已空则删除（残留非 JSON 文件时保留原目录，避免误删用户文件）
             if let remain = try? fm.contentsOfDirectory(atPath: legacyDir.path), remain.isEmpty {
                 try? fm.removeItem(at: legacyDir)
-            }
-        }
-
-        // ② COS 配置备份 json：备份/ 根目录 → 备份/CosConfig/
-        let cosDir = DataRoot.url().appendingPathComponent("CosConfig", isDirectory: true)
-        try? fm.createDirectory(at: cosDir, withIntermediateDirectories: true)
-        if let names = try? fm.contentsOfDirectory(atPath: DataRoot.url().path) {
-            for name in names where name.lowercased().hasSuffix(".json") {
-                let src = DataRoot.url().appendingPathComponent(name)
-                let dst = cosDir.appendingPathComponent(name)
-                if fm.fileExists(atPath: dst.path) {
-                    try? fm.removeItem(at: src)
-                } else {
-                    try? fm.moveItem(at: src, to: dst)
-                }
             }
         }
     }
