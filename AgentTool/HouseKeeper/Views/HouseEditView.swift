@@ -1044,7 +1044,8 @@ struct HouseEditView: View {
         // v1.54：保存后自动生成/更新该房源的脱敏版 H5（删旧生成新）——
         //        保证「新增了房源就自动有分享页」，选房链接里点卡片即可打开完整详情；
         //        编辑保存时旧 H5 立即失效、生成新 H5（内容与最新房源信息一致）
-        if let config = CosConfig.load(), config.isValid {
+        // 服务器模式：App 内分享不生成 H5 分享页，此自动重建跳过。
+        if !HouseServerMode.ready, let config = CosConfig.load(), config.isValid {
             let files = target.mediaItems.map { ShareMediaFile(name: $0.fileName, kind: $0.kind) }
             let profile = CosUploader.loadShareProfile()
             let info = ShareHouseInfo(

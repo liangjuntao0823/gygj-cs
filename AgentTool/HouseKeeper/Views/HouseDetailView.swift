@@ -1437,14 +1437,10 @@ struct HouseDetailView: View {
         }
     }
 
-    /// 按模式生成分享卡片链接并弹系统分享面板
+    /// 按模式生成分享内容并弹系统分享面板
     /// 注意：Task 内只传值类型（fileName/kind 数组 + 字符串字段），绝不直接访问 SwiftData @Model，
     /// 否则跨线程读取模型会闪退（分享闪退修复根因）
     private func startShare(mode: ShareMode) {
-        guard let config = CosConfig.load(), config.isValid else {
-            shareError = "请先到「设置 → 房源分享 → 远程配置」填写云存储配置（腾讯云 COS），再分享卡片链接"
-            return
-        }
         // 先在主线程把所有数据拷成值类型，Task 里不再触碰 SwiftData 模型
         let files = house.mediaItems.map { ShareMediaFile(name: $0.fileName, kind: $0.kind) }
         let roomKey = house.mediaRoomKey
@@ -1461,6 +1457,22 @@ struct HouseDetailView: View {
             name: profile.name,
             phone: profile.phone
         )
+        // 服务器模式：App 内分享——本地媒体文件 + 纯文字，直接系统面板，不生成 H5 链接、不传桶
+        if HouseServerMode.ready {
+            let urls: [URL] = files.compactMap { f in
+                let u = MediaStore.url(for: f.name, roomKey: roomKey)
+                return FileManager.default.fileExists(atPath: u.path) ? u : nil
+            }
+            var items: [Any] = urls
+            items.append(info.shareText)
+            detailShareStep = ShareStep(items: items)
+            Task { try? await HouseRemoteClient.shared.addShareRecord(roomKey: roomKey, channel: "app内分享", summary: info.shareText) }
+            return
+        }
+        guard let config = CosConfig.load(), config.isValid else {
+            shareError = "请先到「设置 → 房源分享 → 远程配置」填写云存储配置（腾讯云 COS），再分享卡片链接"
+            return
+        }
         isSharing = true
         shareProgress = 0
         Task {

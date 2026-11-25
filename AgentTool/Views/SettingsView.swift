@@ -1176,12 +1176,20 @@ struct SettingsView: View {
     // v1.54：全量重建全部房源的脱敏版分享 H5——
     // 云端旧分享页全部删除（旧链接立即失效）+ 每间房重新生成最新 H5（无媒体房源只删旧页不生成）
     private func rebuildAllShareH5() {
-        guard let ctx = houseModelContext,
-              let config = CosConfig.load(), config.isValid else {
+        guard houseModelContext != nil else {
+            houseCacheTip = "数据容器不可用，请重启 App 后重试"
+            return
+        }
+        // 服务器模式：App 内分享不生成 H5 分享链接，此重建入口跳过
+        if HouseServerMode.ready {
+            houseCacheTip = "当前为 App 内分享，不生成 H5 分享链接"
+            return
+        }
+        guard let config = CosConfig.load(), config.isValid else {
             houseCacheTip = "请先到「云端配置」填写 COS 配置并验证通过"
             return
         }
-        let houses = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
+        let houses = (try? houseModelContext?.fetch(FetchDescriptor<House>())) ?? []
         let active = houses.filter { !($0.isDeleted ?? false) }
         let profile = CosUploader.loadShareProfile()
         // 主线程先拷贝全部值类型，Task 内不再触碰 SwiftData 模型
@@ -2528,12 +2536,20 @@ struct ShareSettingsPage: View {
     }
 
     private func rebuildAllShareH5() {
-        guard let ctx = houseModelContext,
-              let config = CosConfig.load(), config.isValid else {
+        guard houseModelContext != nil else {
+            houseCacheTip = "数据容器不可用，请重启 App 后重试"
+            return
+        }
+        // 服务器模式：App 内分享不生成 H5 分享链接，此重建入口跳过
+        if HouseServerMode.ready {
+            houseCacheTip = "当前为 App 内分享，不生成 H5 分享链接"
+            return
+        }
+        guard let config = CosConfig.load(), config.isValid else {
             houseCacheTip = "请先到「云端配置」填写 COS 配置并验证通过"
             return
         }
-        let houses = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
+        let houses = (try? houseModelContext?.fetch(FetchDescriptor<House>())) ?? []
         let active = houses.filter { !($0.isDeleted ?? false) }
         let profile = CosUploader.loadShareProfile()
         let items = active.map { h -> (files: [ShareMediaFile], roomKey: String, info: ShareHouseInfo) in

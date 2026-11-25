@@ -3066,10 +3066,6 @@ struct HouseListView: View {
 
     private func generateSingleShare(mode: ShareMode) {
         guard let house = singleShareHouse else { return }
-        guard let config = CosConfig.load(), config.isValid else {
-            infoMessage = "请先到「设置 → 房源分享 → 远程配置」填写云存储配置（腾讯云 COS）并保存验证，再分享卡片链接"; showInfoAlert = true
-            return
-        }
         guard !house.mediaItems.isEmpty else {
             infoMessage = "这套房源还没有照片或视频，先编辑添加素材再分享"; showInfoAlert = true
             return
@@ -3089,6 +3085,25 @@ struct HouseListView: View {
             name: profile.name,
             phone: profile.phone
         )
+        // 服务器模式：App 内分享——本地媒体 + 纯文字，直接系统面板，不生成 H5 链接
+        if HouseServerMode.ready {
+            let urls: [URL] = files.compactMap { f in
+                let u = MediaStore.url(for: f.name, roomKey: roomKey)
+                return FileManager.default.fileExists(atPath: u.path) ? u : nil
+            }
+            var items: [Any] = urls
+            items.append(info.shareText)
+            shareQueue = [items]
+            shareIndex = 0
+            presentShareStep(items)
+            singleShareHouse = nil
+            Task { try? await HouseRemoteClient.shared.addShareRecord(roomKey: roomKey, channel: "app内分享", summary: info.shareText) }
+            return
+        }
+        guard let config = CosConfig.load(), config.isValid else {
+            infoMessage = "请先到「设置 → 房源分享 → 远程配置」填写云存储配置（腾讯云 COS）并保存验证，再分享卡片链接"; showInfoAlert = true
+            return
+        }
         isGenerating = true
         generateTip = "正在上传照片和视频…"
         generateProgress = 0
@@ -3132,10 +3147,6 @@ struct HouseListView: View {
     /// v1.22：生成【合集分享卡片】（一次选 N 套 → 一个链接 → 好友点开看全部），生成后弹一次系统分享面板
     /// 注意：值类型（ShareCollectionItem）在主线程构建完成，Task 内只传递值，绝不直接访问 SwiftData @Model（跨线程读取模型会闪退）
     private func generateShareQueue(mode: ShareMode) {
-        guard let config = CosConfig.load(), config.isValid else {
-            infoMessage = "请先到「设置 → 房源分享 → 远程配置」填写云存储配置（腾讯云 COS）并保存验证，再分享卡片链接"; showInfoAlert = true
-            return
-        }
         let shareable = houses.filter { selectedHouseIDs.contains($0.id) && !$0.mediaItems.isEmpty }
         guard !shareable.isEmpty else {
             infoMessage = "选中的房源都没有照片或视频，先编辑添加素材再分享"; showInfoAlert = true
@@ -3146,6 +3157,50 @@ struct HouseListView: View {
             if a.floorNumber != b.floorNumber { return a.floorNumber < b.floorNumber }
             if a.roomNumber != b.roomNumber { return a.roomNumber < b.roomNumber }
             return a.roomNo < b.roomNo
+        }
+
+        // 服务器模式：App 内分享——每套一批（本地媒体 + 该套纯文字），依次弹系统面板；不生成合集 H5 链接
+        if HouseServerMode.ready {
+            var batches: [[Any]] = []
+            var records: [(roomKey: String, summary: String)] = []
+            for house in sortedShareable {
+                let roomKey = house.mediaRoomKey
+                let profile = CosUploader.loadShareProfile()
+                let info = ShareHouseInfo(
+                    displayRoomNo: house.displayRoomNo,
+                    towerLabel: house.towerLabel,
+                    layout: house.layout,
+                    statusLabel: house.status.label,
+                    priceText: house.priceText,
+                    landlord: house.landlord,
+                    password: house.password,
+                    remark: house.remark,
+                    name: profile.name,
+                    phone: profile.phone
+                )
+                let urls = house.mediaItems.compactMap { item -> URL? in
+                    let u = MediaStore.url(for: item.fileName, roomKey: roomKey)
+                    return FileManager.default.fileExists(atPath: u.path) ? u : nil
+                }
+                var batch: [Any] = urls
+                batch.append(info.shareText)
+                batches.append(batch)
+                records.append((roomKey, info.shareText))
+            }
+            shareQueue = batches
+            shareIndex = 0
+            presentShareStep(batches[0])
+            Task {
+                for rec in records {
+                    try? await HouseRemoteClient.shared.addShareRecord(roomKey: rec.roomKey, channel: "app内分享", summary: rec.summary)
+                }
+            }
+            return
+        }
+
+        guard let config = CosConfig.load(), config.isValid else {
+            infoMessage = "请先到「设置 → 房源分享 → 远程配置」填写云存储配置（腾讯云 COS）并保存验证，再分享卡片链接"; showInfoAlert = true
+            return
         }
 
         // 主线程先构建值类型数组（Task 闭包内不触碰 @Model）
