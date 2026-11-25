@@ -186,7 +186,8 @@ class CloudHandler(BaseHTTPRequestHandler):
         if path == nh.PREFIX or path.startswith(nh.PREFIX + "/"):
             nh.route_request(self, "GET", path, self.ctx.hub)
             return
-        if path == ha.PREFIX or path.startswith(ha.PREFIX + "/"):
+        if (path == ha.PREFIX or path.startswith(ha.PREFIX + "/")
+                or path == ha.PUBLIC_PREFIX or path.startswith(ha.PUBLIC_PREFIX + "/")):
             ha.route_request(self, "GET", path, self.ctx.house_store, self.ctx.hub)
             return
         if path == "/api/meter/health":
@@ -279,7 +280,8 @@ class CloudHandler(BaseHTTPRequestHandler):
         if path == nh.PREFIX or path.startswith(nh.PREFIX + "/"):
             nh.route_request(self, "POST", path, self.ctx.hub)
             return
-        if path == ha.PREFIX or path.startswith(ha.PREFIX + "/"):
+        if (path == ha.PREFIX or path.startswith(ha.PREFIX + "/")
+                or path == ha.PUBLIC_PREFIX or path.startswith(ha.PUBLIC_PREFIX + "/")):
             ha.route_request(self, "POST", path, self.ctx.house_store, self.ctx.hub)
             return
         if path == "/api/meter/enroll":

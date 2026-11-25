@@ -4,8 +4,8 @@
 公寓管家 · 公开分享 H5 静态壳（服务器本地托管，不依赖 COS / 旧云函数）
 =====================================================================
 单页应用：
-  - `/public/h5?roomKey=<房号>`  → 单房卡片（户型 / 租金 / 实拍图文视频 / 名片）
-  - `/public/h5`                → 公开选房列表（全部待租房源，脱敏）
+  - `/api/public/h5?roomKey=<房号>`  → 单房卡片（户型 / 租金 / 实拍图文视频 / 名片）
+  - `/api/public/h5`                → 公开选房列表（全部待租房源，脱敏）
 数据走免鉴权公开接口：`/api/public/rooms[?roomKey=]`、`/api/public/profile`，
 媒体走 `/api/public/media/<objectKey>`。页面不含房号 / 房东 / 备注等内部信息。
 """
@@ -54,7 +54,7 @@ body{background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSys
 </style>
 </head>
 <body>
-<div class="topbar"><a id="back" href="/public/h5" style="display:none">‹ 返回</a><h1 id="title">房源信息</h1></div>
+<div class="topbar"><a id="back" href="/api/public/h5" style="display:none">‹ 返回</a><h1 id="title">房源信息</h1></div>
 <div class="wrap" id="app"><div class="loading">加载中…</div></div>
 <script>
 function qs(k){var p=new URLSearchParams(location.search);return p.get(k)||""}
@@ -100,7 +100,7 @@ async function renderList(){
     if(!rooms.length){app.innerHTML='<div class="empty">暂无可看房源</div>';return}
     var h=rooms.map(function(r){
       var thumb=r.media&&r.media.length?'<img class="thumb" src="'+mediaUrl((r.media.find(function(m){return m.kind!=="video"})||r.media[0]).objectKey)+'">':"";
-      return '<a class="room-item" href="/public/h5?roomKey='+encodeURIComponent(r.roomKey)+'">'+thumb+
+      return '<a class="room-item" href="/api/public/h5?roomKey='+encodeURIComponent(r.roomKey)+'">'+thumb+
         '<div class="info"><div class="t">'+esc(r.layout||"户型")+'</div><div class="s">'+esc((r.tower||"")+" "+(r.roomNo||""))+'</div></div>'+
         '<div class="p">¥'+esc(r.price||"")+'</div></a>';
     }).join("");
