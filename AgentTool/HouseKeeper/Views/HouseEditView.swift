@@ -1005,42 +1005,6 @@ struct HouseEditView: View {
                                                detail: "\(failSummary) 删除失败，已挂任务中心", room: rk, cloud: false)
                         }
                     }
-                } else if let config = CosConfig.load(), config.isValid {
-                    Task {
-                        var succeeded: [(name: String, kind: String)] = []
-                        var failed: [(name: String, kind: String, error: String)] = []
-                        for item in removed {
-                            do {
-                                try await CosUploader.deleteRemoteMedia(fileName: item.name, kind: item.kind, roomKey: rk, config: config)
-                                succeeded.append(item)
-                            } catch {
-                                failed.append((name: item.name, kind: item.kind, error: error.localizedDescription))
-                            }
-                        }
-                        let successSplit = HouseLedgerFormat.split(succeeded)
-                        let failSplit = HouseLedgerFormat.split(failed.map { (name: $0.name, kind: $0.kind) })
-                        let summary = HouseLedgerFormat.mediaSummary(images: successSplit.images.count, videos: successSplit.videos.count)
-                        let failSummary = HouseLedgerFormat.mediaSummary(images: failSplit.images.count, videos: failSplit.videos.count)
-                        if failed.isEmpty {
-                            BackupLogStore.log(category: "房源", action: "删除媒体（本地→云端）", result: "成功",
-                                               detail: "已删除\(summary)", room: rk, cloud: true)
-                        } else {
-                            let failedFiles = failed.map { $0.name }
-                            let failureDetail = summary.isEmpty
-                            ? "\(failSummary) 删除失败，已挂任务中心"
-                            : "已删除\(summary)；\(failSummary) 删除失败，已挂任务中心"
-                            // 断网/超时：本地已删、云端对象还在别人能看到的旧内容——
-                            // 挂任务中心待处理，联网后手动点重试补删；files 只供内部重试，日志不展示文件名。
-                            SyncTaskCenter.shared.reportFailure(
-                                kind: .mediaDelete,
-                                title: "删云端媒体",
-                                roomKeys: [rk],
-                                failure: "\(rk) 有 \(failed.count) 个媒体没从云端删掉；点重试",
-                                files: failedFiles)
-                            BackupLogStore.log(category: "房源", action: "删除媒体（本地→云端）", result: "失败",
-                                               detail: failureDetail, room: rk, cloud: true)
-                        }
-                    }
                 }
             }
             // 房号/座号变更 → 数据库已存好，再整体迁移本地媒体目录（文件不丢）
@@ -1074,30 +1038,6 @@ struct HouseEditView: View {
         }
         let cloudPushKind: CloudPushKind = isNewHouse ? .newHouse : (roomChanged ? .rename : .plainEdit)
         let oldRoomKeyForPurge = originalRoomKey
-        // v1.54：保存后自动生成/更新该房源的脱敏版 H5（删旧生成新）——
-        //        保证「新增了房源就自动有分享页」，选房链接里点卡片即可打开完整详情；
-        //        编辑保存时旧 H5 立即失效、生成新 H5（内容与最新房源信息一致）
-        // 服务器模式：App 内分享不生成 H5 分享页，此自动重建跳过。
-        if !HouseServerMode.ready, let config = CosConfig.load(), config.isValid {
-            let files = target.mediaItems.map { ShareMediaFile(name: $0.fileName, kind: $0.kind) }
-            let profile = CosUploader.loadShareProfile()
-            let info = ShareHouseInfo(
-                displayRoomNo: target.displayRoomNo,
-                towerLabel: target.towerLabel,
-                layout: target.layout,
-                statusLabel: target.status.label,
-                priceText: target.priceText,
-                landlord: target.landlord,
-                password: target.password,
-                remark: target.remark,
-                name: profile.name,
-                phone: profile.phone
-            )
-            let roomKey = target.mediaRoomKey
-            Task {
-                _ = try? await CosUploader.autoRegenerateMaskedShare(mediaFiles: files, roomKey: roomKey, info: info, config: config)
-            }
-        }
         // v1.72（#6）：本地账本镜像（media/<房号>/info.json，与云端同构）——保存即写，删除随目录一步到位
         LocalHouseLedger.save(target)
         // v1.19：新增 / 编辑保存后同步到云端账本（共享房源）
