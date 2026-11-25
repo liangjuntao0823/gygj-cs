@@ -11,7 +11,7 @@
 口径说明：
 - 字段修改走 upsert_house，自动写账本事件与 outbox；后台 operator 固定 "admin"。
 - 历史账本事件为审计记录，不提供改写；如需追加管理员备注，后续在存储层补 append_ledger。
-- 媒体对象存 COS；候选调阅链接按自定义域名拼接，若桶为私有读，需另取临时凭证（本轮返回 objectKey）。
+- 媒体对象存服务器本地磁盘（media_v2）；后台返回媒体清单与 objectKey，调阅走公开媒体接口。
 """
 
 from __future__ import annotations
