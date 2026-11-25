@@ -218,11 +218,13 @@ class MeterConsoleTests(unittest.TestCase):
         info2 = mc.code_info()
         self.assertNotEqual(info2["enrollCode"], "code-init")
         self.assertGreater(info2["remainingSec"], 0)
+        self.assertRegex(info2["enrollCode"], r"^\d{8}$")
         # 手动轮换再次换新
         before = info2["enrollCode"]
         res = mc.rotate_code()
         self.assertTrue(res["ok"])
         self.assertNotEqual(res["enrollCode"], before)
+        self.assertRegex(res["enrollCode"], r"^\d{8}$")
 
     def test_snapshot_export(self) -> None:
         _, _, mc = self._build()

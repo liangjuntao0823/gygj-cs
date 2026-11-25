@@ -366,7 +366,7 @@ class Store:
         changed = not self.service_path.exists() or not loaded.get("enroll_code")
         if not svc.get("enroll_code"):
             import secrets
-            svc["enroll_code"] = secrets.token_hex(16)
+            svc["enroll_code"] = f"{secrets.randbelow(10 ** 8):08d}"
         if changed:
             self.save_service(svc)
         return svc

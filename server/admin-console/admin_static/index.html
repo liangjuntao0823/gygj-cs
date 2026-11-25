@@ -167,6 +167,23 @@ header.top{display:flex;justify-content:space-between;align-items:center;margin-
 <script>
 const $=id=>document.getElementById(id);
 let STATE={meta:null, meterTenants:[], houses:[]};
+let codeTimer=null;
+function fmtRemain(sec){
+  sec=Math.max(0,Math.floor(sec));
+  const h=Math.floor(sec/3600),m=Math.floor(sec%3600/60),s=sec%60;
+  return `剩余 ${h} 小时 ${m} 分 ${s} 秒`;
+}
+function startCodeCountdown(sec){
+  clearInterval(codeTimer);
+  let left=Math.max(0,Math.floor(sec));
+  const tick=()=>{
+    $('meter-code-ttl').textContent=fmtRemain(left);
+    if(left<=0){clearInterval(codeTimer);codeTimer=null;loadMeter();return}
+    left--;
+  };
+  tick();
+  codeTimer=setInterval(tick,1000);
+}
 
 async function api(path, opts={}){
   const r=await fetch(path,{headers:{'Content-Type':'application/json'},...opts});
@@ -273,7 +290,7 @@ async function loadMeter(){
     <div class="stat"><div class="n">${s.pushBad}</div><div class="l">推送异常</div></div>`;
   const c=await api('/admin/api/meter/code');
   $('meter-code').textContent=c.enrollCode;
-  $('meter-code-ttl').textContent=`剩余 ${Math.floor(c.remainingSec/3600)} 小时 ${Math.floor(c.remainingSec%3600/60)} 分`;
+  startCodeCountdown(c.remainingSec);
   $('meter-table').querySelector('tbody').innerHTML=d.tenants.map((t,i)=>{
     const h=t.hub||{};
     const pushTag=!h.bound?'<span class="tag gray">未绑定通道</span>':h.pushOk?'<span class="tag g">正常</span>':'<span class="tag r">异常</span>';

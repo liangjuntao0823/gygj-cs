@@ -26,6 +26,11 @@ from typing import Any
 CODE_ROTATE_SEC = 24 * 3600
 
 
+def _new_enroll_code() -> str:
+    """8 位随机数字接入码（允许前导 0，固定 8 位）。"""
+    return f"{secrets.randbelow(10 ** 8):08d}"
+
+
 def _mask_token(t: str) -> str:
     t = str(t or "")
     if len(t) <= 10:
@@ -64,19 +69,19 @@ class MeterConsole:
         last = float(svc.get("enroll_code_rotated_at") or 0.0)
         now = time.time()
         if force:
-            svc["enroll_code"] = secrets.token_hex(16)
+            svc["enroll_code"] = _new_enroll_code()
             svc["enroll_code_rotated_at"] = now
             self.store.save_service(svc)
             return
         if last == 0.0:
             # 首次载入：已有接入码则仅补记轮换时间，不随意换码；无码才生成
             if not svc.get("enroll_code"):
-                svc["enroll_code"] = secrets.token_hex(16)
+                svc["enroll_code"] = _new_enroll_code()
             svc["enroll_code_rotated_at"] = now
             self.store.save_service(svc)
             return
         if now - last >= CODE_ROTATE_SEC:
-            svc["enroll_code"] = secrets.token_hex(16)
+            svc["enroll_code"] = _new_enroll_code()
             svc["enroll_code_rotated_at"] = now
             self.store.save_service(svc)
 
