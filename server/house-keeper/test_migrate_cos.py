@@ -69,7 +69,7 @@ class TestCosXmlList(unittest.TestCase):
     def test_parse_real_cos_list_xml(self):
         xml = (
             '<?xml version="1.0" encoding="UTF-8"?>'
-            '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+            '<ListBucketResult>'
             '<Contents><Key>h/1-2334/info.json</Key></Contents>'
             '<Contents><Key>h/1-2334/photo.jpg</Key></Contents>'
             '<Contents><Key>h/2-1418/info.json</Key></Contents>'
@@ -83,6 +83,37 @@ class TestCosXmlList(unittest.TestCase):
         self.assertEqual(
             sorted(keys),
             ["h/1-2334/info.json", "h/2-1418/info.json"])
+
+    def test_parse_xml_with_s3_namespace(self):
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+            '<Contents><Key>h/2-1418/info.json</Key></Contents>'
+            '<IsTruncated>false</IsTruncated>'
+            '</ListBucketResult>'
+        ).encode("utf-8")
+        client = migrate_cos.CosXMLClient(
+            secret_id="sid", secret_key="skey", bucket="b", region="ap-guangzhou")
+        client._request = lambda method, path, query="": xml  # type: ignore[assignment]
+        self.assertEqual(client.list_info_keys(),
+                         ["h/2-1418/info.json"])
+
+
+class TestGetObjectSigning(unittest.TestCase):
+    def test_chinese_key_transport_encoded_sign_raw(self):
+        captured: dict[str, str] = {}
+        client = migrate_cos.CosXMLClient(
+            secret_id="sid", secret_key="skey", bucket="b",
+            region="ap-guangzhou")
+
+        def fake(method, url_path, query="", sign_path=None):
+            captured.update(url_path=url_path, sign_path=sign_path)
+            return b"{}"
+
+        client._request = fake  # type: ignore[assignment]
+        client.get_object("h/1-1001上/info.json")
+        self.assertEqual(captured["url_path"], "/h/1-1001%E4%B8%8A/info.json")
+        self.assertEqual(captured["sign_path"], "/h/1-1001上/info.json")
 
 
 if __name__ == "__main__":

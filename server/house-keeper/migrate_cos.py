@@ -92,14 +92,17 @@ class CosXMLClient:
             f"&q-signature={signature}"
         )
 
-    def _request(self, method: str, path: str,
-                 query: str = "") -> bytes:
+    def _request(self, method: str, url_path: str,
+                 query: str = "", sign_path: str | None = None) -> bytes:
         now = int(time.time())
         key_time = f"{now - 60};{now + 600}"
-        url = f"https://{self.host}{path}"
+        # 签名用的资源路径必须是原始（未 percent-encode）路径；含中文房号
+        # 时若拿编码路径参与签名，COS 会判 SignatureDoesNotMatch(403)。
+        sign_path = sign_path or url_path
+        url = f"https://{self.host}{url_path}"
         if query:
             url += "?" + query
-        auth = self._sign(key_time, method, path, {})
+        auth = self._sign(key_time, method, sign_path, {})
         req = urllib.request.Request(
             url, headers={"Authorization": auth, "Host": self.host},
             method=method)
@@ -115,9 +118,11 @@ class CosXMLClient:
                 q += "&continuation-token=" + urllib.parse.quote(marker)
             import xml.etree.ElementTree as ET
             root = ET.fromstring(self._request("GET", "/", q))
-            ns = "{http://s3.amazonaws.com/doc/2006-03-01/}"
+            # COS 返回裸标签无命名空间；个别客户端/代理会包 S3 默认 ns，
+            # 这里按根标签自动取 ns 前缀，两种形态都兼容。
+            ns = root.tag.split("}", 1)[0] + "}" if root.tag.startswith("{") else ""
             for c in root.findall(f"{ns}Contents"):
-                k = c.find(f"{ns}Key").text
+                k = c.findtext(f"{ns}Key")
                 if k and k.endswith("/info.json"):
                     keys.append(k)
             if root.findtext(f"{ns}IsTruncated") == "true":
@@ -127,8 +132,9 @@ class CosXMLClient:
         return keys
 
     def get_object(self, key: str) -> bytes:
-        path = "/" + urllib.parse.quote(key)
-        return self._request("GET", path)
+        url_path = "/" + urllib.parse.quote(key)
+        # 传输用编码路径，签名用原始路径（中文房号必须如此才能过签）。
+        return self._request("GET", url_path, sign_path="/" + key)
 
 
 def run_migration(store: Any, client: CosXMLClient,
