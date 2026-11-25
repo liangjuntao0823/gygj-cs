@@ -538,10 +538,6 @@ struct MainTabView: View {
             MeterStore.shared.startAutoRefreshIfNeeded()
             refreshAutoBackupTimer()
             checkAutoBackup()
-            Task { await CloudBackupService.retryPendingUploads() }
-            Task { await CloudBackupService.enforceCloudRetention() }
-            // v2.67：补推上次没上云成功的公共操作日志
-            Task { await CloudOps.flushPending() }
             // v2.68：分享扩展配套——镜像非敏感配置进 App Group + 合并扩展写的本机日志
             SharedBridge.writeMirrors()
             BackupLogStore.mergeExtensionLogs()
@@ -569,11 +565,6 @@ struct MainTabView: View {
             HouseLedgerMigrator.run(validRoomKeys: validRoomKeys)
             // v2.47：清理历史账本里残留的笼统动作（如「媒体更新」），本地云端同清
             HouseLedgerDeprecatedCleanup.run()
-            Task {
-                if let config = CosConfig.load(), config.isValid {
-                    await HouseLedgerStore.syncAll(roomKeys: HouseLedgerStore.dirtyRoomKeys(), config: config)
-                }
-            }
             // b118（清单12：打开 App 轻量变更感知）：启动时轻量探测云端房源账本是否有变化
             // v2.62（A3）：同时记下「最近一次前台检测时间」，避免启动瞬间的 didBecomeActive 再补一次检测
             UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "cloudDetectLastForegroundAt")
@@ -588,10 +579,6 @@ struct MainTabView: View {
             LocalNotificationManager.shared.deliverMissedNotifications()
             LocalNotificationManager.shared.rebuildAll(modelContext: modelContext)
             checkAutoBackup()
-            // v1.12：回前台重试未上传的云端备份
-            Task { await CloudBackupService.retryPendingUploads() }
-            // v2.67：回前台补推积压的公共日志
-            Task { await CloudOps.flushPending() }
             // v2.68：回前台刷新配置镜像 + 合并分享扩展写的本机日志
             SharedBridge.writeMirrors()
             BackupLogStore.mergeExtensionLogs()
@@ -604,12 +591,6 @@ struct MainTabView: View {
                 }
             }
             // 房源媒体不再自动补传：失败任务留在任务中心，由用户手动点重试
-            // v2.45：回前台合并上传待同步账本
-            Task {
-                if let config = CosConfig.load(), config.isValid {
-                    await HouseLedgerStore.syncAll(roomKeys: HouseLedgerStore.dirtyRoomKeys(), config: config)
-                }
-            }
             // b118（清单12）：回前台同样做轻量变更感知
             // v2.62（A3）：加 5 分钟门槛——锁屏解锁也会触发 didBecomeActive，
             // 不设门槛会变成「一解锁就检测」；5 分钟内重复回前台直接跳过。
@@ -864,12 +845,9 @@ struct MainTabView: View {
             defaults.set(slotKey, forKey: "autoBackupCompletedSlot")
             defaults.synchronize()
             BackupLogStore.log(category: "备份", action: "自动快速备份", result: "成功", detail: url.lastPathComponent, checksum: BackupV5Manager.sha1OfFile(at: url) ?? "")
-            // 自动上传云端（后台；失败入队下次重试）
-            Task {
-                await CloudBackupService.autoUploadFastBackup(zipURL: url, config: nil)
-                await MainActor.run {
-                    automaticBackupMessage = "自动备份成功：\(url.lastPathComponent)\n" + CloudBackupService.uploadState(of: url.lastPathComponent)
-                }
+            // 备份落本机磁盘；旧桶自动上传已下线
+            Task { @MainActor in
+                automaticBackupMessage = "自动备份成功：\(url.lastPathComponent)"
             }
             // 按保留天数清理旧自动备份（v1.12：只清理自动快速备份，手动备份不参与）
             cleanupAutoFastBackups(days: retentionDays())
