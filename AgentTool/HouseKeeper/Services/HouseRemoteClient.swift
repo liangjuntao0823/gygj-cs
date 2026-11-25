@@ -82,6 +82,14 @@ struct RemoteHouseStats: Codable {
 
 struct HouseAPIError: LocalizedError {
     let message: String
+    /// 服务器已识别令牌，但该用户未被授权访问房源库（403）；此类错误不应自动重试
+    let forbidden: Bool
+
+    init(message: String, forbidden: Bool = false) {
+        self.message = message
+        self.forbidden = forbidden
+    }
+
     var errorDescription: String? { message }
 }
 
@@ -129,6 +137,9 @@ final class HouseRemoteClient {
         let (data, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse else {
             throw HouseAPIError(message: "服务器无响应")
+        }
+        if http.statusCode == 403 {
+            throw HouseAPIError(message: "暂无房源访问权限，请联系管理员开通", forbidden: true)
         }
         return (data, http)
     }
@@ -205,6 +216,9 @@ final class HouseRemoteClient {
         guard let http = resp as? HTTPURLResponse else {
             throw HouseAPIError(message: "媒体上传失败（服务器响应无效）")
         }
+        if http.statusCode == 403 {
+            throw HouseAPIError(message: "暂无房源访问权限，请联系管理员开通", forbidden: true)
+        }
         guard http.statusCode == 200 else {
             throw HouseAPIError(message: "媒体上传失败（服务器 \(http.statusCode)）")
         }
@@ -231,6 +245,9 @@ final class HouseRemoteClient {
         let (data, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse else {
             throw HouseAPIError(message: "媒体下载失败（服务器响应无效）")
+        }
+        if http.statusCode == 403 {
+            throw HouseAPIError(message: "暂无房源访问权限，请联系管理员开通", forbidden: true)
         }
         guard http.statusCode == 200 else {
             throw HouseAPIError(message: "媒体下载失败（服务器 \(http.statusCode)）")
