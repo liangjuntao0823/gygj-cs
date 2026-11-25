@@ -2,10 +2,10 @@ import Foundation
 import CryptoKit
 
 // MARK: - v1.80 远程配置中心
-/// 三级兜底：云端 config.json（COS 桶根，权威）→ 本地缓存（Documents/Config/config_cache.json）→ 代码内置默认值
+/// 三级兜底：服务器远程配置（/api/house/config，权威）→ 本地缓存（Documents/Config/config_cache.json）→ 代码内置默认值
 /// 联网时 App 启动 / 每次云端同步成功调用 refresh() 拉取最新并更新缓存；
 /// 断网时读本地缓存；首次安装无缓存时用内置默认值（= 与现状完全一致）。
-/// 后台可视化编辑入口：云端后台「远程配置」页（云函数 config_save 写桶根 config.json）。
+/// 后台可视化编辑入口：服务器管理后台「远程配置」页。
 enum RemoteConfig {
     struct Announcement: Codable {
         var enabled: Bool
