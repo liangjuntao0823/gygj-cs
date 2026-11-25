@@ -1128,14 +1128,7 @@ struct HouseEditView: View {
             dismiss()
             return
         }
-        launchCloudPush(mediaSnapshots: mediaSnapshots,
-                        record: ledgerRecord,
-                        removedMedia: removedMedia,
-                        kind: cloudPushKind,
-                        oldRoomKey: oldRoomKeyForPurge,
-                        action: syncAction,
-                        changeText: syncChange,
-                        rollback: rollback)
+        // 未接入服务器：旧桶上行编排已下线，本地落库已在上文完成，仅刷新收尾
         NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
         dismiss()
     }
