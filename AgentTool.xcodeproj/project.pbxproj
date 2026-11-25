@@ -59,7 +59,6 @@
 		A10000010000000000000501 /* HouseRemoteClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000501 /* HouseRemoteClient.swift */; };
 		A10000010000000000000502 /* HouseSyncEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000502 /* HouseSyncEngine.swift */; };
 		A10000010000000000000503 /* HouseServerMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000503 /* HouseServerMode.swift */; };
-		A10000010000000000000601 /* HouseCosCredentialStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000601 /* HouseCosCredentialStore.swift */; };
 		A10000010000000000000602 /* HousePendingUploader.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000602 /* HousePendingUploader.swift */; };
 		A10000010000000000000305 /* HouseLedger.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000305 /* HouseLedger.swift */; };
 		A10000010000000000000306 /* HouseLedgerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000306 /* HouseLedgerView.swift */; };
@@ -174,7 +173,6 @@
 		B10000010000000000000501 /* HouseRemoteClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseRemoteClient.swift; sourceTree = "<group>"; };
 		B10000010000000000000502 /* HouseSyncEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseSyncEngine.swift; sourceTree = "<group>"; };
 		B10000010000000000000503 /* HouseServerMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseServerMode.swift; sourceTree = "<group>"; };
-		B10000010000000000000601 /* HouseCosCredentialStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseCosCredentialStore.swift; sourceTree = "<group>"; };
 		B10000010000000000000602 /* HousePendingUploader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HousePendingUploader.swift; sourceTree = "<group>"; };
 		B10000010000000000000305 /* HouseLedger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseLedger.swift; sourceTree = "<group>"; };
 		B10000010000000000000306 /* HouseLedgerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseLedgerView.swift; sourceTree = "<group>"; };
@@ -427,7 +425,6 @@
 				B10000010000000000000501 /* HouseRemoteClient.swift */,
 				B10000010000000000000502 /* HouseSyncEngine.swift */,
 				B10000010000000000000503 /* HouseServerMode.swift */,
-				B10000010000000000000601 /* HouseCosCredentialStore.swift */,
 				B10000010000000000000602 /* HousePendingUploader.swift */,
 			);
 			path = Services;
@@ -630,7 +627,6 @@
 				A10000010000000000000501 /* HouseRemoteClient.swift in Sources */,
 				A10000010000000000000502 /* HouseSyncEngine.swift in Sources */,
 				A10000010000000000000503 /* HouseServerMode.swift in Sources */,
-				A10000010000000000000601 /* HouseCosCredentialStore.swift in Sources */,
 				A10000010000000000000602 /* HousePendingUploader.swift in Sources */,
 				A10000010000000000000140 /* MediaPendingView.swift in Sources */,
 				A10000010000000000000202 /* MeterModels.swift in Sources */,

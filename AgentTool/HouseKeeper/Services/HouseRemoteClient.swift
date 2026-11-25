@@ -80,21 +80,6 @@ struct RemoteHouseStats: Codable {
     let pendingOutbox: Int
 }
 
-struct RemoteCosCredentialEnvelope: Codable {
-    let ok: Bool
-    let credentials: RemoteCosCredentials
-    let bucket: String
-    let region: String
-    let prefix: String?
-}
-
-struct RemoteCosCredentials: Codable {
-    let secretId: String
-    let secretKey: String
-    let token: String
-    let expiredTime: TimeInterval
-}
-
 struct HouseAPIError: LocalizedError {
     let message: String
     var errorDescription: String? { message }
@@ -194,15 +179,6 @@ final class HouseRemoteClient {
             throw HouseAPIError(message: "读取统计失败（服务器 \(http.statusCode)）")
         }
         return try decode(RemoteHouseStats.self, data: data)
-    }
-
-    /// 旧 COS 临时凭证（休眠链路：后端已下线该路由，保留签名仅为兼容旧批量导入编译，主链不再调用）
-    func fetchCosCredentials() async throws -> RemoteCosCredentialEnvelope {
-        let (data, http) = try await makeRequest("/api/house/cos-credentials", method: "GET")
-        guard http.statusCode == 200 else {
-            throw HouseAPIError(message: "临时凭证不可用（服务器 \(http.statusCode)）")
-        }
-        return try decode(RemoteCosCredentialEnvelope.self, data: data)
     }
 
     // MARK: 媒体（服务器本地磁盘，二进制直传/直出）
