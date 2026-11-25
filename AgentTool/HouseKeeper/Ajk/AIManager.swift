@@ -414,6 +414,8 @@ final class AIManager: ObservableObject {
            Date().timeIntervalSince(cache.time) < (cache.text.contains("拉取失败") ? 60 : 300) {
             return cache.text
         }
+        // 服务器模式：媒体落服务器本地磁盘，无存储桶用量，不再请求旧云函数
+        if HouseServerMode.ready { return "" }
         guard !CloudConfig.functionURL.isEmpty, !CloudConfig.passwordHash.isEmpty,
               let url = URL(string: "\(CloudConfig.functionURL)?act=usage&k=\(CloudConfig.passwordHash)") else {
             return "云端用量：未配置云函数地址或密钥（设置→云端配置），无法拉取"

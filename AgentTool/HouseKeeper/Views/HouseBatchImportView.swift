@@ -999,8 +999,6 @@ struct HouseBatchImportView: View {
         var failedLedgerRooms: [String] = []
         await MediaActivityGate.shared.beginUpload()
         defer { Task { await MediaActivityGate.shared.endUpload() } }
-        let stsConfig: CosConfig? = (try? await HouseCosCredentialStore.shared.credential())
-            .map { CosConfig.sts($0) }
         var done = 0
         for house in houses {
             let roomKey = house.mediaRoomKey
@@ -1008,12 +1006,13 @@ struct HouseBatchImportView: View {
             syncCenter.advance(id: importID, done: done, note: "正在处理 \(roomKey)")
             for mi in files {
                 do {
-                    guard let cfg = stsConfig else {
-                        throw HouseAPIError(message: "未取得服务器临时凭证")
+                    let localURL = MediaStore.url(for: mi.fileName, roomKey: roomKey)
+                    guard FileManager.default.fileExists(atPath: localURL.path) else {
+                        throw HouseAPIError(message: "本地媒体不存在：\(mi.fileName)")
                     }
-                    try await CosUploader.uploadHouseMedia(fileName: mi.fileName, kind: mi.kind,
-                                                           roomKey: roomKey, config: cfg,
-                                                           compress: shareCompressionEnabled)
+                    let data = try Data(contentsOf: localURL)
+                    _ = try await HouseRemoteClient.shared.uploadMedia(
+                        roomKey: roomKey, fileName: mi.fileName, kind: mi.kind, data: data)
                     HouseMediaUploadQueue.remove(roomKey: roomKey, fileName: mi.fileName)
                 } catch {
                     HouseMediaUploadQueue.enqueue(roomKey: roomKey, fileName: mi.fileName, kind: mi.kind)

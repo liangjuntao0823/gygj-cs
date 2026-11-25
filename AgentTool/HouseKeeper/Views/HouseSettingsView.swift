@@ -1342,6 +1342,8 @@ struct ShareProfileView: View {
     /// v1.42：把本地二维码立即同步到云端桶 users/<用户名>/qrcode.jpg（已发出的 H5 链接动态引用桶 URL，
     /// 保存/清除后无需重新分享即生效）。未配置云存储或上传失败时静默跳过（下次分享时仍会照常上传）。
     private func syncQRToCloud(clear: Bool) {
+        // 服务器模式：二维码只存本机 QrcodeStore，不再上传存储桶
+        if HouseServerMode.ready { return }
         guard let config = CosConfig.load() else { return }
         Task {
             do {
@@ -1492,6 +1494,8 @@ struct ShareProfileView: View {
     /// v1.47：把名片姓名/电话同步到云端 users/<用户名>/profile.json——公开选房 H5（?act=rooms）
     /// 每次打开/刷新实时读取它，改名片后租客刷新页面即显示最新（二维码图已由 syncQRToCloud 上传 qrcode.jpg）。
     private func syncProfileToCloud(name: String, phone: String) {
+        // 服务器模式：姓名/电话只存本机钥匙串，不上传服务器或存储桶
+        if HouseServerMode.ready { return }
         guard let config = CosConfig.load() else { return }
         Task {
             do {

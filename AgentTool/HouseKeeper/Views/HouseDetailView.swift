@@ -942,6 +942,7 @@ struct HouseDetailView: View {
 
     /// 点「更新」：字段覆盖 + 媒体补缺/删除
     private func applyCloudUpdate() {
+        if HouseServerMode.ready { pendingCloudRecord = nil; return }
         guard let rec = pendingCloudRecord,
               let config = CosConfig.load(), config.isValid else { return }
         pendingCloudRecord = nil

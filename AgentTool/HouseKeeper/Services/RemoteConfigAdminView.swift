@@ -315,6 +315,34 @@ struct RemoteConfigAdminView: View {
     private func loadConfig() {
         loading = true
         statusText = ""
+        Task { @MainActor in
+            if HouseServerMode.ready {
+                do {
+                    let dict = try await HouseRemoteClient.shared.fetchConfig()
+                    if let fetched = Self.payload(from: dict) {
+                        config = fetched
+                        syncAIModels()
+                    } else {
+                        config = Self.defaultTemplate()
+                        aiModelsJSON = ""
+                    }
+                    fillUpdateForm()
+                    loaded = true
+                    statusText = "已加载服务器配置 v\(config.version)"
+                    loading = false
+                    return
+                } catch {
+                    statusText = "服务器配置加载失败：\(error.localizedDescription)，回退旧云端"
+                }
+            }
+            loading = false
+            loadLegacyCloudFunction()
+        }
+    }
+
+    private func loadLegacyCloudFunction() {
+        loading = true
+        statusText = ""
         let u = (CloudUser.username).addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
         guard let url = URL(string: "\(CloudConfig.functionURL)?act=configGet&k=\(CloudConfig.passwordHash)&u=\(u)") else {
             loading = false
@@ -332,11 +360,7 @@ struct RemoteConfigAdminView: View {
                 }
                 if let fetched = obj.config {
                     config = fetched
-                    if let list = fetched.aiModels, let data = try? JSONEncoder().encode(list) {
-                        aiModelsJSON = String(data: data, encoding: .utf8) ?? ""
-                    } else {
-                        aiModelsJSON = ""
-                    }
+                    syncAIModels()
                 } else {
                     config = Self.defaultTemplate()
                     aiModelsJSON = ""
@@ -346,6 +370,26 @@ struct RemoteConfigAdminView: View {
                 statusText = "已加载云端配置 v\(config.version)"
             }
         }.resume()
+    }
+
+    private func syncAIModels() {
+        if let list = config.aiModels, let data = try? JSONEncoder().encode(list) {
+            aiModelsJSON = String(data: data, encoding: .utf8) ?? ""
+        } else {
+            aiModelsJSON = ""
+        }
+    }
+
+    private static func payload(from dict: [String: Any]) -> RemoteConfig.Payload? {
+        guard let data = try? JSONSerialization.data(withJSONObject: dict),
+              let p = try? JSONDecoder().decode(RemoteConfig.Payload.self, from: data) else { return nil }
+        return p
+    }
+
+    private static func dictionary(from p: RemoteConfig.Payload) -> [String: Any]? {
+        guard let data = try? JSONEncoder().encode(p),
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return dict
     }
 
     // MARK: 保存
@@ -369,6 +413,29 @@ struct RemoteConfigAdminView: View {
         config.version = (config.version > 0 ? config.version : 0) + 1
         var body = config
         body.updatedBy = CloudUser.username
+
+        if HouseServerMode.ready {
+            Task { @MainActor in
+                do {
+                    guard let dict = Self.dictionary(from: body) else {
+                        throw NSError(domain: "RemoteConfigAdmin", code: -1,
+                                       userInfo: [NSLocalizedDescriptionKey: "配置编码失败"])
+                    }
+                    try await HouseRemoteClient.shared.putConfig(dict)
+                    RemoteConfig.apply(body)
+                    saving = false
+                    statusText = "已保存 ✓ 服务器配置 v\(body.version)，App 下次启动/同步即生效"
+                } catch {
+                    saving = false
+                    statusText = "保存失败：\(error.localizedDescription)"
+                }
+            }
+            return
+        }
+        saveLegacyCloudFunction(body: body)
+    }
+
+    private func saveLegacyCloudFunction(body: RemoteConfig.Payload) {
         let u = (CloudUser.username).addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
         guard let url = URL(string: "\(CloudConfig.functionURL)?act=configSave&k=\(CloudConfig.passwordHash)&u=\(u)"),
               let payload = try? JSONEncoder().encode(body) else {
