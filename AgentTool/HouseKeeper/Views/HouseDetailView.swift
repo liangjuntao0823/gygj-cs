@@ -1071,18 +1071,14 @@ struct HouseDetailView: View {
     }
 
     private func deleteHouse() {
-        // v1.36 需求1：删除 = 彻底删除（本地文件+数据库记录+云端桶 h/<房号>/ 一并删除，不可恢复）
-        // 保留二次确认弹窗；backups/media 镜像保留（自动备份 zip 引用，删了旧备份恢复缺图）
-        // v2.57（P1-2）：改为「先删云端、成功再删本地」——旧顺序在云端删除失败期间，任何设备一同步
-        // 就把已删的房原样拉回来（“删了又复活”）；现在云端删失败时本地不动，改挂任务中心重试（P1-3）。
+        // 删除：服务器模式先删服务器权威库、成功后删本机记录；未接入仅删本地。
+        // 旧桶文件夹删除编排已下线；backups/media 备份镜像保留（旧备份恢复引用）。
         guard let ctx = houseModelContext else { return }
         let roomKey = house.mediaRoomKey
-        let config = CosConfig.load()
-        let wasCloud = house.cloudStatus   // v1.19 补全：记录删除前存储位置，用于成功提示
         // v2.45：删除事件先写账本（目录随后整体删除；云端删除前会先同步一次留证）
         let deleteDetail = HouseServerMode.ready
             ? "彻底删除服务器记录与本地房源（桶内媒体保留）"
-            : "彻底删除本地房源" + (config?.isValid == true ? "，并尝试删除云端" : "")
+            : "彻底删除本地房源"
         HouseLedgerStore.append(roomKey: roomKey, action: "删除房源", detail: deleteDetail)
         // 服务器模式：硬删——先删服务器权威库，成功后删本机记录；不进回收站，COS 桶文件夹与媒体本轮保留。
         if HouseServerMode.ready {
@@ -1111,68 +1107,15 @@ struct HouseDetailView: View {
             }
             return
         }
-        // 未配置云端：云端本来就没有，直接删本地（原逻辑）
-        guard let config = config, config.isValid else {
-            MediaStore.deleteHouseDirectory(roomKey: roomKey)
-            SyncFailStore.clear(roomKey)
-            UnreadCloudHouseStore.clear(roomKey)
-            // v2.57（P1-5）：待传队列残留一并清，防幽灵任务
-            HouseMediaUploadQueue.removeRoom(roomKey)
-            ctx.delete(house)
-            try? ctx.save()
-            NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
-            BackupLogStore.log(category: "删除", action: "彻底删除（本地+云端）", result: "跳过", detail: "未配置云存储，仅删本地", room: roomKey, cloud: true)
-            deleteResultMessage = wasCloud == .both ? "已删除本地 + 云端房源" : "已删除本地房源"
-            return
-        }
-        // 配置了云端：先删云端，成功后再删本地；失败挂任务中心（带环节说明），点重试云端成功后自动清本地
-        isDeletingCloud = true
-        Task {
-            do {
-                // v1.69：日志统一一条「彻底删除（本地+云端）」
-                var objCount = 0
-                try await CloudBackupService.deleteHouseRemoteFolder(roomKey: roomKey, config: config, writeLog: false, reportCount: { objCount = $0 })
-                // v2.38（#62）：禁止裸 try? 吞错——账本移除失败必须抛出，走下面 catch，否则账本还在、
-                // 文件夹已删，下次同步会把这套「删了又回来」。404（本就没账本）deleteRemoteObject 内部已当成功。
-                try await CloudHouseSync.delete(roomKey: roomKey, config: config)
-                BackupLogStore.log(category: "删除", action: "彻底删除（本地+云端）", result: "成功", detail: "删除房源（云端桶文件夹\(objCount)个对象 + 云端账本已移除）", room: roomKey, cloud: true)
-                // 云端删成功 → 本地删除（整个房号目录 + 分享缓存 + 状态标记 + 待传队列 + 数据库记录）
-                await MainActor.run {
-                    isDeletingCloud = false
-                    MediaStore.deleteHouseDirectory(roomKey: roomKey)
-                    SyncFailStore.clear(roomKey)
-                    UnreadCloudHouseStore.clear(roomKey)
-                    HouseMediaUploadQueue.removeRoom(roomKey)
-                    ctx.delete(house)
-                    try? ctx.save()
-                    NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
-                    deleteResultMessage = wasCloud == .cloud ? "已删除云端房源" : "已删除本地 + 云端房源"
-                    // v2.44：删除完成系统通知
-                    HouseActionNotifier.shared.send(
-                        key: "delete.\(roomKey)",
-                        title: "房源已删除",
-                        body: "\(roomKey) 本地与云端均已删除"
-                    )
-                }
-            } catch {
-                // 云端删除失败：本地保留（防“复活”），挂任务中心重试；重试成功后 retryCloudDelete 自动清本地
-                BackupLogStore.log(category: "删除", action: "彻底删除（本地+云端）", result: "失败", detail: "云端删除失败（本地保留未删）：\(String(describing: error))", room: roomKey, cloud: true)
-                await MainActor.run {
-                    isDeletingCloud = false
-                    // v2.57（P1-3）：失败不再只 toast，挂任务中心 cloudDelete 任务可重试
-                    SyncTaskCenter.shared.finish(id: SyncTaskCenter.shared.begin(kind: .cloudDelete, title: "删云端", roomKeys: [roomKey], total: 1),
-                                                  success: false,
-                                                  failure: "\(roomKey) 云端没删掉（本地保留未删）：\(error.localizedDescription)，点重试；云端删除成功后自动清掉本地")
-                    cloudDeleteMessage = "云端删除失败：\(error.localizedDescription)。本地已保留，已挂任务中心，点重试；删除云端成功后会自动清理本地"
-                    HouseActionNotifier.shared.send(
-                        key: "deletefail.\(roomKey)",
-                        title: "云端没删掉",
-                        body: "\(roomKey) 云端删除失败（本地保留）：\(error.localizedDescription)，可到任务中心重试",
-                        silent: true
-                    )
-                }
-            }
-        }
+        // 未接入服务器：旧桶删除编排已下线，仅删本地（目录/状态标记/待传队列/数据库记录）
+        MediaStore.deleteHouseDirectory(roomKey: roomKey)
+        SyncFailStore.clear(roomKey)
+        UnreadCloudHouseStore.clear(roomKey)
+        HouseMediaUploadQueue.removeRoom(roomKey)
+        ctx.delete(house)
+        try? ctx.save()
+        NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
+        deleteResultMessage = "已删除本地房源"
     }
 
     // MARK: - v1.36 需求2：成交/在租/退租 关联查看（只读）
