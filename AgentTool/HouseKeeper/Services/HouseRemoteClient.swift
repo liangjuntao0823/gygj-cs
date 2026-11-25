@@ -169,9 +169,10 @@ final class HouseRemoteClient {
         return try decode(RemoteHouseList.self, data: data)
     }
 
-    func getHouse(_ roomKey: String) async throws -> RemoteHouse {
+    func getHouse(_ roomKey: String) async throws -> RemoteHouse? {
         let path = "/api/house/houses/\(encodedRoomKey(roomKey))"
         let (data, http) = try await makeRequest(path, method: "GET")
+        if http.statusCode == 404 { return nil }
         guard http.statusCode == 200 else {
             throw HouseAPIError(message: "读取房源失败（服务器 \(http.statusCode)）")
         }
@@ -224,7 +225,10 @@ final class HouseRemoteClient {
             req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization")
         }
         req.httpBody = data
-        let (respData, http) = try await URLSession.shared.data(for: req)
+        let (respData, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse else {
+            throw HouseAPIError(message: "媒体上传失败（服务器响应无效）")
+        }
         guard http.statusCode == 200 else {
             throw HouseAPIError(message: "媒体上传失败（服务器 \(http.statusCode)）")
         }
@@ -248,7 +252,10 @@ final class HouseRemoteClient {
         if let t = token, !t.isEmpty {
             req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization")
         }
-        let (data, http) = try await URLSession.shared.data(for: req)
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse else {
+            throw HouseAPIError(message: "媒体下载失败（服务器响应无效）")
+        }
         guard http.statusCode == 200 else {
             throw HouseAPIError(message: "媒体下载失败（服务器 \(http.statusCode)）")
         }
