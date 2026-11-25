@@ -42,6 +42,8 @@ struct HouseLedgerEvent: Codable, Identifiable, Hashable {
     }
 }
 
+// 以下远程事件转换仅主 App 使用；分享扩展（APP_EXTENSION）不含服务器客户端，单独剔除
+#if !APP_EXTENSION
 extension HouseLedgerEvent {
     /// 服务器账本事件 → 本地展示模型（服务器模式详情页读取用）
     init(remote: RemoteLedgerEvent) {
@@ -70,6 +72,7 @@ extension HouseLedgerEvent {
         return f.date(from: ts) ?? Date()
     }
 }
+#endif
 
 /// 单套房账本文件（与 info.json 同目录：本地 media/<roomKey>/ledger.json，云端 h/<roomKey>/ledger.json）
 struct HouseLedgerFile: Codable {
@@ -302,10 +305,13 @@ enum HouseLedgerStore {
     static func scheduleSync(roomKey: String) {
         // 服务器模式：账本权威源在 8082 服务器库，切割期旧 COS 桶只作回退底、不回写；
         // 待确认事件保留本机 pending 兜底，不向旧桶发起账本写请求。
+        // 分享扩展不含服务器模式判定，条件编译剔除该分支，保持旧链路兜底。
+        #if !APP_EXTENSION
         if HouseServerMode.ready {
             markDirty(roomKey)
             return
         }
+        #endif
         guard let config = CosConfig.load(), config.isValid else {
             markDirty(roomKey)
             return
