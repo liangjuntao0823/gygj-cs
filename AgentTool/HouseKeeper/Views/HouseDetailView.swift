@@ -818,42 +818,6 @@ struct HouseDetailView: View {
                     }
                 }
             }
-        } else if let config = CosConfig.load(), config.isValid {
-            let record = CloudHouseSync.record(from: house, username: CloudUser.username)
-            Task {
-                do {
-                    // v2.36（#6）：详情页状态切换改走 uploadGuarded 合并写，失败不再静默吞掉
-                    _ = try await CloudHouseSync.uploadGuarded(record: record, config: config)
-                    await MainActor.run {
-                        house.cloudStatus = .both
-                        SyncFailStore.clear(roomKey)
-                        try? modelContext.save()
-                        // v2.44：状态切换同步结果
-                        HouseActionNotifier.shared.send(
-                            key: "status.\(roomKey)",
-                            title: "状态已同步",
-                            body: "\(displayNo) 已改为\(newStatus.label)，桶内已更新"
-                        )
-                    }
-                    BackupLogStore.log(category: "房源", action: "切换状态", result: "成功",
-                                      detail: "状态：\(oldStatus.label) → \(newStatus.label)",
-                                      room: displayNo, cloud: true)
-                } catch {
-                    // v2.36（#6）：失败标记 SyncFail，下次同步不再被云端旧状态盲目覆盖
-                    await MainActor.run {
-                        SyncFailStore.mark(roomKey)
-                        HouseActionNotifier.shared.send(
-                            key: "statusfail.\(roomKey)",
-                            title: "状态同步失败",
-                            body: "\(displayNo) 本机已改，桶内没同步上：\(error.localizedDescription)",
-                            silent: true
-                        )
-                    }
-                    BackupLogStore.log(category: "房源", action: "切换状态", result: "失败",
-                                      detail: "云端更新失败：\(error.localizedDescription)",
-                                      room: displayNo, cloud: true)
-                }
-            }
         }
     }
 
