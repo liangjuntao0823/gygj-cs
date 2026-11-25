@@ -1327,29 +1327,12 @@ struct HouseDetailView: View {
             Task { try? await HouseRemoteClient.shared.addShareRecord(roomKey: roomKey, channel: "app内分享", summary: info.shareText) }
             return
         }
-        guard let config = CosConfig.load(), config.isValid else {
-            shareError = "请先到「设置 → 房源分享 → 远程配置」填写云存储配置（腾讯云 COS），再分享卡片链接"
-            return
+        // 未接入服务器：旧桶卡片链接已下线，回退本地媒体 + 文字系统分享
+        let localUrls: [URL] = files.compactMap { f in
+            let u = MediaStore.url(for: f.name, roomKey: roomKey)
+            return FileManager.default.fileExists(atPath: u.path) ? u : nil
         }
-        isSharing = true
-        shareProgress = 0
-        Task {
-            do {
-                let url = try await CosUploader.shareCard(mediaFiles: files, roomKey: roomKey, info: info, mode: mode, config: config) { p in
-                    Task { @MainActor in self.shareProgress = p }
-                }
-                await MainActor.run {
-                    isSharing = false
-                    shareItems = [url]
-                    detailShareStep = ShareStep(items: shareItems)
-                }
-            } catch {
-                await MainActor.run {
-                    isSharing = false
-                    shareError = error.localizedDescription
-                }
-            }
-        }
+        detailShareStep = ShareStep(items: localUrls + [info.shareText])
     }
 
     // MARK: - v1.15 需求1：一键保存（全部图片+视频保存到手机相册）
