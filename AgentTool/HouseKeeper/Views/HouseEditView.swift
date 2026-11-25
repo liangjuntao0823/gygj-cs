@@ -559,6 +559,11 @@ struct HouseEditView: View {
             stashDraft(house: house, reason: "断网，改动未保存")
             return
         }
+        // 服务器模式：冲突校验走服务器权威库（HouseSyncEngine.pushHouse），不进旧云账本守卫链
+        if HouseServerMode.ready {
+            saveRaw()
+            return
+        }
         guard let config = CosConfig.load(), config.isValid else {
             // 没配云存储：无从校验，也谈不上覆盖别人，按原流程存本机
             saveRaw()

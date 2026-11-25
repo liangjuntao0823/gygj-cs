@@ -73,7 +73,19 @@ final class HouseSyncEngine: ObservableObject {
         setTop(list.topRevision)
         if list.houses.isEmpty { return 0 }
         let changed = try applyRemote(list.houses, context: context)
+        // 记录对账完成后，把本地磁盘缺失的媒体从服务器回补落盘（已存在自动跳过）
+        await backfillMissingMedia(context: context)
         return changed
+    }
+
+    /// 遍历在册房源，回补本地磁盘缺失但服务器有的媒体文件；单个失败跳过，不阻断同步。
+    private func backfillMissingMedia(context: ModelContext) async {
+        let houses = (try? context.fetch(FetchDescriptor<House>())) ?? []
+        for h in houses where !h.isTrashed {
+            let records = h.mediaItems.map { ($0.fileName, $0.kind) }
+            guard !records.isEmpty else { continue }
+            _ = await HouseRemoteClient.shared.downloadMissingMedia(roomKey: h.mediaRoomKey, records: records)
+        }
     }
 
     private func applyRemote(_ remoteHouses: [RemoteHouse], context: ModelContext) throws -> Int {

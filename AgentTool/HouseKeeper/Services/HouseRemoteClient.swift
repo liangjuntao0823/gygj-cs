@@ -2,8 +2,8 @@
 //  HouseRemoteClient.swift
 //  公寓管家 · 房源板块服务器权威 API 客户端
 //
-//  服务器（8082 内 house-keeper 模块）为唯一权威；本类只负责小 JSON 收发，
-//  媒体实体仍在 COS（见 HouseMediaUploader / 临时凭证）。
+//  服务器（8082 内 house-keeper 模块）为唯一权威；本类负责 JSON 收发与媒体二进制直传/直出，
+//  媒体实体全部落服务器本地磁盘（不再使用 COS 桶）。
 //  复用：服务器地址 NotifyHub.shared.endpoint、租户令牌 MeterCloudSync.shared.token。
 //
 
@@ -262,6 +262,52 @@ final class HouseRemoteClient {
         guard http.statusCode == 200 else {
             throw HouseAPIError(message: "媒体删除失败（服务器 \(http.statusCode)）")
         }
+    }
+
+    /// 服务器模式回补本地缺失媒体：按本地记录名单逐个从服务器下载落盘，已存在的跳过；
+    /// 单个缺失跳过不中断整批。返回本次新落盘的 (fileName, kind)。
+    func downloadMissingMedia(roomKey: String, records: [(fileName: String, kind: String)]) async -> [(fileName: String, kind: String)] {
+        let existing = Set(MediaStore.existingFileNames(roomKey: roomKey).map { MediaNaming.canonicalKey($0) })
+        var done: [(fileName: String, kind: String)] = []
+        let imageExts = [".jpg", ".jpeg", ".png", ".heic", ".webp", ".gif"]
+        for record in records {
+            let name = record.fileName
+            let lower = name.lowercased()
+            let isVideo = record.kind == "video" || lower.hasSuffix(".mp4") || lower.hasSuffix(".mov") || lower.hasSuffix(".m4v")
+            let isImage = !isVideo && imageExts.contains { lower.hasSuffix($0) }
+            guard isVideo || isImage else { continue }
+            if existing.contains(MediaNaming.canonicalKey(name)) { continue }
+
+            // 服务器视频统一 .mp4：记录若是 .mov，先试记录名再回退 .mp4
+            let candidates: [String]
+            if isVideo {
+                let base = (name as NSString).deletingPathExtension
+                candidates = [name, base + ".mp4"]
+            } else {
+                candidates = [name]
+            }
+            var data: Data?
+            var remoteName = name
+            for candidate in candidates {
+                if let d = try? await downloadMedia(roomKey: roomKey, fileName: candidate) {
+                    data = d
+                    remoteName = candidate
+                    break
+                }
+            }
+            guard let downloaded = data else { continue }
+
+            let saveName: String
+            if isVideo {
+                let ext = MediaNaming.videoExtension(for: downloaded)
+                saveName = ((remoteName as NSString).deletingPathExtension) + "." + ext
+            } else {
+                saveName = remoteName
+            }
+            guard MediaStore.write(data: downloaded, fileName: saveName, roomKey: roomKey) else { continue }
+            done.append((saveName, isVideo ? "video" : "image"))
+        }
+        return done
     }
 
     // MARK: 配置 / 名片 / 分享记录（服务器权威）
