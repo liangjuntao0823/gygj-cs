@@ -590,7 +590,19 @@ struct AIToolExecutor {
             let didChangeKey = oldRoomKey != newRoomKey
             if didChangeKey {
                 // v2.37（#3）：动本地目录前先校验新 key 云端没被别的房占用；占用或网络拿不准就回滚改动、不保存不迁移
-                if let config = CosConfig.load(), config.isValid {
+                if HouseServerMode.ready {
+                    do {
+                        if let occupied = try await HouseRemoteClient.shared.getHouse(newRoomKey) {
+                            house.roomNo = originalRoomNo
+                            house.tower = originalTower
+                            return "目标房号 \(occupied.roomNo) 已存在，不能改过去，已取消本次修改"
+                        }
+                    } catch {
+                        house.roomNo = originalRoomNo
+                        house.tower = originalTower
+                        return "服务器校验失败（\(error.localizedDescription)），本次未改动，请网络正常后重试"
+                    }
+                } else if let config = CosConfig.load(), config.isValid {
                     do {
                         if let occupied = try await CloudHouseSync.fetchOne(roomKey: newRoomKey, config: config) {
                             house.roomNo = originalRoomNo
@@ -616,16 +628,26 @@ struct AIToolExecutor {
             // v2.37（#3）：先确认新账本推送成功，再删旧目录；推送失败则旧目录原样保留，避免两边都空
             let pushedOK = await pushHouseToCloud(house)
             // 房号改了且新账本已确认成功：旧房号的云端账本与目录才清掉，否则下次同步会当成一套新房源补回来
-            if didChangeKey, pushedOK, let config = CosConfig.load(), config.isValid {
-                do {
-                    // v2.36（#5 后 delete 会抛错）：用 do-catch 接住，失败留痕，不影响本地已迁移成功的结果
-                    try await CloudHouseSync.delete(roomKey: oldRoomKey, config: config)
-                    if let objs = try? await CosUploader.listObjects(prefix: "h/\(oldRoomKey)/", config: config) {
-                        for obj in objs { try? await CloudBackupService.deleteRemoteObject(name: obj.name, config: config) }
+            if didChangeKey, pushedOK {
+                if HouseServerMode.ready {
+                    do {
+                        // 服务器硬删旧 key：后端级联移除账本与磁盘媒体
+                        try await HouseRemoteClient.shared.delete(oldRoomKey)
+                    } catch {
+                        BackupLogStore.log(category: "房源", action: "AI改房号清理旧目录", result: "失败",
+                                          detail: "\(oldRoomKey)：\(error.localizedDescription)", cloud: false)
                     }
-                } catch {
-                    BackupLogStore.log(category: "房源", action: "AI改房号清理旧目录", result: "失败",
-                                      detail: "\(oldRoomKey)：\(error.localizedDescription)", cloud: true)
+                } else if let config = CosConfig.load(), config.isValid {
+                    do {
+                        // v2.36（#5 后 delete 会抛错）：用 do-catch 接住，失败留痕，不影响本地已迁移成功的结果
+                        try await CloudHouseSync.delete(roomKey: oldRoomKey, config: config)
+                        if let objs = try? await CosUploader.listObjects(prefix: "h/\(oldRoomKey)/", config: config) {
+                            for obj in objs { try? await CloudBackupService.deleteRemoteObject(name: obj.name, config: config) }
+                        }
+                    } catch {
+                        BackupLogStore.log(category: "房源", action: "AI改房号清理旧目录", result: "失败",
+                                          detail: "\(oldRoomKey)：\(error.localizedDescription)", cloud: true)
+                    }
                 }
             }
             logAI(category: "房源", action: "编辑房源", result: "成功", detail: "\(house.tower)座\(house.roomNo) 修改 \(field)：\(old) → \(value)")
@@ -668,7 +690,9 @@ struct AIToolExecutor {
             try? houseCtx.save()
             SyncFailStore.clear(roomKey)
             UnreadCloudHouseStore.clear(roomKey)
-            if let config = CosConfig.load(), config.isValid {
+            if HouseServerMode.ready {
+                try? await HouseRemoteClient.shared.delete(roomKey)
+            } else if let config = CosConfig.load(), config.isValid {
                 try? await CloudHouseSync.delete(roomKey: roomKey, config: config)
                 try? await CloudBackupService.deleteHouseRemoteFolder(roomKey: roomKey, config: config)
             }
@@ -691,10 +715,25 @@ struct AIToolExecutor {
         }
     }
 
-    /// v2.24：AI 改完房源立刻推云端账本（与手动编辑同一条路径），失败在卡片标「未同步」。
-    /// v2.37（#3）：返回是否推送成功——改房号时只有新账本确认成功，调用方才可以删旧目录，失败则旧目录保留。
+    /// AI 改完房源立刻推云端账本（与手动编辑同一条路径），失败在卡片标「未同步」。
+    /// 返回是否推送成功——改房号时只有新账本确认成功，调用方才可以删旧目录，失败则旧目录保留。
     @discardableResult
     private func pushHouseToCloud(_ house: House) async -> Bool {
+        // 服务器模式：走服务器权威库（HouseSyncEngine.pushHouse），不进旧 COS 账本链路
+        if HouseServerMode.ready {
+            do {
+                _ = try await HouseSyncEngine.shared.pushHouse(house)
+                house.cloudStatus = .both
+                try? houseModelContext?.save()
+                SyncFailStore.clear(house.mediaRoomKey)
+                return true
+            } catch {
+                SyncFailStore.mark(house.mediaRoomKey)
+                BackupLogStore.log(category: "同步", action: "AI推送房源失败", result: "失败",
+                                   detail: "\(house.displayRoomNo)：\(error.localizedDescription)", cloud: false)
+                return false
+            }
+        }
         guard let config = CosConfig.load(), config.isValid else { return false }
         let record = CloudHouseSync.record(from: house, username: CloudUser.username)
         do {
