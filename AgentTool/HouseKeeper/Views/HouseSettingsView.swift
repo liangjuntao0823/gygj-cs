@@ -12,7 +12,7 @@ import Security
 /// （表现为「保存成功退出再进又变回旧地域」，自检时读到 ap-guangzhou 旧值）。
 /// 新实现：存在则 SecItemUpdate 更新、不存在则 SecItemAdd 添加，并立即回读比对，值一致才返回 true。
 enum KeychainFix {
-    private static let service = "com.zfgj.housekeeper"
+    private static let service = "com.gj.tg2.housekeeper"
 
     @discardableResult
     static func saveVerified(_ value: String, for key: String) -> Bool {

@@ -26,6 +26,9 @@ import urllib.parse
 from typing import Any
 
 PREFIX = "/api/house"
+PUBLIC_PREFIX = "/api/public"
+# 媒体上传上限 60MB（图片 / 视频）
+MEDIA_BODY_LIMIT = 60 * 1024 * 1024
 
 
 def _q(handler: Any) -> dict[str, str]:
@@ -63,7 +66,7 @@ def _spawn_deliver(store: Any, hub: Any) -> None:
 
 
 def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) -> bool:
-    if not path.startswith(PREFIX):
+    if not (path.startswith(PREFIX) or path.startswith(PUBLIC_PREFIX)):
         return False
     method = method.upper()
 
@@ -71,7 +74,42 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
         handler._send(obj, code)
         return True
 
+    def send_file(code: int, data: bytes, content_type: str, download_name: str = "") -> bool:
+        handler.send_response(code)
+        handler.send_header("Content-Type", content_type)
+        handler.send_header("Content-Length", str(len(data)))
+        handler.send_header("Cache-Control", "no-store")
+        if download_name:
+            handler.send_header("Content-Disposition",
+                                 f'inline; filename="{download_name}"')
+        handler.end_headers()
+        try:
+            handler.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return True
+
+    def read_raw(limit: int) -> bytes | None:
+        try:
+            length = int(handler.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0 or length > limit:
+            return None
+        return handler.rfile.read(length)
+
     try:
+        # ---- 公开只读：脱敏房源 + 媒体（访客无 token，H5/分享页用）----
+        if path == f"{PUBLIC_PREFIX}/rooms" and method == "GET":
+            return send(200, {"ok": True, "rooms": store.public_rooms()})
+
+        if path.startswith(f"{PUBLIC_PREFIX}/media/") and method == "GET":
+            rel = urllib.parse.unquote(path[len(f"{PUBLIC_PREFIX}/media/"):])
+            data = store.media.read_rel(rel)
+            if data is None:
+                return send(404, {"ok": False, "error": "not_found"})
+            return send_file(200, data, store.media.guess_content_type(rel))
+
         if path == f"{PREFIX}/health" and method == "GET":
             return send(200, {"ok": True, "service": "house-keeper", **store.stats()})
 
@@ -80,16 +118,90 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
                 return True
             return send(200, {"ok": True, **store.stats()})
 
-        # ---- COS 临时凭证：服务器签发，客户端按需取用，永久密钥不落 App ----
-        if path == f"{PREFIX}/cos-credentials" and method == "GET":
+        # ---- 名片（姓名 / 电话；二维码图片走媒体通道）----
+        if path == f"{PREFIX}/profile" and method == "GET":
             if not handler._require_auth():
                 return True
-            try:
-                import cos_sts
-                return send(200, cos_sts.credentials_for_client())
-            except Exception as e:
-                return send(503, {"ok": False, "error": "sts_unavailable",
-                                  "detail": str(e)[:200]})
+            return send(200, {"ok": True, "profile": store.profile_get()})
+
+        if path == f"{PREFIX}/profile" and method == "PUT":
+            if not handler._require_auth():
+                return True
+            body = handler._read_json()
+            if body is None:
+                return send(400, {"ok": False, "error": "bad_json"})
+            prof = store.profile_set(
+                name=str(body.get("name") or body.get("profile", {}).get("name") or ""),
+                phone=str(body.get("phone") or body.get("profile", {}).get("phone") or ""),
+                qr_path=str(body.get("qrPath") or ""))
+            return send(200, {"ok": True, "profile": prof})
+
+        # ---- 分享记录 ----
+        if path == f"{PREFIX}/share-records" and method == "GET":
+            if not handler._require_auth():
+                return True
+            return send(200, {"ok": True, "records": store.share_records_list()})
+
+        if path == f"{PREFIX}/share-records" and method == "POST":
+            if not handler._require_auth():
+                return True
+            body = handler._read_json() or {}
+            rec = store.share_records_add(
+                room_key=str(body.get("roomKey") or ""),
+                channel=str(body.get("channel") or ""),
+                summary=str(body.get("summary") or ""),
+                operator=str(body.get("operator") or "未知用户"))
+            return send(200, {"ok": True, "record": rec})
+
+        # ---- 远程配置 / 在线更新块（服务器权威，本地可改后回写）----
+        if path == f"{PREFIX}/config" and method == "GET":
+            if not handler._require_auth():
+                return True
+            return send(200, {"ok": True, "config": store.config_get("app")})
+
+        if path == f"{PREFIX}/config" and method == "PUT":
+            if not handler._require_auth():
+                return True
+            body = handler._read_json()
+            if body is None:
+                return send(400, {"ok": False, "error": "bad_json"})
+            store.config_set("app", body if isinstance(body, dict) else {})
+            return send(200, {"ok": True, "config": store.config_get("app")})
+
+        # ---- 房源媒体（服务器磁盘；二进制直传/直出）----
+        if path.startswith(f"{PREFIX}/media/"):
+            if not handler._require_auth():
+                return True
+            rest = urllib.parse.unquote(path[len(f"{PREFIX}/media/"):])
+            segs = [s for s in rest.strip("/").split("/") if s]
+            if len(segs) == 1 and method == "POST":
+                room_key = segs[0]
+                file_name = handler.headers.get("X-File-Name") or _q(handler).get("filename", "")
+                kind = handler.headers.get("X-Kind") or ("video" if file_name.lower().endswith((".mov", ".mp4", ".m4v")) else "image")
+                data = read_raw(MEDIA_BODY_LIMIT)
+                if data is None:
+                    return send(400, {"ok": False, "error": "bad_or_too_large"})
+                if not file_name:
+                    file_name = store.media.new_file_name(room_key, "mp4" if kind == "video" else "jpg")
+                try:
+                    rel = store.media.save_house_media(room_key, file_name, data)
+                except ValueError as e:
+                    return send(400, {"ok": False, "error": str(e)})
+                return send(200, {"ok": True, "objectKey": rel,
+                                  "fileName": store.media.safe_file_name(file_name),
+                                  "kind": kind})
+            if len(segs) == 2 and method == "GET":
+                room_key, file_name = segs[0], segs[1]
+                data = store.media.read_house_media(room_key, file_name)
+                if data is None:
+                    return send(404, {"ok": False, "error": "not_found"})
+                return send_file(200, data, store.media.guess_content_type(rel_path=store.media.rel_house(room_key, file_name)))
+            if len(segs) == 2 and method == "DELETE":
+                room_key, file_name = segs[0], segs[1]
+                store.media.delete_house_media(room_key, file_name)
+                return send(200, {"ok": True, "deleted": file_name})
+            return send(405, {"ok": False, "error": "method_not_allowed"})
+
 
         # ---- 集合级 ----
         if path == f"{PREFIX}/houses" and method == "GET":

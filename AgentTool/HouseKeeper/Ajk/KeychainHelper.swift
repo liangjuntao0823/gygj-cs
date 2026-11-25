@@ -14,7 +14,7 @@ enum KeychainHelper {
         guard let data = value.data(using: .utf8) else { return false }
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "com.gongyuguanjia.app",
+            kSecAttrService as String: "com.gj.tg2.ai",
             kSecAttrAccount as String: key,
             kSecValueData as String: data
         ]
@@ -28,7 +28,7 @@ enum KeychainHelper {
     static func load(key: String) -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "com.gongyuguanjia.app",
+            kSecAttrService as String: "com.gj.tg2.ai",
             kSecAttrAccount as String: key,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
@@ -43,7 +43,7 @@ enum KeychainHelper {
     static func delete(key: String) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "com.gongyuguanjia.app",
+            kSecAttrService as String: "com.gj.tg2.ai",
             kSecAttrAccount as String: key
         ]
         SecItemDelete(query as CFDictionary)

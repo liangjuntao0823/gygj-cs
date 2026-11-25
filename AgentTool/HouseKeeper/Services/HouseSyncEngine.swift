@@ -48,10 +48,9 @@ final class HouseSyncEngine: ObservableObject {
 
     // MARK: - 媒体名映射
 
-    /// 本地 MediaItem -> COS objectKey
+    /// 本地 MediaItem -> 服务器磁盘相对引用
     static func objectKey(roomKey: String, fileName: String, kind: String) -> String {
-        let cloudName = MediaNaming.cloudName(fileName: fileName, kind: kind)
-        return "h/\(roomKey)/\(cloudName)"
+        "houses/\(roomKey)/\(fileName)"
     }
 
     /// 服务器媒体 objectKey -> 本地 MediaItem.fileName

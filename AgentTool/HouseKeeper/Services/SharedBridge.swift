@@ -1,13 +1,13 @@
 import Foundation
 
-/// v2.68 分享扩展 ↔ 主 App 共享桥（App Group：group.com.gj.tg.shared，与 Widget 同组）。
+/// 分享扩展 ↔ 主 App 共享桥（App Group：group.com.gj.tg2.shared，与 Widget 同组）。
 /// 口径：
 /// - 敏感密钥（COS sid/skey、后台口令明文）绝不进共享区——扩展经云函数 cosCfg 取 COS 配置，仅内存持有；
 /// - 共享区只放非敏感配置镜像（用户名/云函数地址/口令哈希/压缩开关/自定义域名）与两进程共用的队列；
 /// - 口令哈希本就随每个云函数请求 URL 传输（k= 参数），镜像不扩大暴露面；
 /// - suite 不可用时回退 standard，主 App 存量行为不变。
 enum SharedBridge {
-    static let groupID = "group.com.gj.tg.shared"
+    static let groupID = "group.com.gj.tg2.shared"
 
     static var defaults: UserDefaults { UserDefaults(suiteName: groupID) ?? .standard }
 

@@ -23,7 +23,7 @@ func resolveAppGroupID() -> String {
         "group.6f5a3ce5f64acb19.3",
         "group.6f5a3ce5f64acb19.4",
         "group.6f5a3ce5f64acb19.5",
-        "group.com.gj.tg.shared"
+        "group.com.gj.tg2.shared"
     ]
     // 逐个探测：哪个 group 里已有主 App 写入的数据（todoCount 键存在）就用哪个
     for g in candidates {
@@ -31,7 +31,7 @@ func resolveAppGroupID() -> String {
             return g
         }
     }
-    return "group.com.gj.tg.shared"
+    return "group.com.gj.tg2.shared"
 }
 
 // MARK: - 小组件数据模型

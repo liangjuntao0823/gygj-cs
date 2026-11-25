@@ -8,7 +8,7 @@
 			<key>CFBundleTypeRole</key>
 			<string>Editor</string>
 			<key>CFBundleURLName</key>
-			<string>com.gj.tg.houseimport</string>
+			<string>com.gj.tg2.houseimport</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>gongyuguanjia</string>

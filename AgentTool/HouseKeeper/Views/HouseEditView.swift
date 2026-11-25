@@ -1199,11 +1199,8 @@ struct HouseEditView: View {
             if !mediaSnapshots.isEmpty {
                 await MediaActivityGate.shared.beginUpload()
                 defer { Task { await MediaActivityGate.shared.endUpload() } }
-                if let cred = try? await HouseCosCredentialStore.shared.credential() {
-                    let stsConfig = CosConfig.sts(cred)
-                    _ = try? await uploadMedia(snapshots: mediaSnapshots, config: stsConfig,
-                                               writeSuccessLog: false, taskID: taskID)
-                }
+                _ = try? await uploadMedia(snapshots: mediaSnapshots,
+                                           writeSuccessLog: false, taskID: taskID)
             }
             do {
                 let remote = try await HouseSyncEngine.shared.pushHouse(target)
@@ -1275,7 +1272,7 @@ struct HouseEditView: View {
                     // #23：先把媒体全部传完（成功或已入队），最后才传账本，别的设备不会在媒体没齐时拉到半成品。
                     // 仅适用于「新增房源且一并带了媒体」；没带媒体的新增 mediaSnapshots 为空，直接传账本。
                     // v2.58：新增房源的媒体成功日志并入「新增房源」一条，不再单独写「新增媒体」。
-                    let mediaResult = try await uploadMedia(snapshots: mediaSnapshots, config: config, writeSuccessLog: false, taskID: uploadTaskID, isNewHouse: true)
+                    let mediaResult = try await uploadMedia(snapshots: mediaSnapshots, writeSuccessLog: false, taskID: uploadTaskID, isNewHouse: true)
                     do {
                         // v2.57（P0-1）：没传上去的文件名不写入云端账本——否则另一台设备同步时会把
                         // 这些「账本有、桶里没有」的引用当成失效剔除，补传成功后反而成桶孤儿；
@@ -1293,7 +1290,7 @@ struct HouseEditView: View {
 
                 case .rename:
                     // #3：先建新名（媒体 → 账本），账本确认成功且媒体无失败，最后才删旧目录；任一步失败旧目录保留。
-                    let mediaResult = try await uploadMedia(snapshots: mediaSnapshots, config: config, taskID: uploadTaskID)
+                    let mediaResult = try await uploadMedia(snapshots: mediaSnapshots, taskID: uploadTaskID)
                     do {
                         // v2.57（P0-1）：改名场景同样不把没传上的文件名写进新房账本，补传成功后再补写
                         var recordToPush = record
@@ -1323,7 +1320,7 @@ struct HouseEditView: View {
 
                 case .plainEdit:
                     // 普通编辑：媒体（仅新增）与账本照旧推送
-                    let mediaResult = try await uploadMedia(snapshots: mediaSnapshots, config: config, taskID: uploadTaskID)
+                    let mediaResult = try await uploadMedia(snapshots: mediaSnapshots, taskID: uploadTaskID)
                     do {
                         // v2.57（P0-1）：没传上的文件名不写入云端账本，防止他端同步剔除造成跨设备丢媒体
                         var recordToPush = record
@@ -1448,9 +1445,8 @@ struct HouseEditView: View {
         return false
     }
 
-    private func uploadMedia(snapshots: [MediaUploadSnapshot], config: CosConfig, writeSuccessLog: Bool = true, taskID: UUID? = nil, isNewHouse: Bool = false) async throws -> (success: Int, failed: Int, failedFiles: [String], lastError: String) {
+    private func uploadMedia(snapshots: [MediaUploadSnapshot], writeSuccessLog: Bool = true, taskID: UUID? = nil, isNewHouse: Bool = false) async throws -> (success: Int, failed: Int, failedFiles: [String], lastError: String) {
         guard !snapshots.isEmpty else { return (0, 0, [], "") }
-        let compress = shareCompressionEnabled
         var success = 0, failed = 0, lastError = ""
         var failedFiles: [String] = []
         let total = snapshots.count
@@ -1472,50 +1468,12 @@ struct HouseEditView: View {
                 }
                 continue
             }
-            let base = Double(idx) / Double(total)
-            let span = 1.0 / Double(total)
             do {
-                try await CosUploader.uploadHouseMedia(
-                    fileName: snap.fileName, kind: snap.kind, roomKey: snap.roomKey,
-                    config: config, compress: compress,
-                    onStage: { stage in
-                        HouseSyncProgress.shared.updateStage(roomKey: snap.roomKey, direction: .upload, label: stage)
-                    },
-                    onTranscodeProgress: { p in
-                        let fraction = max(0, min(1, p.isFinite ? p : 0))
-                        HouseSyncProgress.shared.updateTranscodeProgress(
-                            roomKey: snap.roomKey,
-                            direction: .upload,
-                            progress: base + span * fraction,
-                            fraction: fraction
-                        )
-                        if let taskID {
-                            Task { @MainActor in
-                                SyncTaskCenter.shared.advanceWithinFile(id: taskID, fileIndex: idx,
-                                                                        fraction: fraction,
-                                                                        note: "正在转码 \(snap.fileName)")
-                            }
-                        }
-                    },
-                    onBytes: { p in
-                        HouseSyncProgress.shared.update(roomKey: snap.roomKey, direction: .upload,
-                                                       progress: base + span * p)
-                        if let taskID {
-                            Task { @MainActor in
-                                SyncTaskCenter.shared.advanceWithinFile(id: taskID, fileIndex: idx,
-                                                                        fraction: p,
-                                                                        note: "正在上传 \(snap.fileName)")
-                            }
-                        }
-                    },
-                    onSpeed: { bytesPerSecond in
-                        HouseSyncProgress.shared.updateSpeed(bytesPerSecond: bytesPerSecond)
-                        if let taskID {
-                            Task { @MainActor in
-                                SyncTaskCenter.shared.updateSpeed(id: taskID, bytesPerSecond: bytesPerSecond)
-                            }
-                        }
-                    })
+                let data = try Data(contentsOf: url)
+                HouseSyncProgress.shared.updateStage(roomKey: snap.roomKey, direction: .upload, label: "正在上传")
+                _ = try await HouseRemoteClient.shared.uploadMedia(
+                    roomKey: snap.roomKey, fileName: snap.fileName,
+                    kind: snap.kind, data: data)
                 HouseMediaUploadQueue.remove(roomKey: snap.roomKey, fileName: snap.fileName)
                 success += 1
             } catch {

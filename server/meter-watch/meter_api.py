@@ -462,8 +462,12 @@ def serve(store: mw.Store, engine: mw.Engine) -> int:
     hub = nh.HubRuntime(str(store.home / "notify.json"), config=svc)
     engine.hub = hub
 
-    # 房源板块：SQLite 权威库（house.db，600），与租户文件同目录
-    house_store = hs.HouseStore(str(store.home / "house.db"))
+    # 房源板块：SQLite 权威库。全新架构用独立空库 house_v2.db + media_v2/，
+    # 不承接旧 house.db 存量（历史数据由用户后续自行导入迁移）；可用 HOUSE_DB 覆盖。
+    import os
+    house_db = str(store.home / os.environ.get("HOUSE_DB", "house_v2.db"))
+    house_media = str(store.home / os.environ.get("HOUSE_MEDIA_DIR", "media_v2"))
+    house_store = hs.HouseStore(house_db, media_root=house_media)
 
     # 管理后台：鉴权会话 + 服务器看板 + 电表值守 + 房源管理，复用现有 store/hub/house_store
     admin_auth = aauth.AdminAuth(store.home)

@@ -95,7 +95,7 @@ enum KeychainKey {
 }
 
 enum KeychainStore {
-    private static let service = "com.zfgj.housekeeper"
+    private static let service = "com.gj.tg2.housekeeper"
 
     /// 仅用于定位条目（删除/更新）的精简 query，不含 data/accessible，
     /// 避免额外属性导致 SecItemDelete/Update 匹配不到旧项。

@@ -26,6 +26,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
+import media_store as ms
+
 # 字段键 -> 中文名（账本与推送展示）
 FIELD_LABELS: dict[str, str] = {
     "roomNo": "房号",
@@ -100,6 +102,26 @@ CREATE TABLE IF NOT EXISTS outbox (
   status TEXT NOT NULL DEFAULT 'pending',
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS app_config (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL DEFAULT '{}',
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS profile (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  name TEXT NOT NULL DEFAULT '',
+  phone TEXT NOT NULL DEFAULT '',
+  qr_path TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS share_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  room_key TEXT NOT NULL DEFAULT '',
+  ts TEXT NOT NULL,
+  channel TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL DEFAULT '',
+  operator TEXT NOT NULL DEFAULT ''
+);
 CREATE INDEX IF NOT EXISTS idx_houses_rev ON houses(revision);
 CREATE INDEX IF NOT EXISTS idx_media_room ON media_refs(room_key);
 CREATE INDEX IF NOT EXISTS idx_ledger_room ON ledger_events(room_key);
@@ -147,9 +169,10 @@ def _display(field: str, value: Any) -> str:
 class HouseStore:
     """SQLite 房源权威存储；线程安全（连接 check_same_thread=False + 全局锁）。"""
 
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, media_root: str | Path | None = None):
         self.path = Path(db_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.media = ms.MediaStore(media_root or (self.path.parent / "media"))
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -500,6 +523,11 @@ class HouseStore:
             conn.execute("DELETE FROM ledger_events WHERE room_key=?", (room_key,))
             conn.execute("DELETE FROM media_refs WHERE room_key=?", (room_key,))
             conn.execute("DELETE FROM houses WHERE room_key=?", (room_key,))
+            # 级联清理服务器磁盘上该房源的媒体实体
+            try:
+                self.media.delete_house_dir(room_key)
+            except Exception:
+                pass
             self._write_outbox(conn, event_id, room_key, action, operator, title, body,
                                {"deleted": True, "hardDelete": True}, origin_device_id, now)
             conn.commit()
@@ -602,3 +630,97 @@ class HouseStore:
                 "SELECT COUNT(*) c FROM outbox WHERE status='pending'").fetchone()["c"]
             return {"total": total, "tower1": t1, "tower2": t2,
                     "pendingOutbox": pending}
+
+    # ------------------------------------------------------------------
+    # 远程配置（app_config：可变配置 / 在线更新块，服务器为权威）
+    # ------------------------------------------------------------------
+    def config_get(self, key: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM app_config WHERE key=?", (key,)).fetchone()
+        if row is None:
+            return {}
+        try:
+            return json.loads(row["value"] or "{}")
+        except json.JSONDecodeError:
+            return {}
+
+    def config_set(self, key: str, value: dict[str, Any]) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO app_config (key,value,updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                "updated_at=excluded.updated_at",
+                (key, json.dumps(value, ensure_ascii=False), iso(now_local())))
+            self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # 名片（姓名 / 电话 / 二维码引用；二维码图片实体在 media.profile）
+    # ------------------------------------------------------------------
+    def profile_get(self) -> dict[str, Any]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT name,phone,qr_path,updated_at FROM profile WHERE id=1"
+            ).fetchone()
+        if row is None:
+            return {"name": "", "phone": "", "qrPath": "", "updatedAt": ""}
+        return {"name": row["name"], "phone": row["phone"],
+                "qrPath": row["qr_path"], "updatedAt": row["updated_at"]}
+
+    def profile_set(self, name: str, phone: str, qr_path: str = "") -> dict[str, Any]:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO profile (id,name,phone,qr_path,updated_at) "
+                "VALUES (1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+                "name=excluded.name, phone=excluded.phone, qr_path=excluded.qr_path, "
+                "updated_at=excluded.updated_at",
+                (name, phone, qr_path, iso(now_local())))
+            self._conn.commit()
+        return self.profile_get()
+
+    # ------------------------------------------------------------------
+    # 分享记录（取代旧桶 users/<u>/share_records.json）
+    # ------------------------------------------------------------------
+    def share_records_add(self, room_key: str, channel: str, summary: str,
+                          operator: str) -> dict[str, Any]:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO share_records (room_key,ts,channel,summary,operator) "
+                "VALUES (?,?,?,?,?)",
+                (room_key, iso(now_local()), channel, summary, operator))
+            self._conn.commit()
+            rec = {"id": cur.lastrowid, "roomKey": room_key,
+                   "ts": iso(now_local()), "channel": channel,
+                   "summary": summary, "operator": operator}
+        return rec
+
+    def share_records_list(self, limit: int = 200) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id,room_key,ts,channel,summary,operator FROM share_records "
+                "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [{"id": r["id"], "roomKey": r["room_key"], "ts": r["ts"],
+                 "channel": r["channel"], "summary": r["summary"],
+                 "operator": r["operator"]} for r in rows]
+
+    # ------------------------------------------------------------------
+    # 公开选房（脱敏，免鉴权；H5 / 公开链接用）
+    # ------------------------------------------------------------------
+    def public_rooms(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT room_key,room_no,tower,layout,price,status FROM houses "
+                "WHERE is_deleted=0 AND status='available' "
+                "ORDER BY tower, room_no").fetchall()
+            out = []
+            for r in rows:
+                media = self._media(self._conn, r["room_key"])
+                out.append({
+                    "roomKey": r["room_key"], "roomNo": r["room_no"],
+                    "tower": r["tower"], "layout": r["layout"],
+                    "price": r["price"], "status": r["status"],
+                    "media": [{"objectKey": m["objectKey"], "fileName": m["fileName"],
+                               "kind": m["kind"], "sortOrder": m["sortOrder"]}
+                              for m in media],
+                })
+        return out
