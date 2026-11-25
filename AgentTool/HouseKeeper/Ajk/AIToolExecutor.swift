@@ -602,18 +602,6 @@ struct AIToolExecutor {
                         house.tower = originalTower
                         return "服务器校验失败（\(error.localizedDescription)），本次未改动，请网络正常后重试"
                     }
-                } else if let config = CosConfig.load(), config.isValid {
-                    do {
-                        if let occupied = try await CloudHouseSync.fetchOne(roomKey: newRoomKey, config: config) {
-                            house.roomNo = originalRoomNo
-                            house.tower = originalTower
-                            return "目标房号 \(occupied.roomKey) 云端已存在，不能改过去，已取消本次修改"
-                        }
-                    } catch {
-                        house.roomNo = originalRoomNo
-                        house.tower = originalTower
-                        return "云端校验失败（\(error.localizedDescription)），本次未改动，请网络正常后重试"
-                    }
                 }
                 MediaStore.migrateHouseDirectory(from: oldRoomKey, to: newRoomKey)
                 // 新目录里的每个媒体入补传队列，App 启动/回前台自动传到新 key（kind 按扩展名判）
@@ -636,17 +624,6 @@ struct AIToolExecutor {
                     } catch {
                         BackupLogStore.log(category: "房源", action: "AI改房号清理旧目录", result: "失败",
                                           detail: "\(oldRoomKey)：\(error.localizedDescription)", cloud: false)
-                    }
-                } else if let config = CosConfig.load(), config.isValid {
-                    do {
-                        // v2.36（#5 后 delete 会抛错）：用 do-catch 接住，失败留痕，不影响本地已迁移成功的结果
-                        try await CloudHouseSync.delete(roomKey: oldRoomKey, config: config)
-                        if let objs = try? await CosUploader.listObjects(prefix: "h/\(oldRoomKey)/", config: config) {
-                            for obj in objs { try? await CloudBackupService.deleteRemoteObject(name: obj.name, config: config) }
-                        }
-                    } catch {
-                        BackupLogStore.log(category: "房源", action: "AI改房号清理旧目录", result: "失败",
-                                          detail: "\(oldRoomKey)：\(error.localizedDescription)", cloud: true)
                     }
                 }
             }
@@ -692,9 +669,6 @@ struct AIToolExecutor {
             UnreadCloudHouseStore.clear(roomKey)
             if HouseServerMode.ready {
                 try? await HouseRemoteClient.shared.delete(roomKey)
-            } else if let config = CosConfig.load(), config.isValid {
-                try? await CloudHouseSync.delete(roomKey: roomKey, config: config)
-                try? await CloudBackupService.deleteHouseRemoteFolder(roomKey: roomKey, config: config)
             }
             logAI(category: "房源", action: "彻底删除", result: "成功", detail: label + "（本地 + 云端）")
             return "已彻底删除房源 \(label)：本地照片视频、数据库记录、云端目录一并清除，不可恢复，时间 \(dateText(Date()))"
@@ -734,20 +708,7 @@ struct AIToolExecutor {
                 return false
             }
         }
-        guard let config = CosConfig.load(), config.isValid else { return false }
-        let record = CloudHouseSync.record(from: house, username: CloudUser.username)
-        do {
-            _ = try await CloudHouseSync.uploadGuarded(record: record, removedMedia: [], config: config)
-            house.cloudStatus = .both
-            try? houseModelContext?.save()
-            SyncFailStore.clear(house.mediaRoomKey)
-            return true
-        } catch {
-            SyncFailStore.mark(house.mediaRoomKey)
-            BackupLogStore.log(category: "同步", action: "AI推送房源失败", result: "失败",
-                               detail: "\(house.displayRoomNo)：\(error.localizedDescription)", cloud: true)
-            return false
-        }
+        return false
     }
 
     private func findHouse(_ room: String, in ctx: ModelContext) -> House? {
