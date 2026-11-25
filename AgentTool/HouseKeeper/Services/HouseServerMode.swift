@@ -24,7 +24,7 @@ enum HouseServerMode {
 
     /// 是否已具备走服务器的条件：开关开 + 已接入租户令牌
     static var ready: Bool {
-        enabled && MeterCloudSync.shared.hasToken
+        enabled && MeterCloudSync.hasPersistedToken()
     }
 
     /// 未接入时给用户的引导文案

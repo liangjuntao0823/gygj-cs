@@ -393,6 +393,25 @@ final class MeterCloudSync {
         (token ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
     }
 
+    private nonisolated static func persistedTokenFileURL() -> URL {
+        let fm = FileManager.default
+        let dir = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return dir.appendingPathComponent("meter-cloud-token")
+    }
+
+    private nonisolated static func loadPersistedFileToken() -> String? {
+        guard let s = try? String(contentsOf: persistedTokenFileURL(), encoding: .utf8) else { return nil }
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty ? nil : t
+    }
+
+    /// nonisolated 只读持久令牌（钥匙串 → 本机兜底文件），供非 MainActor 的路由/账本存储同步判定；
+    /// 不依赖 MainActor 内存缓存，避免跨 actor 隔离引用。
+    nonisolated static func hasPersistedToken() -> Bool {
+        if let k = KeychainStore.load(MeterCloudConfig.tokenKey), !k.isEmpty { return true }
+        return loadPersistedFileToken() != nil
+    }
+
     // 测试诊断：分别读取三个来源的原始状态，不依赖 token 的缓存逻辑，用于定位真机令牌丢失环节
     struct TokenDiagnostic {
         let memory: Bool
