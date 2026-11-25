@@ -87,8 +87,9 @@ enum RemoteConfig {
     /// 返回是否拉取成功（在线更新检查据此区分「已是最新」与「连不上服务器」）
     @discardableResult
     static func refresh() async -> Bool {
+        #if !APP_EXTENSION
         do {
-            let client = await HouseRemoteClient.shared
+            let client = HouseRemoteClient.shared
             let dict = try await client.fetchConfig()
             let data = try JSONSerialization.data(withJSONObject: dict)
             let p = try JSONDecoder().decode(Payload.self, from: data)
@@ -98,6 +99,9 @@ enum RemoteConfig {
         } catch {
             return false
         }
+        #else
+        return false
+        #endif
     }
 
     // MARK: - 便捷读取（内置默认兜底，未配置时与 v1.79 行为完全一致）
@@ -287,8 +291,10 @@ final class UpdateDownloader: ObservableObject {
         var url: URL?
         if !update.objectKey.isEmpty {
             let rel = update.objectKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? update.objectKey
+            #if !APP_EXTENSION
             let base = NotifyHub.shared.endpoint
             url = URL(string: "\(base)/api/public/media/\(rel)")
+            #endif
         }
         if url == nil, !update.downloadURL.isEmpty {
             url = URL(string: update.downloadURL)
