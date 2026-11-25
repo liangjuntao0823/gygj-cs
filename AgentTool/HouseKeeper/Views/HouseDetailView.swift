@@ -795,10 +795,31 @@ struct HouseDetailView: View {
                 fieldChanges: [HouseLedgerFieldChange(field: "状态", oldValue: oldStatus.label, newValue: newStatus.label)])
         }
         NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
-        if let config = CosConfig.load(), config.isValid {
+        let displayNo = house.displayRoomNo
+        if HouseServerMode.ready {
+            // 服务器模式：状态切换直接推服务器权威库，不走旧 COS 账本链路；失败入待补传队列
+            Task {
+                do {
+                    _ = try await HouseSyncEngine.shared.pushHouse(house)
+                    await MainActor.run {
+                        HouseActionNotifier.shared.send(
+                            key: "status.\(roomKey)",
+                            title: "状态已同步",
+                            body: "\(displayNo) 已改为\(newStatus.label)，服务器已更新")
+                    }
+                } catch {
+                    await MainActor.run {
+                        HousePendingUploader.shared.markPending(roomKey)
+                        HouseActionNotifier.shared.send(
+                            key: "statusfail.\(roomKey)",
+                            title: "状态同步失败",
+                            body: "\(displayNo) 已改本机，服务器没同步上：\(error.localizedDescription)",
+                            silent: true)
+                    }
+                }
+            }
+        } else if let config = CosConfig.load(), config.isValid {
             let record = CloudHouseSync.record(from: house, username: CloudUser.username)
-            let roomKey = house.mediaRoomKey
-            let displayNo = house.displayRoomNo
             Task {
                 do {
                     // v2.36（#6）：详情页状态切换改走 uploadGuarded 合并写，失败不再静默吞掉
@@ -841,6 +862,8 @@ struct HouseDetailView: View {
     /// 进详情自动检测：只判断「有没有更新」，无更新不弹任何东西
     @MainActor
     private func checkCloudOnEnter() async {
+        // 服务器模式：房源权威库在 8082，进详情不再跑旧 COS 字段对比检测，避免弹旧链路覆盖告警
+        guard !HouseServerMode.ready else { return }
         guard CosConfig.load()?.isValid == true else { return }
         await runCloudCheck(useCache: true, silentWhenFresh: true)
     }
@@ -848,6 +871,10 @@ struct HouseDetailView: View {
     /// 右上角单房刷新：只拉这一套的 info.json，强制不走缓存
     @MainActor
     private func refreshSingleHouse() async {
+        guard !HouseServerMode.ready else {
+            showCloudToast("服务器模式：以服务器房源为准")
+            return
+        }
         guard CosConfig.load()?.isValid == true else {
             showCloudToast("未配置云存储，无法检测")
             return
@@ -857,6 +884,7 @@ struct HouseDetailView: View {
 
     @MainActor
     private func runCloudCheck(useCache: Bool, silentWhenFresh: Bool) async {
+        if HouseServerMode.ready { return }
         guard let config = CosConfig.load(), config.isValid else { return }
         guard !isCheckingCloud else { return }
         isCheckingCloud = true
@@ -1113,7 +1141,35 @@ struct HouseDetailView: View {
         let config = CosConfig.load()
         let wasCloud = house.cloudStatus   // v1.19 补全：记录删除前存储位置，用于成功提示
         // v2.45：删除事件先写账本（目录随后整体删除；云端删除前会先同步一次留证）
-        HouseLedgerStore.append(roomKey: roomKey, action: "删除房源", detail: "彻底删除本地房源" + (config?.isValid == true ? "，并尝试删除云端" : ""))
+        let deleteDetail = HouseServerMode.ready
+            ? "移入服务器回收站（媒体与旧桶保留）"
+            : "彻底删除本地房源" + (config?.isValid == true ? "，并尝试删除云端" : "")
+        HouseLedgerStore.append(roomKey: roomKey, action: "删除房源", detail: deleteDetail)
+        // 服务器模式：双端删除走服务器软删除（进回收站，可恢复）；切割期不删 COS 桶文件夹与媒体，
+        // 桶内对象整体保留作回退底，仅在服务器库置删除标记 + 本地同步标记。
+        if HouseServerMode.ready {
+            isDeletingCloud = true
+            Task {
+                do {
+                    try await HouseSyncEngine.shared.pushDelete(house)
+                    await MainActor.run {
+                        HouseMediaUploadQueue.removeRoom(roomKey)
+                        SyncFailStore.clear(roomKey)
+                        try? ctx.save()
+                        isDeletingCloud = false
+                        deleteResultMessage = "已移入回收站（服务器）"
+                        NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
+                        dismiss()
+                    }
+                } catch {
+                    await MainActor.run {
+                        isDeletingCloud = false
+                        cloudDeleteMessage = "删除失败：\(error.localizedDescription)，本机记录保留"
+                    }
+                }
+            }
+            return
+        }
         // 未配置云端：云端本来就没有，直接删本地（原逻辑）
         guard let config = config, config.isValid else {
             MediaStore.deleteHouseDirectory(roomKey: roomKey)

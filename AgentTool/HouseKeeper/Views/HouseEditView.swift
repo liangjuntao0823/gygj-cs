@@ -627,7 +627,9 @@ struct HouseEditView: View {
             let ok = await NetworkMonitor.shared.awaitReachable()
             if ok {
                 await MainActor.run {
-                    guard let config = CosConfig.load(), config.isValid else {
+                    // 服务器模式：查重口径以服务器库为准，不再读旧 COS 桶做先探后写，直接落库
+                    guard !HouseServerMode.ready,
+                          let config = CosConfig.load(), config.isValid else {
                         performSave()
                         return
                     }

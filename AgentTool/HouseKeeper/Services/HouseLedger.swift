@@ -42,6 +42,35 @@ struct HouseLedgerEvent: Codable, Identifiable, Hashable {
     }
 }
 
+extension HouseLedgerEvent {
+    /// 服务器账本事件 → 本地展示模型（服务器模式详情页读取用）
+    init(remote: RemoteLedgerEvent) {
+        let date = HouseLedgerEvent.parseDate(remote.ts)
+        let changes = (remote.fieldChanges ?? []).map {
+            HouseLedgerFieldChange(field: $0.field, oldValue: $0.oldValue, newValue: $0.newValue)
+        }
+        self.init(
+            id: remote.id,
+            date: date,
+            operatorName: remote.operatorName?.isEmpty == false ? remote.operatorName! : "未知用户",
+            action: remote.action,
+            detail: remote.detail ?? "",
+            fieldChanges: changes,
+            migrated: remote.migrated ?? false)
+    }
+
+    /// 解析服务器 ISO8601 时间（东八区 +08:00）；失败回退普通日期格式，再失败取当前时间
+    private static func parseDate(_ ts: String) -> Date {
+        if let d = ISO8601DateFormatter().date(from: ts) { return d }
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        if let d = f.date(from: ts) { return d }
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f.date(from: ts) ?? Date()
+    }
+}
+
 /// 单套房账本文件（与 info.json 同目录：本地 media/<roomKey>/ledger.json，云端 h/<roomKey>/ledger.json）
 struct HouseLedgerFile: Codable {
     var roomKey: String
@@ -271,6 +300,12 @@ enum HouseLedgerStore {
 
     /// v2.52：有云配置就后台合并上传；无配置/无效配置也标记待同步，配置好后启动自动补
     static func scheduleSync(roomKey: String) {
+        // 服务器模式：账本权威源在 8082 服务器库，切割期旧 COS 桶只作回退底、不回写；
+        // 待确认事件保留本机 pending 兜底，不向旧桶发起账本写请求。
+        if HouseServerMode.ready {
+            markDirty(roomKey)
+            return
+        }
         guard let config = CosConfig.load(), config.isValid else {
             markDirty(roomKey)
             return

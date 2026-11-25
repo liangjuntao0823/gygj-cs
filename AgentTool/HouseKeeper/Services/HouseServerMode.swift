@@ -9,7 +9,7 @@
 
 import Foundation
 
-@MainActor
+// 仅读写 UserDefaults 与令牌状态，无 UI 状态隔离需求；nonisolated 以便账本存储等非 MainActor 路径同步读取
 enum HouseServerMode {
     private static let modeKey = "house.serverMode.v1"
 

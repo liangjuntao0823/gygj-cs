@@ -92,6 +92,7 @@ struct HouseListView: View {
     @ObservedObject private var syncProgress = HouseSyncProgress.shared
     // v2.41：快捷指令深链 → 唤起新增房源并自动解析剪贴板
     @ObservedObject private var houseImportIntent = HouseImportIntent.shared
+    @ObservedObject private var syncEngine = HouseSyncEngine.shared
     @State private var autoImportNext = false
     @State private var handledImportTick = 0
     @State private var towerFilter: Int? = nil      // nil = 全部
@@ -571,7 +572,9 @@ struct HouseListView: View {
                 Task {
                     // 进页先补传离线未提交的改动，再增量拉取权威库（弱网改动不丢）
                     _ = await HousePendingUploader.shared.flush(context: ctx)
-                    if let n = try? await HouseSyncEngine.shared.pull(context: ctx), n > 0 {
+                    let n = try? await HouseSyncEngine.shared.pull(context: ctx)
+                    await HouseSyncEngine.shared.refreshStats()
+                    if (n ?? 0) > 0 {
                         reloadHouses()
                     }
                 }
@@ -584,7 +587,7 @@ struct HouseListView: View {
             // 只消费「App 启动 / 回前台」写下的 pending 标记；没有标记就不发请求。
             let pending = UserDefaults.standard.bool(forKey: "cloudLedgerPendingHint")
             UserDefaults.standard.set(false, forKey: "cloudLedgerPendingHint")
-            if pending { showCloudChangeHint() }
+            if pending && !HouseServerMode.ready { showCloudChangeHint() }
             // v2.62（A5）：静默兜底——距上次检测超过 30 分钟、且当前没有上传任务时，才轻量检测一次；
             // 失败不弹提示（避免刚进页面就打扰），只有真有更新才挂横幅。
             Task {
@@ -606,7 +609,7 @@ struct HouseListView: View {
         // b120：通知到达也走统一提示入口（showCloudChangeHint 防抖），并消费 pendingHint
         .onReceive(NotificationCenter.default.publisher(for: Self.cloudLedgerChangedLight)) { _ in
             UserDefaults.standard.set(false, forKey: "cloudLedgerPendingHint")
-            showCloudChangeHint()
+            if !HouseServerMode.ready { showCloudChangeHint() }
         }
     }
 
@@ -635,6 +638,8 @@ struct HouseListView: View {
     /// - 加 45 秒节流：短时间内反复进入页面直接复用上次结果，不重复发请求。
     /// 探测失败（断网/超时/未配置云）→ .detectFailed，与「无变化」严格区分。
     static func detectCloudLedgerChange(houseContext: ModelContext?) async -> CloudChangeState {
+        // 服务器模式：清单/账本权威在 8082，旧 COS 清单变更感知整体跳过，避免读旧桶、弹旧「云端有更新」横幅
+        if HouseServerMode.ready { return .noChange }
         guard let config = CosConfig.load(), config.isValid else { return .detectFailed }
         guard let ctx = houseContext else { return .detectFailed }
 
@@ -976,6 +981,35 @@ struct HouseListView: View {
     //    1座/2座不再被默认「待租」筛选顶替掉（统计栏不下沉）
     //  - 无任何筛选 → 显示「1座 X套 2座 X套 待租 X套」
 
+    /// 数据来源徽章：服务器权威库 / 旧 COS 链路，便于真机辨识当前读的是哪一端
+    private var sourceBadge: some View {
+        HStack(spacing: 5) {
+            Circle()
+                .fill(HouseServerMode.ready ? Color.green : Color.orange)
+                .frame(width: 6, height: 6)
+            if HouseServerMode.ready {
+                Text("服务器")
+                    .font(.caption2.weight(.medium))
+                    .foregroundColor(.green)
+                if let total = syncEngine.serverTotal {
+                    Text("\(total)套")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                if let rev = syncEngine.serverTopRevision {
+                    Text("修订\(rev)")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            } else {
+                Text("旧COS")
+                    .font(.caption2.weight(.medium))
+                    .foregroundColor(.orange)
+            }
+        }
+        .fixedSize()
+    }
+
     private var statsBar: some View {
         HStack(spacing: 12) {
             // v2.3（需求⑤修正）：上版误删了整条统计栏——恢复 v1.99/b106 版（排序 + 数量胶囊全部保留），
@@ -1039,6 +1073,8 @@ struct HouseListView: View {
                 .foregroundColor(.secondary)
                 .lineLimit(1)
                 .fixedSize()
+
+            sourceBadge
 
             Spacer()
 
@@ -1986,6 +2022,7 @@ struct HouseListView: View {
             // 先补传本地离线写，再拉取服务器增量，保证两端最终一致
             _ = await HousePendingUploader.shared.flush(context: ctx)
             let changed = try await HouseSyncEngine.shared.pull(context: ctx)
+            await HouseSyncEngine.shared.refreshStats()
             showToast(changed > 0 ? "已同步 \(changed) 套房源" : "房源已是最新")
             syncCenter.endTransient(id: progressID)
             return .finished

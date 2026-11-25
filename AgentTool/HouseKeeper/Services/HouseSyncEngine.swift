@@ -18,6 +18,11 @@ final class HouseSyncEngine: ObservableObject {
     @Published var busy = false
     @Published var statusText: String?
 
+    /// 服务器权威库快照（仅服务器模式回填）：用于界面辨识数据来源
+    @Published var serverTotal: Int?
+    @Published var serverTopRevision: Int?
+    @Published var lastPullAt: Date?
+
     private let topKey = "house.sync.topRevision.v1"
     private let revMapKey = "house.sync.revMap.v1"
     private let defaults = UserDefaults.standard
@@ -64,6 +69,8 @@ final class HouseSyncEngine: ObservableObject {
     @discardableResult
     func pull(context: ModelContext) async throws -> Int {
         let list = try await HouseRemoteClient.shared.listHouses(since: topRevision)
+        serverTopRevision = list.topRevision
+        lastPullAt = Date()
         guard !list.houses.isEmpty else {
             setTop(list.topRevision)
             return 0
@@ -71,6 +78,14 @@ final class HouseSyncEngine: ObservableObject {
         let changed = try applyRemote(list.houses, context: context)
         setTop(list.topRevision)
         return changed
+    }
+
+    /// 拉取服务器权威库套数（stats），回填来源标识用；失败不打扰调用方
+    func refreshStats() async {
+        guard HouseServerMode.ready else { return }
+        if let stats = try? await HouseRemoteClient.shared.stats() {
+            serverTotal = stats.total
+        }
     }
 
     private func applyRemote(_ remoteHouses: [RemoteHouse], context: ModelContext) throws -> Int {

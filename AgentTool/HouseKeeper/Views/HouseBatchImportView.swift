@@ -288,7 +288,7 @@ struct HouseBatchImportView: View {
         let badLines = parsed.badCount
         Task {
             var cloudKeys = Set<String>()
-            if let cfg = CosConfig.load(), cfg.isValid,
+            if !HouseServerMode.ready, let cfg = CosConfig.load(), cfg.isValid,
                let cloudRecs = try? await CloudHouseSync.fetchAll(config: cfg) {
                 cloudKeys = Set(cloudRecs.map { $0.roomKey })
             }
@@ -429,7 +429,7 @@ struct HouseBatchImportView: View {
         let local = (try? houseModelContext?.fetch(FetchDescriptor<House>())) ?? []
         Task {
             var cloudKeys = Set<String>()
-            if let cfg = CosConfig.load(), cfg.isValid,
+            if !HouseServerMode.ready, let cfg = CosConfig.load(), cfg.isValid,
                let cloudRecs = try? await CloudHouseSync.fetchAll(config: cfg) {
                 cloudKeys = Set(cloudRecs.map { $0.roomKey })
             }
@@ -779,7 +779,7 @@ struct HouseBatchImportView: View {
         var all = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
         // 再查一遍云端账本，防止另一台设备已建同号房（拉取失败退回只查本地，不阻断）
         var cloudRoomKeys = Set<String>()
-        if let cfg = CosConfig.load(), cfg.isValid,
+        if !HouseServerMode.ready, let cfg = CosConfig.load(), cfg.isValid,
            let cloudRecs = try? await CloudHouseSync.fetchAll(config: cfg) {
             cloudRoomKeys = Set(cloudRecs.map { $0.roomKey })
         }

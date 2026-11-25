@@ -11,6 +11,9 @@ struct HouseLedgerView: View {
     @State private var events: [HouseLedgerEvent] = []
     @State private var isSyncing = false
     @State private var syncHint: String?
+    /// 数据来源标识：服务器账本 / 旧云端账本 / 本机镜像
+    @State private var sourceText: String = "本机镜像"
+    @State private var sourceIsServer = false
 
     private var filtered: [HouseLedgerEvent] {
         let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -33,6 +36,7 @@ struct HouseLedgerView: View {
         NavigationStack {
             VStack(spacing: 0) {
                 searchBar
+                sourceBadge
                 if let syncHint {
                     Text(syncHint)
                         .font(.footnote)
@@ -95,6 +99,22 @@ struct HouseLedgerView: View {
         .padding(.vertical, 10)
     }
 
+    // MARK: 来源标识
+
+    private var sourceBadge: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(sourceIsServer ? Color.green : Color.orange)
+                .frame(width: 7, height: 7)
+            Text(sourceText)
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 4)
+    }
+
     // MARK: 列表
 
     private var eventList: some View {
@@ -133,9 +153,28 @@ struct HouseLedgerView: View {
 
     private func reload() {
         events = HouseLedgerStore.events(roomKey: roomKey)
+        sourceIsServer = false
+        sourceText = HouseServerMode.ready ? "本机镜像（待同步服务器）" : "本机镜像"
     }
 
     private func refresh() async {
+        // 服务器模式：账本读服务器权威库，不再拉旧 COS ledger.json
+        if HouseServerMode.ready {
+            isSyncing = true
+            syncHint = nil
+            do {
+                let remoteEvents = try await HouseRemoteClient.shared.ledger(roomKey)
+                events = remoteEvents.map { HouseLedgerEvent(remote: $0) }
+                sourceIsServer = true
+                sourceText = "服务器账本"
+            } catch {
+                reload()
+                syncHint = "服务器账本读取失败，显示本机记录：\(error.localizedDescription)"
+            }
+            isSyncing = false
+            return
+        }
+        // 旧链路兜底：未接入服务器时走原 COS 账本
         guard let config = CosConfig.load(), config.isValid else {
             syncHint = "未配置云存储，只显示本机记录"
             return
@@ -145,6 +184,7 @@ struct HouseLedgerView: View {
         do {
             try await HouseLedgerStore.pull(roomKey: roomKey, config: config)
             reload()
+            sourceText = "旧云端账本"
         } catch {
             syncHint = "云端刷新失败：\(error.localizedDescription)"
         }
