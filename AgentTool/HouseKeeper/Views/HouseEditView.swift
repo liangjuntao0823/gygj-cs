@@ -559,26 +559,8 @@ struct HouseEditView: View {
             stashDraft(house: house, reason: "断网，改动未保存")
             return
         }
-        // 服务器模式：冲突校验走服务器权威库（HouseSyncEngine.pushHouse），不进旧云账本守卫链
-        if HouseServerMode.ready {
-            saveRaw()
-            return
-        }
-        guard let config = CosConfig.load(), config.isValid else {
-            // 没配云存储：无从校验，也谈不上覆盖别人，按原流程存本机
-            saveRaw()
-            return
-        }
-        let state = await HouseSyncGuard.check(house: house, config: config, useCache: false)
-        switch state {
-        case .updated(_, let diffs):
-            conflictUploadTip = "这套房在另一台设备被改过：\n" + diffs.joined(separator: "\n")
-                + "\n\n本次改动没有保存，也没有上传。请返回房源详情页，点「更新」同步云端最新数据后，再重新编辑。"
-        case .unknown(let msg):
-            stashDraft(house: house, reason: "云端校验失败（\(msg)）")
-        case .fresh, .mediaOnly, .missing:
-            saveRaw()
-        }
+        // 冲突校验由服务器 pushHouse 乐观锁承接；旧云账本守卫链已下线，未接入直接存本机
+        saveRaw()
     }
 
     /// 把本次改动整体存进草稿箱（不写 SwiftData、不传云端、不删任何文件）
@@ -620,71 +602,17 @@ struct HouseEditView: View {
                           room: house.mediaRoomKey, cloud: false)
     }
 
-    /// b118（P0① 先探后写 + P0⑤ 房号改名竞态加固）：
+    /// 落库入口：联网直接保存，断网提示仅存本机；旧桶先探后写三选一已下线
     private func saveRaw() {
         // v1.40 第10点：无稳定网络 → 先提示「仅存本机」，用户确认后再保存（避免静默只存本地造成误解）
         // v1.66：改为异步确认（最多等 1.2s），避免 NWPathMonitor 未就绪/路径切换瞬间误报离线——
         // 此前「有网络但保存提示没网络、取消再保存就好了」即瞬态误报
-        // b118（P0① 先探后写 + P0⑤ 房号改名竞态加固）：
-        //   新增 → 保存前先查云端同房号，云端已有他人记录 → 弹三选一（同步到本地/仍然覆盖/取消），不再静默覆盖；
-        //   改名 → 保存前先把云端旧房号目录删干净（await），避免保存后立刻下拉刷新把旧房号拉回本地。
         Task {
             let ok = await NetworkMonitor.shared.awaitReachable()
             if ok {
                 await MainActor.run {
-                    // 服务器模式：查重口径以服务器库为准，不再读旧 COS 桶做先探后写，直接落库
-                    guard !HouseServerMode.ready,
-                          let config = CosConfig.load(), config.isValid else {
-                        performSave()
-                        return
-                    }
-                    // 先探后写：新增时云端已有同房号记录 → 三选一
-                    if house == nil {
-                        let clean = cleanRoomNoText()
-                        guard !clean.isEmpty else {
-                            errorMessage = "请填写房号"
-                            showError = true
-                            return
-                        }
-                        let key = tower == 2 ? "2-\(clean)" : "1-\(clean)"
-                        Task {
-                            if let rec = try? await CloudHouseSync.fetchOne(roomKey: key, config: config) {
-                                await MainActor.run {
-                                    cloudConflictRec = rec
-                                    showCloudConflictAlert = true
-                                }
-                            } else {
-                                await MainActor.run { performSave() }
-                            }
-                        }
-                    } else {
-                        // 房号改名（v2.37 #3 重排顺序）：
-                        // 先校验新名云端是否已被别的房占用——占用就报错中止，旧目录原样保留；
-                        // 确认无冲突才落盘，旧目录改到「新名建好、确认成功之后」再删（见 performSave 内的协调推送）。
-                        let newKey = computeNewRoomKey()
-                        if newKey != originalRoomKey && !originalRoomKey.isEmpty {
-                            Task {
-                                do {
-                                    if let occupied = try await CloudHouseSync.fetchOne(roomKey: newKey, config: config) {
-                                        await MainActor.run {
-                                            errorMessage = "目标房号 \(occupied.roomKey) 云端已存在，不能改名过去；请换一个房号"
-                                            showError = true
-                                        }
-                                        return
-                                    }
-                                    await MainActor.run { performSave() }
-                                } catch {
-                                    // 网络失败、无法确定新名是否冲突：保守起见不删旧、不强行改名，提示稍后重试
-                                    await MainActor.run {
-                                        errorMessage = "云端校验失败（\(error.localizedDescription)），本次未改动，请网络正常后重试"
-                                        showError = true
-                                    }
-                                }
-                            }
-                        } else {
-                            performSave()
-                        }
-                    }
+                    // 查重/占用校验以本地 duplicateCheck + 服务器 pushHouse 乐观锁为准，旧桶先探后写已下线
+                    performSave()
                 }
             } else {
                 await MainActor.run { showOfflineAlert = true }
