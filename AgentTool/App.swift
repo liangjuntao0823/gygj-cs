@@ -9,7 +9,7 @@ final class TabRouter: ObservableObject {
     @Published var selectedTab: Int = 0
 }
 
-/// v2.41：快捷指令深链（gongyuguanjia://paste）——切到房源板块并唤起「新增房源」，进页面即解析剪贴板
+/// v2.41：快捷指令深链（gongyuguanjia-fwq://paste）——切到房源板块并唤起「新增房源」，进页面即解析剪贴板
 final class HouseImportIntent: ObservableObject {
     static let shared = HouseImportIntent()
     @Published var tick = 0
@@ -24,7 +24,7 @@ struct AgentToolApp: App {
     // v1.44：外部传入配置备份 json（文件 App「用其他 App 打开」）识别后的提示
     @State private var configImportTip: String?
     @StateObject private var tabRouter = TabRouter()
-    // v2.51：电梯码全屏展示（gongyuguanjia://elevator 与设置页预览共用）
+    // v2.51：电梯码全屏展示（gongyuguanjia-fwq://elevator 与设置页预览共用）
     @StateObject private var elevatorCodeCenter = ElevatorCodeCenter.shared
     // b140：启动图——系统 LaunchScreen 显示静态图（不含版本号），App 首帧叠同一张图 + 动态版本号，0.5 秒内收起
     @State private var showLaunchSplash = true
@@ -185,7 +185,7 @@ struct AgentToolApp: App {
                 .task { _ = await RemoteConfig.refresh() }
                 .onOpenURL { url in
                     // v2.41：快捷指令「复制房源 → 录进公寓管家」深链，直接跳到新增房源并解析剪贴板
-                    if url.scheme?.lowercased() == "gongyuguanjia" {
+                    if url.scheme?.lowercased() == "gongyuguanjia-fwq" {
                         // v2.51：电梯码深链——全屏展示电梯二维码（不切房源、不触导入）
                         let host = (url.host ?? "").lowercased()
                         let path = url.path.lowercased()

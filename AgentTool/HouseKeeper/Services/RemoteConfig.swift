@@ -83,60 +83,17 @@ enum RemoteConfig {
         }
     }
 
-    /// 拉取云端最新配置并更新缓存（联网时调用：App 启动 + 每次云端同步成功后）
-    /// v2.21：改为返回是否拉取成功（在线更新检查要用它区分「已是最新」与「连不上云端」）
+    /// 拉取服务器最新配置并更新缓存（联网时调用：App 启动 + 每次云端同步成功后）
+    /// 返回是否拉取成功（在线更新检查据此区分「已是最新」与「连不上服务器」）
     @discardableResult
     static func refresh() async -> Bool {
-        // v2.31：三重兜底——① 默认域名签名拉 config.json（自定义域名签名一旦不通，以前会一直读旧缓存，
-        //        表现就是「版本更新介绍」永远停在旧版本）；② 自定义域名；③ 云函数 configGet（不需要签名）
-        if let config = CosConfig.load() {
-            let plain = CosConfig(bucket: config.bucket, region: config.region,
-                                  secretId: config.secretId, secretKey: config.secretKey, customDomain: "")
-            if await fetchConfig(using: plain) { return true }
-            if !config.customDomain.isEmpty, await fetchConfig(using: config) { return true }
-        }
-        return await fetchConfigFromFunction()
-    }
-
-    /// 走 COS 预签名拉 config.json
-    private static func fetchConfig(using config: CosConfig) async -> Bool {
         do {
-            let url = try CosUploader.presignedGetURL(for: "config.json", expires: 300, config: config)
-            var request = URLRequest(url: url)
-            request.httpMethod = "GET"
-            request.timeoutInterval = 12
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse else { return false }
-            if http.statusCode == 404 { return false }   // 云端未配置：保持默认/缓存
-            guard (200...299).contains(http.statusCode) else { return false }
+            let client = await HouseRemoteClient.shared
+            let dict = try await client.fetchConfig()
+            let data = try JSONSerialization.data(withJSONObject: dict)
             let p = try JSONDecoder().decode(Payload.self, from: data)
             _current = p
-            try? Data(data).write(to: cacheURL, options: .atomic)
-            return true
-        } catch {
-            return false
-        }
-    }
-
-    /// 走云函数 configGet（填了云函数地址就能用，不受 COS 签名影响）
-    private static func fetchConfigFromFunction() async -> Bool {
-        let base = CloudConfig.functionURL
-        guard !base.isEmpty else { return false }
-        let u = CloudUser.username.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-        guard let url = URL(string: "\(base)?act=configGet&k=\(CloudConfig.passwordHash)&u=\(u)") else { return false }
-        do {
-            var request = URLRequest(url: url)
-            request.httpMethod = "GET"
-            request.timeoutInterval = 12
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else { return false }
-            struct Resp: Decodable { let ok: Bool?; let config: Payload? }
-            let r = try JSONDecoder().decode(Resp.self, from: data)
-            guard r.ok == true, let p = r.config else { return false }
-            _current = p
-            if let raw = try? JSONEncoder().encode(p) {
-                try? raw.write(to: cacheURL, options: .atomic)
-            }
+            try? data.write(to: cacheURL, options: .atomic)
             return true
         } catch {
             return false
@@ -328,14 +285,16 @@ final class UpdateDownloader: ObservableObject {
     func start(_ update: UpdateCenter.Available) {
         guard !isBusy else { return }
         var url: URL?
-        if !update.objectKey.isEmpty, let config = CosConfig.load(), config.isValid {
-            url = try? CosUploader.presignedGetURL(for: update.objectKey, expires: 3600, config: config)
+        if !update.objectKey.isEmpty {
+            let rel = update.objectKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? update.objectKey
+            let base = NotifyHub.shared.endpoint
+            url = URL(string: "\(base)/api/public/media/\(rel)")
         }
         if url == nil, !update.downloadURL.isEmpty {
             url = URL(string: update.downloadURL)
         }
         guard let finalURL = url else {
-            phase = .failed("云端还没有安装包，请在后台填 objectKey 或 downloadURL")
+            phase = .failed("服务器还没有安装包，请在后台填 objectKey 或 downloadURL")
             return
         }
 

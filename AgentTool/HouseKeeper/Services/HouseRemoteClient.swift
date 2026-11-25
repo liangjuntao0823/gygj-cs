@@ -264,6 +264,65 @@ final class HouseRemoteClient {
         }
     }
 
+    // MARK: 配置 / 名片 / 分享记录（服务器权威）
+
+    /// 读取应用远程配置（返回 config 字典，解码为 RemoteConfig.Payload）
+    func fetchConfig() async throws -> [String: Any] {
+        let (data, http) = try await makeRequest("/api/house/config", method: "GET")
+        guard http.statusCode == 200 else {
+            throw HouseAPIError(message: "读取配置失败（服务器 \(http.statusCode)）")
+        }
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        return (json?["config"] as? [String: Any]) ?? [:]
+    }
+
+    /// 写回应用远程配置
+    func putConfig(_ dict: [String: Any]) async throws {
+        let (_, http) = try await makeRequest("/api/house/config", method: "PUT", body: dict)
+        guard http.statusCode == 200 else {
+            throw HouseAPIError(message: "保存配置失败（服务器 \(http.statusCode)）")
+        }
+    }
+
+    /// 读取名片（姓名 / 电话 / 二维码引用）
+    func fetchProfile() async throws -> [String: Any] {
+        let (data, http) = try await makeRequest("/api/house/profile", method: "GET")
+        guard http.statusCode == 200 else {
+            throw HouseAPIError(message: "读取名片失败（服务器 \(http.statusCode)）")
+        }
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        return (json?["profile"] as? [String: Any]) ?? [:]
+    }
+
+    /// 写回名片
+    func putProfile(name: String, phone: String, qrPath: String) async throws {
+        let body: [String: Any] = ["name": name, "phone": phone, "qrPath": qrPath]
+        let (_, http) = try await makeRequest("/api/house/profile", method: "PUT", body: body)
+        guard http.statusCode == 200 else {
+            throw HouseAPIError(message: "保存名片失败（服务器 \(http.statusCode)）")
+        }
+    }
+
+    /// 读取分享记录列表
+    func fetchShareRecords() async throws -> [[String: Any]] {
+        let (data, http) = try await makeRequest("/api/house/share-records", method: "GET")
+        guard http.statusCode == 200 else {
+            throw HouseAPIError(message: "读取分享记录失败（服务器 \(http.statusCode)）")
+        }
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        return (json?["records"] as? [[String: Any]]) ?? []
+    }
+
+    /// 追加一条分享记录
+    func addShareRecord(roomKey: String, channel: String, summary: String) async throws {
+        let body: [String: Any] = ["roomKey": roomKey, "channel": channel,
+                                   "summary": summary, "operator": operatorName]
+        let (_, http) = try await makeRequest("/api/house/share-records", method: "POST", body: body)
+        guard http.statusCode == 200 else {
+            throw HouseAPIError(message: "记录分享失败（服务器 \(http.statusCode)）")
+        }
+    }
+
     // MARK: 写
 
     /// 新增或编辑；expectedRevision 为编辑前修订号（乐观锁），新增传 nil

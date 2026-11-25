@@ -163,7 +163,7 @@ struct MediumWidgetView: View {
             }
         }
         // v2.51：点组件直接全屏出电梯码（不再回 App 首页）
-        .widgetURL(URL(string: "gongyuguanjia://elevator"))
+        .widgetURL(URL(string: "gongyuguanjia-fwq://elevator"))
     }
 
     @ViewBuilder
@@ -194,7 +194,7 @@ struct LockCircular: View {
             Text("待办").font(.system(size: 9))
         }
         .widgetAccentable()
-        .widgetURL(URL(string: "gongyuguanjia://elevator"))
+        .widgetURL(URL(string: "gongyuguanjia-fwq://elevator"))
     }
 }
 
@@ -209,7 +209,7 @@ struct LockRectangular: View {
                 .font(.system(size: 11))
                 .widgetAccentable()
         }
-        .widgetURL(URL(string: "gongyuguanjia://elevator"))
+        .widgetURL(URL(string: "gongyuguanjia-fwq://elevator"))
     }
 }
 

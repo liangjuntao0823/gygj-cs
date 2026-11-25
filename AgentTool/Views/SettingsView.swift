@@ -3402,7 +3402,7 @@ struct OrphanScanProgressOverlay: View {
     }
 }
 
-// MARK: - v2.51 电梯码快捷入口（gongyuguanjia://elevator）
+// MARK: - v2.51 电梯码快捷入口（gongyuguanjia-fwq://elevator）
 
 /// 全局电梯码展示状态：URL Scheme / 设置页预览 都走这里
 final class ElevatorCodeCenter: ObservableObject {
@@ -3553,7 +3553,7 @@ struct ElevatorCodeSettingsPage: View {
     @State private var reloadTick = 0
     @State private var alertText: String?
 
-    private let deepLink = "gongyuguanjia://elevator"
+    private let deepLink = "gongyuguanjia-fwq://elevator"
 
     var body: some View {
         Form {

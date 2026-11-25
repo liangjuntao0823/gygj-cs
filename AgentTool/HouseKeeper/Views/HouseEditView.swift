@@ -19,7 +19,7 @@ struct HouseEditView: View {
 
     /// 传入房源 = 编辑；nil = 新增
     let house: House?
-    /// v2.41：由快捷指令深链唤起时（gongyuguanjia://paste），进页面即自动解析剪贴板并弹确认卡
+    /// v2.41：由快捷指令深链唤起时（gongyuguanjia-fwq://paste），进页面即自动解析剪贴板并弹确认卡
     var autoImportClipboard: Bool = false
     @State private var autoImportHandled = false
 
