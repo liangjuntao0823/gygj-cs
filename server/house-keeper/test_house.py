@@ -88,6 +88,30 @@ class HouseStoreTests(unittest.TestCase):
         self.assertFalse(r["isDeleted"])
         self.assertEqual(self.store.list_houses()["count"], 1)
 
+    def test_hard_delete_cascades(self):
+        media = [{"objectKey": "h/1-2059/a.jpg", "fileName": "a.jpg", "kind": "image"}]
+        self.store.upsert_house(make_house(media=media), operator="涛(iPhone)")
+        # 改一次价产生账本事件与字段变更
+        self.store.upsert_house(make_house(price=1200), operator="涛(iPhone)",
+                                expected_revision=1)
+        self.assertIsNotNone(self.store.get_house("1-2059"))
+        before_outbox = len(self.store.pending_outbox())
+        result = self.store.hard_delete("1-2059", "涛(iPhone)")
+        self.assertTrue(result["hardDelete"])
+        # 房源、媒体引用、账本事件与字段变更全部物理移除
+        self.assertIsNone(self.store.get_house("1-2059"))
+        self.assertEqual(self.store.list_houses()["count"], 0)
+        self.assertEqual(self.store.ledger("1-2059"), [])
+        self.assertEqual(self.store._conn.execute(
+            "SELECT COUNT(*) FROM media_refs WHERE room_key=?",
+            ("1-2059",)).fetchone()[0], 0)
+        self.assertEqual(self.store._conn.execute(
+            "SELECT COUNT(*) FROM field_changes WHERE event_id IN "
+            "(SELECT id FROM ledger_events WHERE room_key=?)",
+            ("1-2059",)).fetchone()[0], 0)
+        # outbox 仍写一条删除事件，供其他接入设备同步本地删除
+        self.assertEqual(len(self.store.pending_outbox()), before_outbox + 1)
+
     def test_incremental_since(self):
         self.store.upsert_house(make_house("1-2059"), operator="涛(iPhone)")
         self.store.upsert_house(make_house("2-1418", tower=2, media=[{"objectKey": "h/2-1418/a.jpg",

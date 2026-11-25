@@ -147,7 +147,8 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
             body = handler._read_json() or {}
             operator = str(body.get("operator") or "未知用户")
             origin = str(body.get("originDeviceId") or "")
-            doc = store.set_deleted(segs[0], True, operator, origin)
+            # 硬删：服务器库与本地一并移除，不进回收站；COS 媒体实体本轮保留不动
+            doc = store.hard_delete(segs[0], operator, origin)
             _spawn_deliver(store, hub)
             return send(200, {"ok": True, **doc})
 

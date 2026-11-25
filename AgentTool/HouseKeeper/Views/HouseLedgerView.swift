@@ -176,7 +176,7 @@ struct HouseLedgerView: View {
         }
         // 旧链路兜底：未接入服务器时走原 COS 账本
         guard let config = CosConfig.load(), config.isValid else {
-            syncHint = "未配置云存储，只显示本机记录"
+            syncHint = "未配置存储桶，只显示本机记录"
             return
         }
         isSyncing = true
@@ -184,9 +184,9 @@ struct HouseLedgerView: View {
         do {
             try await HouseLedgerStore.pull(roomKey: roomKey, config: config)
             reload()
-            sourceText = "旧云端账本"
+            sourceText = "旧桶账本"
         } catch {
-            syncHint = "云端刷新失败：\(error.localizedDescription)"
+            syncHint = "桶内刷新失败：\(error.localizedDescription)"
         }
         isSyncing = false
     }

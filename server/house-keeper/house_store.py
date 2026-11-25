@@ -475,6 +475,37 @@ class HouseStore:
             return self.get_house(room_key)  # type: ignore[return-value]
 
     # ------------------------------------------------------------------
+    # 物理删除（硬删，不进回收站）
+    # ------------------------------------------------------------------
+    def hard_delete(self, room_key: str, operator: str,
+                    origin_device_id: str = "") -> dict[str, Any]:
+        """彻底删除房源：级联清掉账本事件、字段变更、媒体引用与房源行；
+        outbox 仍写一条删除事件，供其他接入设备同步本地删除。媒体实体仍留在 COS，不在此处清理。"""
+        with self._lock:
+            conn = self._conn
+            existing = conn.execute(
+                "SELECT * FROM houses WHERE room_key=?", (room_key,)).fetchone()
+            if existing is None:
+                raise HouseNotFound(room_key)
+            now = now_local()
+            event_id = "ev_" + secrets.token_hex(10)
+            action = "删除房源"
+            title = f"房源删除 · {room_key}"
+            body = f"{operator} 彻底删除房源（{human_time(now)}）"
+            # 级联清理：字段变更 → 账本事件 → 媒体引用 → 房源行
+            led = conn.execute(
+                "SELECT id FROM ledger_events WHERE room_key=?", (room_key,)).fetchall()
+            for r in led:
+                conn.execute("DELETE FROM field_changes WHERE event_id=?", (r["id"],))
+            conn.execute("DELETE FROM ledger_events WHERE room_key=?", (room_key,))
+            conn.execute("DELETE FROM media_refs WHERE room_key=?", (room_key,))
+            conn.execute("DELETE FROM houses WHERE room_key=?", (room_key,))
+            self._write_outbox(conn, event_id, room_key, action, operator, title, body,
+                               {"deleted": True, "hardDelete": True}, origin_device_id, now)
+            conn.commit()
+            return {"ok": True, "roomKey": room_key, "hardDelete": True}
+
+    # ------------------------------------------------------------------
     # 媒体
     # ------------------------------------------------------------------
     def _replace_media(self, conn, room_key: str, media: list[dict[str, Any]]) -> None:

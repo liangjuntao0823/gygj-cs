@@ -832,7 +832,7 @@ struct HouseDetailView: View {
                         HouseActionNotifier.shared.send(
                             key: "status.\(roomKey)",
                             title: "状态已同步",
-                            body: "\(displayNo) 已改为\(newStatus.label)，云端已更新"
+                            body: "\(displayNo) 已改为\(newStatus.label)，桶内已更新"
                         )
                     }
                     BackupLogStore.log(category: "房源", action: "切换状态", result: "成功",
@@ -845,7 +845,7 @@ struct HouseDetailView: View {
                         HouseActionNotifier.shared.send(
                             key: "statusfail.\(roomKey)",
                             title: "状态同步失败",
-                            body: "\(displayNo) 本机已改，云端没同步上：\(error.localizedDescription)",
+                            body: "\(displayNo) 本机已改，桶内没同步上：\(error.localizedDescription)",
                             silent: true
                         )
                     }
@@ -1142,22 +1142,24 @@ struct HouseDetailView: View {
         let wasCloud = house.cloudStatus   // v1.19 补全：记录删除前存储位置，用于成功提示
         // v2.45：删除事件先写账本（目录随后整体删除；云端删除前会先同步一次留证）
         let deleteDetail = HouseServerMode.ready
-            ? "移入服务器回收站（媒体与旧桶保留）"
+            ? "彻底删除服务器记录与本地房源（桶内媒体保留）"
             : "彻底删除本地房源" + (config?.isValid == true ? "，并尝试删除云端" : "")
         HouseLedgerStore.append(roomKey: roomKey, action: "删除房源", detail: deleteDetail)
-        // 服务器模式：双端删除走服务器软删除（进回收站，可恢复）；切割期不删 COS 桶文件夹与媒体，
-        // 桶内对象整体保留作回退底，仅在服务器库置删除标记 + 本地同步标记。
+        // 服务器模式：硬删——先删服务器权威库，成功后删本机记录；不进回收站，COS 桶文件夹与媒体本轮保留。
         if HouseServerMode.ready {
             isDeletingCloud = true
             Task {
                 do {
                     try await HouseSyncEngine.shared.pushDelete(house)
                     await MainActor.run {
-                        HouseMediaUploadQueue.removeRoom(roomKey)
+                        MediaStore.deleteHouseDirectory(roomKey: roomKey)
                         SyncFailStore.clear(roomKey)
-                        try? ctx.save()
+                        UnreadCloudHouseStore.clear(roomKey)
+                        HouseMediaUploadQueue.removeRoom(roomKey)
+                        modelContext.delete(house)
+                        try? modelContext.save()
                         isDeletingCloud = false
-                        deleteResultMessage = "已移入回收站（服务器）"
+                        deleteResultMessage = "已删除服务器与本地房源"
                         NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
                         dismiss()
                     }

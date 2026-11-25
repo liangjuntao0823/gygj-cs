@@ -1213,13 +1213,13 @@ struct HouseEditView: View {
                     switch kind {
                     case .newHouse:
                         HouseActionNotifier.shared.send(key: "new.\(roomKey)",
-                            title: "房源已上传", body: "\(roomKey) 已保存并同步到服务器")
+                            title: "房源已保存", body: "\(roomKey) 台账已保存到服务器")
                     case .rename:
                         HouseActionNotifier.shared.send(key: "rename.\(roomKey)",
                             title: "房号已迁移", body: "\(oldRoomKey) → \(roomKey)，已同步到服务器")
                     case .plainEdit:
                         HouseActionNotifier.shared.send(key: "edit.\(roomKey)",
-                            title: "修改已同步", body: "\(roomKey) 的改动已保存并同步")
+                            title: "修改已同步", body: "\(roomKey) 的改动已保存并同步到服务器")
                     }
                 }
             } catch {
@@ -1403,7 +1403,7 @@ struct HouseEditView: View {
                 HouseActionNotifier.shared.send(
                     key: "save.\(roomKey)",
                     title: "房源已上传",
-                    body: "\(roomKey) 已同步到云端\(mediaSuffix)"
+                    body: "\(roomKey) 已同步到桶\(mediaSuffix)"
                 )
             }
         case .rename:
@@ -1418,7 +1418,7 @@ struct HouseEditView: View {
                 HouseActionNotifier.shared.send(
                     key: "rename.\(roomKey)",
                     title: "房号已迁移",
-                    body: "\(oldRoomKey) → \(roomKey)，云端已同步"
+                    body: "\(oldRoomKey) → \(roomKey)，桶内已同步"
                 )
             }
         case .plainEdit:
@@ -1433,7 +1433,7 @@ struct HouseEditView: View {
                 HouseActionNotifier.shared.send(
                     key: "save.\(roomKey)",
                     title: "修改已同步",
-                    body: "\(roomKey) 的改动已同步到云端\(mediaSuffix)"
+                    body: "\(roomKey) 的改动已同步到桶\(mediaSuffix)"
                 )
             }
         }

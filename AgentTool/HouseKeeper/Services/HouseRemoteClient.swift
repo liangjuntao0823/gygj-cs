@@ -233,15 +233,15 @@ final class HouseRemoteClient {
         return house
     }
 
-    func delete(_ roomKey: String) async throws -> RemoteHouse {
+    /// 硬删房源（服务器库物理移除，不进回收站）；成功只校验状态码，不再解码房源体
+    func delete(_ roomKey: String) async throws {
         let body: [String: Any] = ["operator": operatorName,
                                    "originDeviceId": originDeviceId]
         let path = "/api/house/houses/\(encodedRoomKey(roomKey))"
-        let (data, http) = try await makeRequest(path, method: "DELETE", body: body)
+        let (_, http) = try await makeRequest(path, method: "DELETE", body: body)
         guard http.statusCode == 200 else {
             throw HouseAPIError(message: "删除失败（服务器 \(http.statusCode)）")
         }
-        return try decode(RemoteHouse.self, data: data)
     }
 
     func restore(_ roomKey: String) async throws -> RemoteHouse {

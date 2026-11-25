@@ -18,11 +18,6 @@ final class HouseSyncEngine: ObservableObject {
     @Published var busy = false
     @Published var statusText: String?
 
-    /// 服务器权威库快照（仅服务器模式回填）：用于界面辨识数据来源
-    @Published var serverTotal: Int?
-    @Published var serverTopRevision: Int?
-    @Published var lastPullAt: Date?
-
     private let topKey = "house.sync.topRevision.v1"
     private let revMapKey = "house.sync.revMap.v1"
     private let defaults = UserDefaults.standard
@@ -45,6 +40,11 @@ final class HouseSyncEngine: ObservableObject {
         m[key] = rev
         defaults.set(m, forKey: revMapKey)
     }
+    private func removeServerRevision(forKey key: String) {
+        var m = revMap
+        m.removeValue(forKey: key)
+        defaults.set(m, forKey: revMapKey)
+    }
 
     // MARK: - 媒体名映射
 
@@ -65,27 +65,16 @@ final class HouseSyncEngine: ObservableObject {
 
     // MARK: - 拉取（服务器 → 本地）
 
-    /// 增量拉取并应用；返回实际变化的房源数
+    /// 拉取服务器全量清单并对账应用；返回实际变化的房源数
     @discardableResult
     func pull(context: ModelContext) async throws -> Int {
-        let list = try await HouseRemoteClient.shared.listHouses(since: topRevision)
-        serverTopRevision = list.topRevision
-        lastPullAt = Date()
-        guard !list.houses.isEmpty else {
-            setTop(list.topRevision)
-            return 0
-        }
-        let changed = try applyRemote(list.houses, context: context)
+        // 全量清单：便于识别「曾同步过、但服务器已硬删」的本地孤儿房并一并清除；
+        // 纯本地离线未提交的房（revMap 无记录）不会被误删。
+        let list = try await HouseRemoteClient.shared.listHouses(since: nil)
         setTop(list.topRevision)
+        if list.houses.isEmpty { return 0 }
+        let changed = try applyRemote(list.houses, context: context)
         return changed
-    }
-
-    /// 拉取服务器权威库套数（stats），回填来源标识用；失败不打扰调用方
-    func refreshStats() async {
-        guard HouseServerMode.ready else { return }
-        if let stats = try? await HouseRemoteClient.shared.stats() {
-            serverTotal = stats.total
-        }
     }
 
     private func applyRemote(_ remoteHouses: [RemoteHouse], context: ModelContext) throws -> Int {
@@ -118,6 +107,13 @@ final class HouseSyncEngine: ObservableObject {
             reconcileMedia(target, remote: r, context: context)
             if snapshot(target) != before { changed += 1 }
             setServerRevision(r.revision, forKey: r.roomKey)
+        }
+        // 服务器已硬删的本地孤儿：曾同步过（revMap 有记录）但全量清单已不含 → 物理删除本地记录
+        let remoteKeys = Set(remoteHouses.map { $0.roomKey })
+        for (key, h) in byKey where !remoteKeys.contains(key) && revMap[key] != nil {
+            context.delete(h)
+            removeServerRevision(forKey: key)
+            changed += 1
         }
         try context.save()
         return changed
@@ -161,13 +157,10 @@ final class HouseSyncEngine: ObservableObject {
         return remote
     }
 
+    /// 硬删：通知服务器物理移除（不进回收站）；本地记录由调用方在成功后 ctx.delete 清除
     func pushDelete(_ house: House) async throws {
         let roomKey = house.mediaRoomKey
-        let remote = try await HouseRemoteClient.shared.delete(roomKey)
-        house.isDeleted = true
-        house.deletedAt = Date()
-        setServerRevision(remote.revision, forKey: roomKey)
-        setTop(max(topRevision, remote.revision))
+        try await HouseRemoteClient.shared.delete(roomKey)
     }
 
     func pushRestore(_ house: House) async throws {

@@ -210,6 +210,9 @@ struct CosConfigView: View {
     @State private var profileShareURL: URL? = nil
     @State private var showProfileShare = false
     @State private var showProfileImport = false   // 导入别人发来的共享配置文件
+    // 房源服务器（8082 权威库）地址与状态
+    @State private var endpointInput = ""
+    @State private var serverTip: String?
 
     init() {
         // v1.34：新装 App 默认配置全部为空，由用户自行填写（不再预填 ap-hongkong）
@@ -225,6 +228,7 @@ struct CosConfigView: View {
         _customDomain = State(initialValue: d)
         _functionURL = State(initialValue: CloudConfig.functionURL)
         _username = State(initialValue: CloudUser.username)
+        _endpointInput = State(initialValue: MeterStore.shared.settings.cloudEndpointRaw ?? "")
     }
 
     var body: some View {
@@ -234,6 +238,52 @@ struct CosConfigView: View {
                 LabeledContent("有效期", value: "10 年内有效（不自动过期）")
             } footer: {
                 Text("分享时把该房源的图片和视频传到腾讯云 COS，生成链接卡片发给微信；好友点开即可查看。这里的链接 10 年内有效；「公开选房链接」是另一套，按你设的天数到期。")
+            }
+
+            // 房源服务器（8082 权威库）：台账文字存这里；图片视频实体仍在下方 COS 桶
+            Section {
+                LabeledContent("连接状态") {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(HouseServerMode.ready ? Color.green : Color.gray)
+                            .frame(width: 8, height: 8)
+                        Text(HouseServerMode.ready ? "已接入服务器" : HouseServerMode.notReadyReason)
+                            .foregroundColor(.secondary)
+                            .font(.footnote)
+                    }
+                }
+                TextField("服务器地址", text: $endpointInput)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.URL)
+                HStack(spacing: 12) {
+                    Button {
+                        saveServerEndpoint()
+                    } label: {
+                        Label("保存", systemImage: "checkmark.circle")
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(Color(red: 31/255, green: 58/255, blue: 95/255))
+                    Button {
+                        clearServerEndpoint()
+                    } label: {
+                        Label("恢复默认", systemImage: "arrow.counterclockwise")
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                }
+                if let serverTip {
+                    Text(serverTip).font(.footnote).foregroundColor(.green)
+                }
+            } header: {
+                Text("房源服务器（台账权威库）")
+            } footer: {
+                Text("房源文字台账、状态与修订记录存到这台服务器；图片、视频实体仍在下方腾讯云 COS 桶。未接入服务器时回退本机与桶兜底。")
             }
 
             // v1.18：云函数后台——管理后台网址（可设置）、后台口令、部署教程
@@ -559,6 +609,21 @@ struct CosConfigView: View {
         CloudConfig.clearFunctionURL()
         functionURL = ""
         savedTip = "已清空云函数地址（新装状态）"
+    }
+
+    private func saveServerEndpoint() {
+        let v = endpointInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !v.isEmpty else { serverTip = "地址不能为空"; return }
+        MeterStore.shared.settings.cloudEndpoint = v
+        MeterStore.shared.saveSettings()
+        serverTip = "服务器地址已保存"
+    }
+
+    private func clearServerEndpoint() {
+        MeterStore.shared.settings.cloudEndpointRaw = nil
+        MeterStore.shared.saveSettings()
+        endpointInput = ""
+        serverTip = "已恢复默认服务器地址"
     }
 
     private func saveAndVerify() {

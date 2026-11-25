@@ -92,7 +92,6 @@ struct HouseListView: View {
     @ObservedObject private var syncProgress = HouseSyncProgress.shared
     // v2.41：快捷指令深链 → 唤起新增房源并自动解析剪贴板
     @ObservedObject private var houseImportIntent = HouseImportIntent.shared
-    @ObservedObject private var syncEngine = HouseSyncEngine.shared
     @State private var autoImportNext = false
     @State private var handledImportTick = 0
     @State private var towerFilter: Int? = nil      // nil = 全部
@@ -570,10 +569,9 @@ struct HouseListView: View {
             // 服务器模式：进页面静默增量拉取权威库（小 JSON，失败不打扰、不打断操作）
             if HouseServerMode.ready, let ctx = houseModelContext {
                 Task {
-                    // 进页先补传离线未提交的改动，再增量拉取权威库（弱网改动不丢）
+                    // 进页先补传离线未提交的改动，再全量对账权威库（弱网改动不丢）
                     _ = await HousePendingUploader.shared.flush(context: ctx)
                     let n = try? await HouseSyncEngine.shared.pull(context: ctx)
-                    await HouseSyncEngine.shared.refreshStats()
                     if (n ?? 0) > 0 {
                         reloadHouses()
                     }
@@ -981,35 +979,6 @@ struct HouseListView: View {
     //    1座/2座不再被默认「待租」筛选顶替掉（统计栏不下沉）
     //  - 无任何筛选 → 显示「1座 X套 2座 X套 待租 X套」
 
-    /// 数据来源徽章：服务器权威库 / 旧 COS 链路，便于真机辨识当前读的是哪一端
-    private var sourceBadge: some View {
-        HStack(spacing: 5) {
-            Circle()
-                .fill(HouseServerMode.ready ? Color.green : Color.orange)
-                .frame(width: 6, height: 6)
-            if HouseServerMode.ready {
-                Text("服务器")
-                    .font(.caption2.weight(.medium))
-                    .foregroundColor(.green)
-                if let total = syncEngine.serverTotal {
-                    Text("\(total)套")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                }
-                if let rev = syncEngine.serverTopRevision {
-                    Text("修订\(rev)")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                }
-            } else {
-                Text("旧COS")
-                    .font(.caption2.weight(.medium))
-                    .foregroundColor(.orange)
-            }
-        }
-        .fixedSize()
-    }
-
     private var statsBar: some View {
         HStack(spacing: 12) {
             // v2.3（需求⑤修正）：上版误删了整条统计栏——恢复 v1.99/b106 版（排序 + 数量胶囊全部保留），
@@ -1073,8 +1042,6 @@ struct HouseListView: View {
                 .foregroundColor(.secondary)
                 .lineLimit(1)
                 .fixedSize()
-
-            sourceBadge
 
             Spacer()
 
@@ -1517,7 +1484,7 @@ struct HouseListView: View {
     /// v2.57（P1-2）：双端删除执行体——先逐套删云端，成功一套删一套本地；全部云端成功的房本地立即清、
     /// 界面马上见效；云端失败的房本地保留（同步不会把它拉回来，因为云端已删/在删），挂任务中心
     /// 「删云端」任务标注失败环节，retryCloudDelete 成功后自动清掉本地残留。
-    /// 服务器模式双端删除：逐套调服务器软删除（进回收站），本地同步标记；失败的房本地保留可重试
+    /// 服务器模式双端硬删：逐套删服务器权威库，成功一套删一套本地；不进回收站；失败的房本地保留可重试
     private func runServerDelete(keys: [String], ctx: ModelContext) {
         deleteTotal = keys.count
         deleteDone = 0
@@ -1525,12 +1492,14 @@ struct HouseListView: View {
         deleteCurrentRoom = ""
         Task {
             var ok = 0
+            var localDeleted: [House] = []
             for key in keys {
                 await MainActor.run { deleteCurrentRoom = key }
                 if let h = houses.first(where: { $0.mediaRoomKey == key }) {
                     do {
                         try await HouseSyncEngine.shared.pushDelete(h)
                         ok += 1
+                        localDeleted.append(h)
                     } catch {
                         showToast("删除失败 \(key)：\(error.localizedDescription)", isError: true)
                     }
@@ -1538,6 +1507,13 @@ struct HouseListView: View {
                 await MainActor.run { deleteDone += 1 }
             }
             await MainActor.run {
+                for h in localDeleted {
+                    MediaStore.deleteHouseDirectory(roomKey: h.mediaRoomKey)
+                    SyncFailStore.clear(h.mediaRoomKey)
+                    UnreadCloudHouseStore.clear(h.mediaRoomKey)
+                    HouseMediaUploadQueue.removeRoom(h.mediaRoomKey)
+                    ctx.delete(h)
+                }
                 try? ctx.save()
                 deleteRunning = false
                 deleteCurrentRoom = ""
@@ -1546,7 +1522,7 @@ struct HouseListView: View {
                 isBatchDelete = false
                 for key in keys { HouseMediaUploadQueue.removeRoom(key) }
                 NotificationCenter.default.post(name: Self.houseStoreChanged, object: nil)
-                if ok > 0 { showToast("已移入回收站 \(ok) 套") }
+                if ok > 0 { showToast("已删除 \(ok) 套（服务器与本地）") }
             }
         }
     }
@@ -1731,7 +1707,7 @@ struct HouseListView: View {
                     HouseActionNotifier.shared.send(
                         key: "status.\(roomKey)",
                         title: "状态已同步",
-                        body: "\(roomNo) 已改为\(house.status.label)，云端已更新"
+                        body: "\(roomNo) 已改为\(house.status.label)，桶内已更新"
                     )
                 }
                 BackupLogStore.log(category: "房源", action: action, result: "成功", detail: changeText, room: roomNo, cloud: true)
@@ -1742,7 +1718,7 @@ struct HouseListView: View {
                     HouseActionNotifier.shared.send(
                         key: "statusfail.\(roomKey)",
                         title: "状态同步失败",
-                        body: "\(roomNo) 已改本机，云端没同步上：\(error.localizedDescription)",
+                        body: "\(roomNo) 已改本机，桶内没同步上：\(error.localizedDescription)",
                         silent: true
                     )
                 }
@@ -2019,11 +1995,10 @@ struct HouseListView: View {
     private func runServerSync(context ctx: ModelContext) async -> CloudPullRunOutcome {
         let progressID = syncCenter.beginTransient(kind: .cloudPull, title: "同步房源", total: 1)
         do {
-            // 先补传本地离线写，再拉取服务器增量，保证两端最终一致
+            // 先补传本地离线写，再拉取服务器全量清单对账，保证两端最终一致
             _ = await HousePendingUploader.shared.flush(context: ctx)
             let changed = try await HouseSyncEngine.shared.pull(context: ctx)
-            await HouseSyncEngine.shared.refreshStats()
-            showToast(changed > 0 ? "已同步 \(changed) 套房源" : "房源已是最新")
+            showToast(changed > 0 ? "已从服务器同步 \(changed) 套房源" : "服务器上房源已是最新")
             syncCenter.endTransient(id: progressID)
             return .finished
         } catch {
