@@ -287,11 +287,7 @@ struct HouseBatchImportView: View {
         let items = parsed.items
         let badLines = parsed.badCount
         Task {
-            var cloudKeys = Set<String>()
-            if !HouseServerMode.ready, let cfg = CosConfig.load(), cfg.isValid,
-               let cloudRecs = try? await CloudHouseSync.fetchAll(config: cfg) {
-                cloudKeys = Set(cloudRecs.map { $0.roomKey })
-            }
+            let cloudKeys = Set<String>()
             await MainActor.run {
                 var kept: [BatchImportItem] = []
                 var removed = 0
@@ -307,9 +303,6 @@ struct HouseBatchImportView: View {
                 self.fullListItems = kept
                 var info = "解析 \(items.count) 间，自动剔除重复 \(removed) 间，可导入 \(kept.count) 间"
                 if badLines > 0 { info += "；无法识别 \(badLines) 行" }
-                if cloudKeys.isEmpty, CosConfig.load()?.isValid != true {
-                    info += "（未配置云或网络不通，本次仅按本机去重）"
-                }
                 self.parseInfo = info
             }
         }
@@ -428,11 +421,7 @@ struct HouseBatchImportView: View {
     private func buildMediaOnlyItems() {
         let local = (try? houseModelContext?.fetch(FetchDescriptor<House>())) ?? []
         Task {
-            var cloudKeys = Set<String>()
-            if !HouseServerMode.ready, let cfg = CosConfig.load(), cfg.isValid,
-               let cloudRecs = try? await CloudHouseSync.fetchAll(config: cfg) {
-                cloudKeys = Set(cloudRecs.map { $0.roomKey })
-            }
+            let cloudKeys = Set<String>()
             await MainActor.run {
                 var result: [BatchImportItem] = []
                 for var item in mediaParsed {
@@ -779,10 +768,6 @@ struct HouseBatchImportView: View {
         var all = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
         // 再查一遍云端账本，防止另一台设备已建同号房（拉取失败退回只查本地，不阻断）
         var cloudRoomKeys = Set<String>()
-        if !HouseServerMode.ready, let cfg = CosConfig.load(), cfg.isValid,
-           let cloudRecs = try? await CloudHouseSync.fetchAll(config: cfg) {
-            cloudRoomKeys = Set(cloudRecs.map { $0.roomKey })
-        }
         var affected: [House] = []
 
         // 新建房源
@@ -889,78 +874,11 @@ struct HouseBatchImportView: View {
                 return
             }
 
-            // 2. 同步云端：服务器模式走服务器权威库；旧 COS 链路仅非服务器模式
+            // 2. 同步服务器：已接入走服务器权威库；未接入仅保存本机
             if HouseServerMode.ready {
                 let _ = await syncBatchToServer(houses: houses, flowTitle: flowTitle, summary: &summary)
-            } else if let cfg = CosConfig.load(), cfg.isValid {
-                await MediaActivityGate.shared.beginUpload()
-                defer { Task { await MediaActivityGate.shared.endUpload() } }
-                let compress = shareCompressionEnabled
-                let totalFiles = houses.reduce(0) { $0 + $1.mediaItems.count }
-                let units = totalFiles + houses.count   // 每个媒体文件 + 每间账本各算一个工作单元
-                // 整批只留一条总任务：批次内每套房产生的零散「搬媒体 / 传改动」记录最后统一收掉
-                let importStart = Date()
-                var failedMediaRooms: [String] = []
-                var failedLedgerRooms: [String] = []
-                let importID = syncCenter.begin(kind: .media, title: flowTitle,
-                                                roomKeys: houses.map { $0.mediaRoomKey }, total: max(1, units))
-                var done = 0
-                for house in houses {
-                    let roomKey = house.mediaRoomKey
-                    let files = house.mediaItems
-                    syncCenter.advance(id: importID, done: done, note: "正在处理 \(roomKey)")
-                    // 逐文件上传：v2.52 起取消自动重试，失败直接入队挂任务中心手动重试
-                    for (fidx, mi) in files.enumerated() {
-                        do {
-                            try await CosUploader.uploadHouseMedia(fileName: mi.fileName, kind: mi.kind, roomKey: roomKey, config: cfg, compress: compress)
-                            HouseMediaUploadQueue.remove(roomKey: roomKey, fileName: mi.fileName)
-                        } catch {
-                            HouseMediaUploadQueue.enqueue(roomKey: roomKey, fileName: mi.fileName, kind: mi.kind)
-                            if !failedMediaRooms.contains(roomKey) { failedMediaRooms.append(roomKey) }
-                        }
-                        done += 1
-                        syncCenter.advance(id: importID, done: done)
-                    }
-                    // 账本上传
-                    let record = CloudHouseSync.record(from: house, username: CloudUser.username)
-                    // v2.45：批量导入写账本；v2.46：图片/视频分型
-                    let impSplit = HouseLedgerFormat.split(files.map { (name: $0.fileName, kind: $0.kind) })
-                    let impSummary = HouseLedgerFormat.mediaSummary(images: impSplit.images.count, videos: impSplit.videos.count)
-                    HouseLedgerStore.append(
-                        roomKey: roomKey,
-                        action: flowTitle,
-                        detail: "新建房源，" + (impSummary.isEmpty ? "无媒体" : impSummary))
-                    do {
-                        _ = try await CloudHouseSync.uploadGuarded(record: record, removedMedia: [], config: cfg)
-                        house.cloudStatus = .both
-                        SyncFailStore.clear(roomKey)
-                        summary.cloudLedger += 1
-                    } catch {
-                        SyncFailStore.mark(roomKey)
-                        failedLedgerRooms.append(roomKey)
-                        summary.cloudFailed += 1
-                    }
-                    done += 1
-                    syncCenter.advance(id: importID, done: done)
-                }
-                try? ctx.save()
-                // 失败房号统一写进这一条总任务的文案里（不再每套房挂一条）
-                let failedRooms = Array(Set(failedLedgerRooms + failedMediaRooms))
-                if failedRooms.isEmpty {
-                    syncCenter.finish(id: importID, success: true, note: "导入完成 \(houses.count) 套")
-                } else {
-                    let roomText = failedRooms.prefix(6).joined(separator: "、")
-                    let more = failedRooms.count > 6 ? " 等 \(failedRooms.count) 套" : ""
-                    syncCenter.finish(id: importID, success: false,
-                                     failure: "这几套没同步上：\(roomText)\(more)，点重试")
-                }
-                // 收掉本批零散记录（同批房号下、批次开始后产生的搬媒体/传改动），整批只剩上面这一条
-                syncCenter.absorbBatch(roomKeys: houses.map { $0.mediaRoomKey },
-                                       kinds: [.media, .pushUp], since: importStart)
-                // 总清单一次性合并落盘（uploadGuarded 已挂防抖钩子，这里强制 flush）
-                await CloudManifestUpdater.shared.flush()
             } else {
-                // 未配置云：仅本机导入，写本地账本镜像
+                // 未接入服务器：仅本机导入，写本地账本镜像
                 for h in houses {
                     LocalHouseLedger.save(h)
                     let localSplit = HouseLedgerFormat.split(h.mediaItems.map { (name: $0.fileName, kind: $0.kind) })
@@ -970,7 +888,7 @@ struct HouseBatchImportView: View {
                         action: flowTitle,
                         detail: "新建房源（仅本机），" + (localSummary.isEmpty ? "无媒体" : localSummary))
                 }
-                summary.errors.append("未配置云存储，本次仅保存到本机")
+                summary.errors.append("未接入服务器，本次仅保存到本机")
             }
 
             isImporting = false
