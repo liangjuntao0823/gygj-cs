@@ -977,58 +977,9 @@ struct HouseDetailView: View {
             }
             return
         }
-        guard let config = CosConfig.load() else {
-            isDownloading = false
-            cloudDeleteMessage = "未配置云存储，无法下载云端房源"
-            return
-        }
-        Task {
-            do {
-                // v1.43：只下载云端账本名单内的媒体（避免把首帧图/分享页等非账本对象混入本地记录）
-                let names = await cloudMediaNames(for: roomKey, config: config)
-                guard !names.isEmpty else {
-                    await MainActor.run {
-                        isDownloading = false
-                        cloudDeleteMessage = "云端账本未找到该房源媒体，无法下载。"
-                    }
-                    return
-                }
-                let files = try await CosUploader.downloadHouseMedia(roomKey: roomKey, expectedNames: names, config: config)
-                await MainActor.run {
-                    for f in files {
-                        let item = MediaItem(fileName: f.fileName, kind: f.kind)
-                        item.house = house
-                        modelContext.insert(item)
-                    }
-                    house.cloudStatus = .both
-                    try? modelContext.save()
-                    // v2.45：下载到本机写账本；v2.46：图片/视频分型
-                    let dlSplit = HouseLedgerFormat.split(files.map { (name: $0.fileName, kind: $0.kind) })
-                    HouseLedgerStore.append(
-                        roomKey: roomKey,
-                        action: "云端房源下载到本机",
-                        detail: HouseLedgerFormat.mediaParts(images: dlSplit.images, videos: dlSplit.videos, includeNames: false).joined(separator: "、"))
-                    Task { try? await HouseLedgerStore.pull(roomKey: roomKey, config: config) }
-                    // v1.44：下载完成立即通知刷新媒体区
-                    NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
-                    isDownloading = false
-                    cloudDeleteMessage = "已下载 \(files.count) 个媒体到本地，现在可以编辑、分享或一键保存了。";
-                    // v2.44：纯云端房源下载完成系统通知
-                    let images = files.filter { $0.kind == "image" }.count
-                    let videos = files.filter { $0.kind == "video" }.count
-                    HouseActionNotifier.shared.send(
-                        key: "download.\(roomKey)",
-                        title: "房源已下载",
-                        body: "\(house.displayRoomNo) 的照片\(images)、视频\(videos) 已存到本机，可编辑分享"
-                    )
-                }
-            } catch {
-                await MainActor.run {
-                    isDownloading = false
-                    cloudDeleteMessage = "下载失败：\(error.localizedDescription)";
-                }
-            }
-        }
+        // 未接入服务器：旧桶下载兜底已下线
+        isDownloading = false
+        cloudDeleteMessage = "未接入服务器，无法下载云端房源"
     }
 
     /// 服务器模式回补名单：本地记录优先；本地为空时从服务器房源详情取 media。
@@ -1039,13 +990,6 @@ struct HouseDetailView: View {
             return remote.media?.map { ($0.fileName, $0.kind) } ?? []
         }
         return []
-    }
-
-    /// v1.43：拉取云端账本里该房号的媒体名单（下载/补缺统一以账本为准，避免桶内非账本对象混入）
-    private func cloudMediaNames(for roomKey: String, config: CosConfig) async -> [String] {
-        // v1.71（方案 A）：单套账本已是一房一文件，直接读单套 info.json，不再全量拉取
-        guard let rec = try? await CloudHouseSync.fetchOne(roomKey: roomKey, config: config) else { return [] }
-        return rec.mediaNames
     }
 
     /// 详情页打开时补缺——记录还在但磁盘文件缺失（用户手删/意外丢失）且服务器/云端有 → 自动下载回补
@@ -1073,30 +1017,8 @@ struct HouseDetailView: View {
                 }
                 return
             }
-            guard let config = CosConfig.load() else {
-                await MainActor.run { isDownloading = false }
-                return
-            }
-            let names = await cloudMediaNames(for: roomKey, config: config)
-            guard !names.isEmpty else {
-                await MainActor.run { isDownloading = false }
-                return
-            }
-            if let files = try? await CosUploader.downloadHouseMedia(roomKey: roomKey, expectedNames: names, config: config), !files.isEmpty {
-                await MainActor.run {
-                    for f in files where !house.mediaItems.contains(where: { $0.fileName == f.fileName }) {
-                        let item = MediaItem(fileName: f.fileName, kind: f.kind)
-                        item.house = house
-                        modelContext.insert(item)
-                    }
-                    try? modelContext.save()
-                    // 下载完成立即通知刷新媒体区（否则详情页仍显示空白占位，需重进 App）
-                    NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
-                    isDownloading = false
-                }
-            } else {
-                await MainActor.run { isDownloading = false }
-            }
+            // 未接入服务器：旧桶补缺兜底已下线
+            await MainActor.run { isDownloading = false }
         }
     }
 
@@ -1130,39 +1052,9 @@ struct HouseDetailView: View {
                 }
                 return
             }
-            guard let config = CosConfig.load() else {
-                await MainActor.run { isDownloading = false }
-                action()
-                return
-            }
-            do {
-                // 只下载云端账本名单内的媒体（避免把首帧图/分享页等非账本对象混入本地记录）
-                let names = await cloudMediaNames(for: roomKey, config: config)
-                guard !names.isEmpty else {
-                    await MainActor.run { isDownloading = false }
-                    action()
-                    return
-                }
-                let files = try await CosUploader.downloadHouseMedia(roomKey: roomKey, expectedNames: names, config: config)
-                await MainActor.run {
-                    for f in files {
-                        let item = MediaItem(fileName: f.fileName, kind: f.kind)
-                        item.house = house
-                        modelContext.insert(item)
-                    }
-                    house.cloudStatus = .both
-                    try? modelContext.save()
-                    // 下载完成立即通知刷新媒体区
-                    NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
-                    isDownloading = false
-                    cloudDeleteMessage = "云端房源已自动下载到本地，请再点一次刚才的操作。";
-                }
-            } catch {
-                await MainActor.run {
-                    isDownloading = false
-                    cloudDeleteMessage = "下载失败：\(error.localizedDescription)";
-                }
-            }
+            // 未接入服务器：旧桶预下载兜底已下线，直接放行本次操作
+            await MainActor.run { isDownloading = false }
+            action()
         }
     }
 
