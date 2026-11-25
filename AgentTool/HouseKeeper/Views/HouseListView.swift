@@ -3085,13 +3085,14 @@ struct HouseListView: View {
             name: profile.name,
             phone: profile.phone
         )
-        // 服务器模式：App 内分享——本地媒体 + 纯文字，直接系统面板，不生成 H5 链接
+        // 服务器模式：App 内分享——本地媒体 + 服务器 H5 链接 + 纯文字，直接系统面板
         if HouseServerMode.ready {
             let urls: [URL] = files.compactMap { f in
                 let u = MediaStore.url(for: f.name, roomKey: roomKey)
                 return FileManager.default.fileExists(atPath: u.path) ? u : nil
             }
             var items: [Any] = urls
+            if let h5 = HouseRemoteClient.h5URL(roomKey: roomKey) { items.append(h5) }
             items.append(info.shareText)
             shareQueue = [items]
             shareIndex = 0
@@ -3183,6 +3184,7 @@ struct HouseListView: View {
                     return FileManager.default.fileExists(atPath: u.path) ? u : nil
                 }
                 var batch: [Any] = urls
+                if let h5 = HouseRemoteClient.h5URL() { batch.append(h5) }
                 batch.append(info.shareText)
                 batches.append(batch)
                 records.append((roomKey, info.shareText))

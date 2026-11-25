@@ -71,6 +71,23 @@ class NativeStoreTests(unittest.TestCase):
         self.assertIn("1-101", keys)
         self.assertNotIn("1-102", keys)
 
+    def test_public_single_only_available(self):
+        self.store.upsert_house(make_house("1-201", status="available"), operator="t")
+        self.store.upsert_house(make_house("1-202", status="rented"), operator="t")
+        one = self.store.public_single("1-201")
+        self.assertIsNotNone(one)
+        self.assertEqual(one["roomKey"], "1-201")
+        self.assertNotIn("landlord", one)  # 脱敏不返回房东
+        self.assertIsNone(self.store.public_single("1-202"))
+        self.assertIsNone(self.store.public_single("1-404"))
+
+    def test_h5_page_renders(self):
+        import h5_page
+        html = h5_page.page_html()
+        self.assertIn("/api/public/rooms", html)
+        self.assertIn("roomKey", html)
+        self.assertIn("拨打电话", html)
+
     def test_hard_delete_removes_disk_media(self):
         self.store.media.save_house_media("1-2059", "1-2059-JPG-abcd-1.jpg", b"img")
         self.store.upsert_house(make_house("1-2059"), operator="t")

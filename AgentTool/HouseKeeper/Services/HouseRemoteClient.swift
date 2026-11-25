@@ -419,6 +419,18 @@ final class HouseRemoteClient {
         }
         return try decode(RemoteHouse.self, data: data)
     }
+
+    /// 公开分享 H5 链接（服务器本地托管静态壳；roomKey 为空时为公开选房列表）
+    static func h5URL(roomKey: String? = nil) -> URL? {
+        guard var comps = URLComponents(string: NotifyHub.shared.endpoint) else { return nil }
+        comps.path = "/public/h5"
+        if let key = roomKey, !key.isEmpty {
+            comps.queryItems = [URLQueryItem(name: "roomKey", value: key)]
+        } else {
+            comps.queryItems = nil
+        }
+        return comps.url
+    }
 }
 
 /// POST /houses 单条返回（服务器对单条也包成 results）

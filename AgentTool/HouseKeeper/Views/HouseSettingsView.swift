@@ -1602,6 +1602,17 @@ struct RoomsShareView: View {
     /// 与单房分享 H5 完全同机制：链接走自定义域名（微信按网页打开+抓卡片），
     /// 页面 JS 每次打开/刷新实时拉 rooms_json，房源/名片/二维码变化刷新即最新。
     private func refreshLink() async {
+        // 服务器模式：选房页由服务器本地托管静态壳，长期有效，房源/名片刷新即最新
+        if HouseServerMode.ready {
+            if let h5 = HouseRemoteClient.h5URL() {
+                cosLink = h5.absoluteString
+                linkTip = "链接长期有效；房源、名片或二维码更新后，租客刷新页面即为最新"
+            } else {
+                cosLink = ""
+                linkTip = "服务器地址未配置，请到「电表监控设置」检查服务器地址"
+            }
+            return
+        }
         guard let config = CosConfig.load() else {
             cosLink = ""
             linkTip = "尚未配置云端\n请先到「设置 → 房源分享 → 云端配置」填写 COS 密钥并保存验证"

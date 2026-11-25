@@ -103,6 +103,22 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
         if path == f"{PUBLIC_PREFIX}/rooms" and method == "GET":
             return send(200, {"ok": True, "rooms": store.public_rooms()})
 
+        if path.startswith(f"{PUBLIC_PREFIX}/rooms/") and method == "GET":
+            key = urllib.parse.unquote(path[len(f"{PUBLIC_PREFIX}/rooms/"):].strip("/"))
+            doc = store.public_single(key)
+            return send(200 if doc else 404, doc or {"ok": False, "error": "not_found"})
+
+        if path == f"{PUBLIC_PREFIX}/profile" and method == "GET":
+            prof = store.profile_get()
+            return send(200, {"ok": True, "profile": {
+                "name": prof.get("name", ""), "phone": prof.get("phone", ""),
+                "qrPath": prof.get("qrPath", "")}})
+
+        if path in (f"{PUBLIC_PREFIX}/h5", f"{PUBLIC_PREFIX}/h5/") and method == "GET":
+            import h5_page
+            return send_file(200, h5_page.page_html().encode("utf-8"),
+                             "text/html; charset=utf-8")
+
         if path.startswith(f"{PUBLIC_PREFIX}/media/") and method == "GET":
             rel = urllib.parse.unquote(path[len(f"{PUBLIC_PREFIX}/media/"):])
             data = store.media.read_rel(rel)

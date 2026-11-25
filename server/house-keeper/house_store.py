@@ -724,3 +724,22 @@ class HouseStore:
                               for m in media],
                 })
         return out
+
+    def public_single(self, room_key: str) -> dict[str, Any] | None:
+        """公开只读单房（脱敏，免鉴权；单房分享 H5 用）。仅待租、未删。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT room_key,room_no,tower,layout,price,status FROM houses "
+                "WHERE room_key=? AND is_deleted=0 AND status='available'",
+                (room_key,)).fetchone()
+            if row is None:
+                return None
+            media = self._media(self._conn, row["room_key"])
+            return {
+                "roomKey": row["room_key"], "roomNo": row["room_no"],
+                "tower": row["tower"], "layout": row["layout"],
+                "price": row["price"], "status": row["status"],
+                "media": [{"objectKey": m["objectKey"], "fileName": m["fileName"],
+                           "kind": m["kind"], "sortOrder": m["sortOrder"]}
+                          for m in media],
+            }
