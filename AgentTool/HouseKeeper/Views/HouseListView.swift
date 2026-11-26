@@ -75,16 +75,6 @@ struct HouseListView: View {
     /// b118（清单12）：打开 App 轻量变更感知——启动/回前台探测云端账本有变化时广播
     static let cloudLedgerChangedLight = Notification.Name("cloudLedgerChangedLight")
 
-    /// v1.67：后台线程安全的媒体对账快照——SwiftData @Model 属性（mediaItems 等）只能在
-    /// 主线程/模型上下文访问，跨线程读会崩溃（v1.66 刷新「点击没反应」根因）。
-    /// 因此先在主线程把需要的数据提取成纯值，后台只做网络请求。
-    private struct PendingMediaHouseSnapshot {
-        let roomKey: String
-        let displayRoomNo: String
-        let files: [ShareMediaFile]
-        let info: ShareHouseInfo
-    }
-
     @State private var searchText = ""
     /// v2.18：房源顶栏「操作日志」入口（批量导入旁边），不用再进设置页才能看日志
     @State private var showLogs = false
@@ -1353,78 +1343,13 @@ struct HouseListView: View {
         }
     }
 
-    /// v1.41：云端账本与本地房源的字段级对比——任一字段（含媒体清单）不同即视为有变化。
-    /// v1.43：媒体名归一化 key——去扩展名 + 小写。
-    /// 视频 .mov/.mp4 同源（上传云端统一转 mp4、本地按原样或账本名保存），按此视为同一文件；
-    /// 图片保留完整后缀（foo.jpg ≠ foo.png），不同 base 名也区分。v2.37（#11）：统一走 MediaNaming.canonicalKey。
-    private static func mediaNormKey(_ name: String) -> String {
-        MediaNaming.canonicalKey(name)
-    }
-
-    /// 仍在待上传登记簿里的媒体属于“本地还没传完”，对账时不能把它算成本地与云端的真实差异。
-    /// 否则失败任务被取消后，这条本地媒体仍被豁免删除，但每轮刷新又被判成“云端有更新”，形成死循环。
-    private static func exemptPendingKeys(roomKey: String) -> Set<String> {
-        Set(HouseMediaUploadQueue.pendingItems()
-            .filter { $0.roomKey == roomKey }
-            .map { mediaNormKey($0.fileName) })
-    }
-
-    /// v2.62：本机「正在上传 / 待重试」的房号集合。
-    /// 这些房是「本地先建好、云端还没写完」，检测时必须整体豁免——否则新增房源上传途中
-    /// 任何一次检测都会命中「本地有、云端没有」，弹出假「云端有更新」。
-    @MainActor
-    private static func activeUploadRoomKeys() -> Set<String> {
-        var keys = Set(HouseMediaUploadQueue.pendingItems().map { $0.roomKey })
-        for task in SyncTaskCenter.shared.running where task.isHouseUpload == true {
-            keys.formUnion(task.roomKeys)
-        }
-        return keys
-    }
-
     /// v2.62：当前是否有房源上传任务正在跑（决定要不要跳过整次检测）
     @MainActor
     private static func hasRunningHouseUpload() -> Bool {
         SyncTaskCenter.shared.running.contains { $0.isHouseUpload == true }
     }
 
-    /// 替代旧的时间戳比较：时间戳只有秒级精度且恢复备份后 lastUpdatedAt 为空，
-    /// 会导致「明明没变化每次同步都判更新」。字段级对比满足「一个标点符号变了都要同步」。
-    /// v1.43：媒体清单改用归一化等价比较（去扩展名小写）——视频 .mov/.mp4 视为同一文件，
-    ///        不再因两套扩展名互斥而每次同步都误判「更新」。
-    /// b116：返回差异描述（nil=一致，非nil=具体哪个字段不同），字符串先 trim 防首尾空格死循环。
-    /// b120：改为 static——轻量变更感知（detectCloudLedgerChange）与同步按钮共用同一判定口径。
-    private static func cloudRecordDiffers(_ rec: CloudHouseRecord, from house: House) -> String? {
-        let ls = { (s: String) in s.trimmingCharacters(in: .whitespacesAndNewlines) }
-        if rec.roomNo != house.roomNo { return "roomNo「\(rec.roomNo)」vs「\(house.roomNo)」" }
-        if rec.tower != house.tower { return "tower \(rec.tower) vs \(house.tower)" }
-        if ls(rec.landlord) != ls(house.landlord) { return "landlord「\(rec.landlord)」vs「\(house.landlord)」" }
-        if ls(rec.layout) != ls(house.layout) { return "layout「\(rec.layout)」vs「\(house.layout)」" }
-        if rec.price != house.price { return "price \(rec.price) vs \(house.price)" }
-        if ls(rec.password) != ls(house.password) { return "password 不同" }
-        if ls(rec.remark) != ls(house.remark) { return "remark「\(rec.remark)」vs「\(house.remark)」" }
-        if ls(rec.status) != ls(house.statusRaw) { return "status「\(rec.status)」vs「\(house.statusRaw)」" }
-        let exempt = exemptPendingKeys(roomKey: house.mediaRoomKey)
-        let localMedia = Set(house.mediaItems.map { Self.mediaNormKey($0.fileName) }).subtracting(exempt)
-        let cloudMedia = Set(rec.mediaNames.map { Self.mediaNormKey($0) })
-        if localMedia != cloudMedia {
-            let onlyLocal = localMedia.subtracting(cloudMedia)
-            let onlyCloud = cloudMedia.subtracting(localMedia)
-            return "media 本地独有[\(onlyLocal.joined(separator: ","))] 云端独有[\(onlyCloud.joined(separator: ","))]"
-        }
-        return nil
-    }
-
-    /// 从云端拉取房源账本并同步到本地（下拉刷新 / 左上角手动同步同效果）。
-    /// v1.19 补全「增减逻辑」：
-    ///  - 增：云端新增 → 完整下载到本地（文字 + 媒体），标双端、可编辑
-    ///  - 改：云端比本地新 → 覆盖文字字段；本地媒体缺失但云端有 → 自动下载媒体
-    ///  - 减：本地房源在云端账本已不存在 → 若它来自云端（双端/云端）则跟随删除；纯本地未上传的保留并补传云端
-    ///  - 无任何变化 → 提示「已刷新，无变化」，不写入操作日志
-    /// v1.41：
-    ///  - 「更新」判定改为字段级对比（cloudRecordDiffers），不再依赖时间戳（时间戳精度/恢复备份导致误判）
-    ///  - 媒体差异双向识别：云端有本地缺（要下载）与 本地有云端缺（要跟随删除）都算变化并弹确认
-    /// v1.63：下拉刷新 = 本地刷新（媒体补全检测）：
-    /// 磁盘有而记录没有 → 自动补建媒体记录；记录有而磁盘没有 → 提示待云端回补；
+    /// 下拉刷新：本地媒体对账——磁盘有而记录没有 → 自动补建媒体记录；记录有而磁盘没有 → 提示待回补；
     /// 无对应房源的目录 → 提示可扫描补录。有变化列明细，无变化提示「已刷新，无变化」。
     private func localRefreshWithMediaCheck() async {
         // v2.63：重入保护——连续下拉两次时不并发跑两份本地对账，避免同一文件被重复插入媒体记录
@@ -1490,46 +1415,6 @@ struct HouseListView: View {
             // v1.77：下拉刷新（本地刷新）不再重建本地账本镜像——重建只在左上角云端同步后执行
             NotificationCenter.default.post(name: Self.houseStoreChanged, object: nil)
         }
-    }
-
-    /// v1.76：重建/刷新本地账本镜像（media/<房号>/info.json），保证与本地房源记录一致。
-    /// v1.77：仅由「左上角云端同步」触发（下拉刷新不再调用）。
-    /// v1.78：改为增量——每套与现有账本对比，有差异才写盘，无差异跳过。
-    /// v1.79：增量对比改为「语义字段」判断（v1.78 的字节全等对比太脆弱：媒体清单顺序/元数据微变都会
-    /// 判为有差异，导致每次同步仍全量重写）。现只对比业务字段 + 排序后的媒体清单，
-    /// updatedAt/updatedBy 不参与判断；真正无变化的套数零写入。返回(实际写入套数, 已校验套数)。
-    /// 判断「账本是否已是当前状态」：业务字段一致且媒体清单（排序后）一致 → 视为无变化
-    private func ledgerIsCurrent(_ h: House, existing: CloudHouseRecord?) -> Bool {
-        guard let existing else { return false }
-        return existing.roomKey == h.mediaRoomKey
-            && existing.roomNo == h.roomNo
-            && existing.tower == h.tower
-            && existing.landlord == h.landlord
-            && existing.layout == h.layout
-            && existing.price == h.price
-            && existing.password == h.password
-            && existing.remark == h.remark
-            && existing.status == h.statusRaw
-            && existing.mediaNames.sorted() == h.mediaItems.map { $0.fileName }.sorted()
-    }
-
-    @discardableResult
-    private func rebuildLocalLedgers() -> (written: Int, checked: Int) {
-        guard let ctx = houseModelContext else { return (0, 0) }
-        let all = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
-        var written = 0
-        var checked = 0
-        for h in all where !h.isTrashed {
-            checked += 1
-            let url = MediaStore.houseDirectory(roomKey: h.mediaRoomKey).appendingPathComponent("info.json")
-            let existing = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(CloudHouseRecord.self, from: $0) }
-            if ledgerIsCurrent(h, existing: existing) {
-                continue   // 账本已是最新，跳过写入
-            }
-            LocalHouseLedger.save(h)
-            written += 1
-        }
-        return (written, checked)
     }
 
     /// v1.83：同步失败自动重试一次——网络瞬断/弱网（如电梯信号切换）时第一次失败会在 1 秒后自动重跑，
