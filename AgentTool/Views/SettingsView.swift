@@ -153,20 +153,6 @@ struct SettingsView: View {
                     Image(systemName: "server.rack")
                 }
             }
-            NavigationLink {
-                AdminPasswordView()
-            } label: {
-                Label {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("管理后台口令")
-                        Text("网页版登录用 · App 内自动免登录")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                } icon: {
-                    Image(systemName: "lock.shield")
-                }
-            }
         } header: {
             Text("账号与云端")
         } footer: {
@@ -883,7 +869,7 @@ struct SettingsView: View {
                 // v2.23：前 6 组改成一级菜单，内容进二级页；最下面「关于」保持原样
                 Section {
                     settingsRow("账号与云端", icon: "person.crop.circle",
-                                subtitle: "我的用户名 · 云端配置（桶/密钥/域名）· 管理后台口令") { AccountSettingsPage() }
+                                subtitle: "我的用户名 · 服务器地址") { AccountSettingsPage() }
                     settingsRow("分享与展示", icon: "square.and.arrow.up",
                                 subtitle: "名片 · 公开选房链接 · 有效期 · 水印 · 压缩 · 重建分享链接") { ShareSettingsPage() }
                     settingsRow("备份与安全", icon: "externaldrive.badge.checkmark",
@@ -2008,92 +1994,6 @@ struct BillTemplateSettingsView: View {
     }
 }
 
-// MARK: - v1.36 管理后台口令（网页版登录用；App 内免登录直接带哈希）
-
-struct AdminPasswordView: View {
-    @Environment(\.dismiss) private var dismiss
-    @State private var password = CloudConfig.adminPassword
-    @State private var confirm = ""
-    @State private var savedFlash = false
-    @State private var resultMsg: String?
-    @State private var errorMsg: String?
-
-    var body: some View {
-        Form {
-            Section {
-                SecureField("后台口令", text: $password)
-                SecureField("再次输入确认", text: $confirm)
-            } header: {
-                Text("口令设置")
-            } footer: {
-                Text("网页版管理后台用此口令登录；App 内打开后台免登录。默认口令 12345678，建议修改为不易猜的字符。v1.17 需求6：保存后会自动同步到云函数（云端后台、网页后台同用此口令）。")
-            }
-            Section {
-                Button("保存") { save() }
-            }
-            if let errorMsg {
-                Section {
-                    Text(errorMsg).foregroundStyle(.red)
-                }
-            }
-        }
-        .navigationTitle("管理后台口令")
-        .navigationBarTitleDisplayMode(.inline)
-        .alert("已保存", isPresented: Binding(
-            get: { savedFlash },
-            set: { if !$0 { savedFlash = false } }
-        )) {
-            Button("好", role: .cancel) { dismiss() }
-        } message: {
-            Text(resultMsg ?? "后台口令已更新：\(password)")
-        }
-    }
-
-    private func save() {
-        let trimmed = password.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.count >= 6 else {
-            errorMsg = "口令至少 6 位"
-            return
-        }
-        guard trimmed == confirm else {
-            errorMsg = "两次输入不一致"
-            return
-        }
-        // v1.17 需求6：记录旧口令哈希用于云函数鉴权，再更新本地
-        let oldHash = CloudConfig.passwordHash
-        CloudConfig.adminPassword = trimmed
-        resultMsg = "本地口令已更新：\(trimmed)"
-        savedFlash = true
-        // 异步同步到云函数（改桶内 h/_admin_pwd.json）
-        Task {
-            let tip = await syncCloud(oldHash: oldHash, new: trimmed)
-            await MainActor.run { resultMsg = tip }
-        }
-    }
-
-    /// v1.17 需求6：调用云函数 setPwd 把新口令同步到云端（成功后云端后台与网页后台立即用新口令）
-    private func syncCloud(oldHash: String, new: String) async -> String {
-        guard let encoded = new.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-              let url = URL(string: "\(CloudConfig.functionURL)?act=setPwd&k=\(oldHash)&new=\(encoded)") else {
-            return "已保存到本地，但同步云函数失败（云函数地址无效）。\n网页版后台仍用旧口令，请稍后在设置页重试。"
-        }
-        do {
-            let (data, resp) = try await URLSession.shared.data(from: url)
-            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-            if code == 401 {
-                return "已保存到本地；但云端同步被拒绝（口令校验失败）。\n请确认云函数已部署后重试。"
-            }
-            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any], obj["ok"] as? Bool == true {
-                return "本地 + 云端后台口令均已更新：\(new)"
-            }
-            return "已保存到本地；云端同步未确认，请稍后重试。"
-        } catch {
-            return "已保存到本地；云端同步失败（网络错误：\(error.localizedDescription)）"
-        }
-    }
-}
-
-
 // MARK: - v2.18：全量备份进度枢纽
 /// 全量备份打包耗时可达几十秒（含照片视频），进度只在这里写、View 只读。
 /// 写入口径：BackupV5Manager.createFullBackup 的 progress 回调本身已切回主线程。
@@ -2139,20 +2039,6 @@ struct AccountSettingsPage: View {
                         }
                     } icon: {
                         Image(systemName: "server.rack")
-                    }
-                }
-                NavigationLink {
-                    AdminPasswordView()
-                } label: {
-                    Label {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("管理后台口令")
-                            Text("网页版登录用 · App 内自动免登录")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                    } icon: {
-                        Image(systemName: "lock.shield")
                     }
                 }
             } header: {
