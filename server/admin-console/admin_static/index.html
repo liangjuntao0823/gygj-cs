@@ -260,13 +260,13 @@ async function loadSys(){
   const svc=(await api('/admin/api/sys/services')).services;
   $('sys-svc').querySelector('tbody').innerHTML=svc.map(s=>`
     <tr><td>${s.display}<div class="subtitle">${s.desc}</div></td>
-    <td><span class="tag ${s.active==='active'?'g':'r'}">${s.active}</span></td>
-    <td>${s.subState}</td><td>${s.pid||'—'}</td><td>${s.memoryKb?Math.round(s.memoryKb/1024)+' MB':'—'}</td>
+    <td><span class="tag ${s.active==='active'?'g':'r'}">${{active:'运行中',inactive:'已停止',dead:'已停止',failed:'异常',unknown:'未知'}[s.active]||s.active}</span></td>
+    <td>${{running:'运行中',dead:'已停止',waiting:'等待中',exited:'已退出',failed:'异常',stopped:'已停止'}[s.subState]||s.subState||'—'}</td><td>${s.pid||'—'}</td><td>${s.memoryKb?Math.round(s.memoryKb/1024)+' MB':'—'}</td>
     <td>${s.canControl?`<button class="ghost" onclick="sysCtrl('${s.unit}','start')">启动</button>
         <button onclick="sysCtrl('${s.unit}','restart')">重启</button>
         <button class="danger" onclick="sysCtrl('${s.unit}','stop')">停止</button>`:'<span class="muted">只读</span>'}</td></tr>`).join('');
   const a=(await api('/admin/api/sys/audit')).audit;
-  $('sys-audit').querySelector('tbody').innerHTML=a.map(x=>`<tr><td>${x.ts}</td><td>${x.actor}</td><td>${x.action}</td><td>${x.target}</td><td class="muted">${x.detail||''}</td></tr>`).join('')||'<tr><td colspan="5" class="muted">暂无日志</td></tr>';
+  $('sys-audit').querySelector('tbody').innerHTML=a.map(x=>`<tr><td>${x.ts}</td><td>${x.actor}</td><td>${{start:'启动',restart:'重启',stop:'停止'}[x.action]||x.action}</td><td>${x.target}</td><td class="muted">${x.detail||''}</td></tr>`).join('')||'<tr><td colspan="5" class="muted">暂无日志</td></tr>';
 }
 async function sysCtrl(unit,action){
   if(!confirm(`确认 ${action} ${unit}？`))return;
@@ -354,7 +354,8 @@ $('h-export-csv').onclick=()=>location.href='/admin/api/house/export?format=csv'
 
 function houseDetail(i){
   const h=STATE.houses[i];
-  const f=(k,v)=>`<div class="field"><label>${k}</label><input id="f-${k}" value="${v??''}"></div>`;
+  const LABEL={roomNo:'房号',tower:'座',landlord:'房东',layout:'户型',price:'租金',password:'密码',remark:'备注'};
+  const f=(k,v)=>`<div class="field"><label>${LABEL[k]||k}</label><input id="f-${k}" value="${v??''}"></div>`;
   const ledger=(h.ledger||[]).map(e=>`<li><strong>${e.at||e.ts}</strong> · ${e.operator} · ${e.action}${e.detail?'：'+e.detail:''}</li>`).join('');
   const media=(h.media||[]).map(m=>`<span>${m.kind==='video'?'🎬':'🖼'} ${m.fileName||m.objectKey}</span>`).join('');
   openModal(`<h3>${h.roomNo} · 详情</h3>
