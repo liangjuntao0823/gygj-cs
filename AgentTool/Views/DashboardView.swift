@@ -191,6 +191,12 @@ struct DashboardView: View {
         return (meta.imageName, meta.icon, meta.label, meta.color, action)
     }
 
+    /// 服务器后台网页（8082 /admin），与房源/电表共用同一服务器端点
+    private var adminURL: URL {
+        let base = NotifyHub.shared.endpoint
+        return URL(string: base + "/admin") ?? URL(string: MeterCloudConfig.defaultEndpoint + "/admin")!
+    }
+
     private var currentMonth: Int {
         Calendar.current.component(.month, from: currentTime)
     }
@@ -804,7 +810,11 @@ struct DashboardView: View {
             QuickActionEditSheet(dashOrder: $qaDashOrder, moreOrder: $qaMoreOrder)
         }
         .sheet(isPresented: $showAdmin) {
-            NavigationStack { RemoteConfigAdminView() }
+            NavigationStack {
+                AdminWebView(url: adminURL)
+                    .navigationTitle("管理后台")
+                    .navigationBarTitleDisplayMode(.inline)
+            }
         }
         .sheet(isPresented: $showAddDeal) {
             NavigationStack { AddDealView() }
@@ -1568,7 +1578,7 @@ struct ImagePickerView: UIViewControllerRepresentable {
     }
 }
 
-// MARK: - v1.17 需求5 云端后台 WebView（App 内管理后台直接加载云端后台网页，免登录）
+// MARK: - 服务器后台 WebView（App 内打开服务器 admin-console 网页，登录会话 cookie 由 WKWebView 持久化维持）
 
 struct AdminWebView: UIViewRepresentable {
     let url: URL
