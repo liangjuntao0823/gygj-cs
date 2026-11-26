@@ -26,7 +26,6 @@
 		A10000010000000000000015 /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000015 /* Theme.swift */; };
 		A10000010000000000000012 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000012 /* Assets.xcassets */; };
 		LSB0000000000000000000001 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = LSR0000000000000000000001 /* LaunchScreen.storyboard */; };
-		A20000010000000000000003 /* MigrationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000010000000000000003 /* MigrationView.swift */; };
 		C20000010000000000000001 /* PlanEditors.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000002 /* PlanEditors.swift */; };
 		A10000010000000000000013 /* Preview Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000013 /* Preview Assets.xcassets */; };
 		WA /* WidgetDataSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = WB /* WidgetDataSync.swift */; };
@@ -138,7 +137,6 @@
 		B10000010000000000000012 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		B10000010000000000000013 /* Preview Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = "Preview Assets.xcassets"; sourceTree = "<group>"; };
 		B10000010000000000000014 /* AgentTool.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AgentTool.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		B20000010000000000000003 /* MigrationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MigrationView.swift; sourceTree = "<group>"; };
 		C20000010000000000000002 /* PlanEditors.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlanEditors.swift; sourceTree = "<group>"; };
 		W2 /* AgentToolWidget.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentToolWidget.swift; sourceTree = "<group>"; };
 		WB /* WidgetDataSync.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WidgetDataSync.swift; sourceTree = "<group>"; };
@@ -291,7 +289,6 @@
 				WB /* WidgetDataSync.swift */,
 				D10000010000000000000004 /* Models */,
 				D10000010000000000000005 /* ViewModels */,
-				D20000010000000000000001 /* Sync */,
 				D10000010000000000000006 /* Views */,
 				B10000010000000000000012 /* Assets.xcassets */,
 				LSR0000000000000000000001 /* LaunchScreen.storyboard */,
@@ -335,14 +332,6 @@
 				B30000010000000000000001 /* LocalNotificationManager.swift */,
 			);
 			path = ViewModels;
-			sourceTree = "<group>";
-		};
-		D20000010000000000000001 /* Sync */ = {
-			isa = PBXGroup;
-			children = (
-				B20000010000000000000003 /* MigrationView.swift */,
-			);
-			path = Sync;
 			sourceTree = "<group>";
 		};
 		D10000010000000000000006 /* Views */ = {
@@ -587,7 +576,6 @@
 				A10000010000000000000099 /* TrashView.swift in Sources */,
 				A10000010000000000000015 /* Theme.swift in Sources */,
 				A10000010000000000000119 /* RentStatView.swift in Sources */,
-				A20000010000000000000003 /* MigrationView.swift in Sources */,
 				C20000010000000000000001 /* PlanEditors.swift in Sources */,
 				A10000010000000000000100 /* House.swift in Sources */,
 				A10000010000000000000101 /* CosUploader.swift in Sources */,

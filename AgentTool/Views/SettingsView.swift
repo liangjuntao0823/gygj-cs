@@ -53,7 +53,6 @@ struct SettingsView: View {
     @State private var clearType: DataBackupManager.BackupType? = nil
     @State private var showClearConfirm = false
     @State private var showVersionHistory = false
-    @State private var showMigration = false
     @State private var showBillTemplate = false
     @State private var showTrash = false   // v1.3：回收站入口从工作台移至设置页
     @State private var showTaskCenter = false   // 左上角常显按钮 → 任务中心
@@ -453,18 +452,6 @@ struct SettingsView: View {
                     }
                 } icon: {
                     Image(systemName: "folder")
-                }
-            }
-            Button { showMigration = true } label: {
-                Label {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("换机迁移")
-                        Text("导出 .zfgj 迁移包拷到新手机，一次性复制；不是日常同步")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                } icon: {
-                    Image(systemName: "iphone.and.arrow.forward")
                 }
             }
             NavigationLink {
@@ -939,9 +926,6 @@ struct SettingsView: View {
             }
             .sheet(isPresented: $showVersionHistory) {
                 VersionHistoryView()
-            }
-            .sheet(isPresented: $showMigration) {
-                MigrationView()
             }
             .sheet(isPresented: $showBillTemplate) {
                 BillTemplateSettingsView()
@@ -2289,7 +2273,6 @@ struct BackupSettingsPage: View {
     @State private var showBackupKindSheet = false
     @State private var showOfflineRestoreConfirm = false
     @State private var showBackupCenterBrowse = false
-    @State private var showMigration = false
     @State private var showBackupCenterRestore = false
     @State private var showLogsView = false
     @State private var showCrashLogsView = false
@@ -2423,18 +2406,6 @@ struct BackupSettingsPage: View {
                         Image(systemName: "folder")
                     }
                 }
-                Button { showMigration = true } label: {
-                    Label {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("换机迁移")
-                            Text("导出 .zfgj 迁移包拷到新手机，一次性复制；不是日常同步")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                    } icon: {
-                        Image(systemName: "iphone.and.arrow.forward")
-                    }
-                }
                 NavigationLink {
                     MediaPendingView()
                 } label: {
@@ -2521,9 +2492,6 @@ struct BackupSettingsPage: View {
         }
         .sheet(isPresented: $showLogsView) {
             BackupLogsView()
-        }
-        .sheet(isPresented: $showMigration) {
-            MigrationView()
         }
         .sheet(isPresented: $showCrashLogsView) {
             CrashLogsView()
