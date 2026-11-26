@@ -23,7 +23,7 @@ func resolveAppGroupID() -> String {
         "group.6f5a3ce5f64acb19.3",
         "group.6f5a3ce5f64acb19.4",
         "group.6f5a3ce5f64acb19.5",
-        "group.com.gj.tg2.shared"
+        "group.com.gj.tg.shared"
     ]
     // 逐个探测：哪个 group 里已有主 App 写入的数据（todoCount 键存在）就用哪个
     for g in candidates {
@@ -31,7 +31,7 @@ func resolveAppGroupID() -> String {
             return g
         }
     }
-    return "group.com.gj.tg2.shared"
+    return "group.com.gj.tg.shared"
 }
 
 // MARK: - 小组件数据模型
@@ -163,7 +163,7 @@ struct MediumWidgetView: View {
             }
         }
         // v2.51：点组件直接全屏出电梯码（不再回 App 首页）
-        .widgetURL(URL(string: "gongyuguanjia-fwq://elevator"))
+        .widgetURL(URL(string: "gongyuguanjia://elevator"))
     }
 
     @ViewBuilder
@@ -194,7 +194,7 @@ struct LockCircular: View {
             Text("待办").font(.system(size: 9))
         }
         .widgetAccentable()
-        .widgetURL(URL(string: "gongyuguanjia-fwq://elevator"))
+        .widgetURL(URL(string: "gongyuguanjia://elevator"))
     }
 }
 
@@ -209,7 +209,7 @@ struct LockRectangular: View {
                 .font(.system(size: 11))
                 .widgetAccentable()
         }
-        .widgetURL(URL(string: "gongyuguanjia-fwq://elevator"))
+        .widgetURL(URL(string: "gongyuguanjia://elevator"))
     }
 }
 
