@@ -668,11 +668,8 @@ final class TaskRetryPerformer {
         }
     }
 
-    /// v2.52：保存房源的媒体上传任务（含手动取消后重试）：逐文件走 uploadHouseMedia
+    /// v2.52：保存房源的媒体上传任务（含手动取消后重试）：逐文件直传服务器磁盘
     private func retryHouseUpload(_ item: TaskRecord, completion: @escaping (TaskRetryOutcome) -> Void) async {
-        guard let config = CosConfig.load(), config.isValid else {
-            completion(.failure(message: "云端配置无效，请先到「云端配置」填写")); return
-        }
         guard let roomKey = item.roomKeys.first else {
             completion(.failure(message: "缺少房号信息，请到这套房编辑页重新操作")); return
         }
@@ -688,70 +685,45 @@ final class TaskRetryPerformer {
         for (index, fileName) in files.enumerated() {
             let ext = (fileName as NSString).pathExtension.lowercased()
             let kind = ["mov", "mp4", "m4v", "avi"].contains(ext) ? "video" : "image"
-            let globalFraction = { (fileFraction: Double) -> Double in
-                let doneBase = Double(index)
-                let total = Double(files.count)
-                return max(0, min(1, (doneBase + fileFraction) / total))
-            }
+            let localURL = MediaStore.url(for: fileName, roomKey: roomKey)
             SyncTaskCenter.shared.advance(id: item.id, done: index, total: files.count, note: "上传中…", currentFileFraction: 0)
             do {
-                try await CosUploader.uploadHouseMedia(fileName: fileName, kind: kind,
-                                                       roomKey: roomKey, config: config,
-                                                       compress: shareCompressionEnabled,
-                                                       onStage: { label in
-                                                           progress.updateStage(roomKey: roomKey, direction: .upload, label: label)
-                                                           Task { @MainActor in SyncTaskCenter.shared.advance(id: item.id, done: index, note: label) }
-                                                       },
-                                                       onTranscodeProgress: { fraction in
-                                                           progress.updateTranscodeProgress(roomKey: roomKey, direction: .upload,
-                                                                                            progress: globalFraction(fraction), fraction: fraction)
-                                                           Task { @MainActor in
-                                                               SyncTaskCenter.shared.advanceWithinFile(id: item.id, fileIndex: index, fraction: fraction)
-                                                           }
-                                                       },
-                                                       onBytes: { fraction in
-                                                           progress.update(roomKey: roomKey, direction: .upload,
-                                                                            progress: globalFraction(fraction), label: "上传中…")
-                                                           Task { @MainActor in
-                                                               SyncTaskCenter.shared.advanceWithinFile(id: item.id, fileIndex: index, fraction: fraction)
-                                                           }
-                                                       },
-                                                       onSpeed: { speed in
-                                                           progress.updateSpeed(bytesPerSecond: speed)
-                                                           Task { @MainActor in SyncTaskCenter.shared.updateSpeed(id: item.id, bytesPerSecond: speed) }
-                                                       })
+                guard FileManager.default.fileExists(atPath: localURL.path),
+                      let data = try? Data(contentsOf: localURL) else {
+                    // 本地文件已失：清队列条目，不再阻塞整房重试
+                    HouseMediaUploadQueue.remove(roomKey: roomKey, fileName: fileName)
+                    SyncTaskCenter.shared.advance(id: item.id, done: index + 1, total: files.count, note: "已跳过本地缺失文件")
+                    continue
+                }
+                _ = try await HouseRemoteClient.shared.uploadMedia(
+                    roomKey: roomKey, fileName: fileName, kind: kind, data: data)
                 HouseMediaUploadQueue.remove(roomKey: roomKey, fileName: fileName)
                 SyncTaskCenter.shared.advance(id: item.id, done: index + 1, total: files.count, note: "已上传 \(index + 1)/\(files.count)", currentFileFraction: 1)
-                progress.update(roomKey: roomKey, direction: .upload, progress: globalFraction(1), label: "已上传 \(index + 1)/\(files.count)")
+                progress.update(roomKey: roomKey, direction: .upload,
+                                progress: Double(index + 1) / Double(files.count), label: "已上传 \(index + 1)/\(files.count)")
             } catch {
                 failures.append(fileName)
-                SyncTaskCenter.shared.updateSpeed(id: item.id, bytesPerSecond: 0)
-                progress.updateSpeed(bytesPerSecond: 0)
             }
         }
         if failures.isEmpty {
-            // v2.57（P0-1/P1-7）：文件全传上后，按本地记录重写云端账本——当初保存时没敢写进账本
-            // 的文件名（防止他端误剔除），现在桶里已有对象，补上引用文件才不算桶孤儿；清单一并 flush。
+            // 文件全传上后，按本地记录重推服务器房源（带上媒体引用数组），清单与旧账本镜像不再补写
             var note = "已补传 \(files.count) 个媒体"
             var ledgerWritten = false
             if let ctx = houseContext {
                 let all = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
                 if let house = all.first(where: { $0.mediaRoomKey == roomKey && !$0.isTrashed }) {
-                    let record = CloudHouseSync.record(from: house, username: CloudUser.username)
                     do {
-                        _ = try await CloudHouseSync.uploadGuarded(record: record, removedMedia: [], config: config)
+                        _ = try await HouseSyncEngine.shared.pushHouse(house)
                         SyncFailStore.clear(roomKey)
-                        await CloudManifestUpdater.shared.flush()
-                        LocalHouseLedger.save(house)
                         ledgerWritten = true
-                        note += "，云端账本已补上这 \(files.count) 个"
+                        note += "，服务器账本已补上这 \(files.count) 个"
                     } catch {
                         completion(.failure(message: "媒体已传上，但账本没写上（\(error.localizedDescription)）；再点一次重试即可"))
                         return
                     }
                 }
             }
-            // v2.60：重试成功只写一条最终日志，去掉原来的「上传媒体 成功」+「补传后补写账本 成功」两条。
+            // v2.60：重试成功只写一条最终日志
             let action = retryLogAction(for: item)
             BackupLogStore.log(category: "房源", action: action, result: "成功",
                               detail: HouseMediaLogFormat.retryDetail(fileCount: files.count, ledgerWritten: ledgerWritten),
@@ -776,79 +748,67 @@ final class TaskRetryPerformer {
 
     /// 删云端媒体：本地已经删了，只补删云端对象（删不存在的对象是幂等，安全）
     private func retryMediaDelete(_ item: TaskRecord, completion: @escaping (TaskRetryOutcome) -> Void) async {
-        guard let config = CosConfig.load(), config.isValid else {
-            completion(.failure(message: "云端配置无效，请先到「云端配置」填写")); return
-        }
         let files = item.files ?? []
         guard !files.isEmpty, let roomKey = item.roomKeys.first else {
             completion(.failure(message: "没有记录到具体文件名，请到这套房的编辑页再删一次")); return
         }
         var failures: [String] = []
         for fileName in files {
-            let ext = (fileName as NSString).pathExtension.lowercased()
-            let kind = ["mov", "mp4", "m4v", "avi"].contains(ext) ? "video" : "image"
             do {
-                try await CosUploader.deleteRemoteMedia(fileName: fileName, kind: kind,
-                                                       roomKey: roomKey, config: config)
+                try await HouseRemoteClient.shared.deleteMedia(roomKey: roomKey, fileName: fileName)
             } catch {
                 failures.append(fileName)
             }
         }
         if failures.isEmpty {
-            completion(.success(note: "云端已删掉 \(files.count) 个媒体"))
+            completion(.success(note: "服务器已删掉 \(files.count) 个媒体"))
         } else {
             completion(.failure(message: "还有 \(failures.count) 个媒体没删掉，可再点重试"))
         }
     }
 
     private func retryCloudDelete(_ item: TaskRecord, completion: @escaping (TaskRetryOutcome) -> Void) async {
-        guard let config = CosConfig.load(), config.isValid else {
-            completion(.failure(message: "云端配置无效，请先到「云端配置」填写")); return
-        }
         var failures: [String] = []
         var localCleaned = 0
         for key in item.roomKeys {
+            let ctx = houseContext
+            let localHouse: House? = ctx.flatMap { c in
+                ((try? c.fetch(FetchDescriptor<House>())) ?? []).first(where: { $0.mediaRoomKey == key })
+            }
             do {
-                try await CloudBackupService.deleteHouseRemoteFolder(roomKey: key, config: config, writeLog: false)
-                try await CloudHouseSync.delete(roomKey: key, config: config)
-                // v2.57（P1-2）：云端删除是「先云后本」的把关步骤——云端删成功才清本地：
-                // 数据库记录、媒体目录、状态标记、待传队列一并清掉，完成整条删除闭环
-                // （含历史挂账：当年本地已删的房这里查不到对象，只清残留目录与标记，同样安全幂等）。
-                if let ctx = houseContext {
-                    let all = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
-                    if let h = all.first(where: { $0.mediaRoomKey == key }) {
-                        MediaStore.deleteHouseDirectory(roomKey: key)
-                        SyncFailStore.clear(key)
-                        UnreadCloudHouseStore.clear(key)
-                        ctx.delete(h)
-                        try? ctx.save()
-                        localCleaned += 1
-                    } else {
-                        MediaStore.deleteHouseDirectory(roomKey: key)
-                        SyncFailStore.clear(key)
-                        UnreadCloudHouseStore.clear(key)
-                    }
-                    HouseMediaUploadQueue.removeRoom(key)
-                    NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
+                if let h = localHouse, let ctx {
+                    // 服务器硬删成功后才清本地：数据库记录、媒体目录、状态标记、待传队列一并清掉
+                    try await HouseSyncEngine.shared.pushDelete(h)
+                    MediaStore.deleteHouseDirectory(roomKey: key)
+                    SyncFailStore.clear(key)
+                    UnreadCloudHouseStore.clear(key)
+                    ctx.delete(h)
+                    try? ctx.save()
+                    localCleaned += 1
+                } else {
+                    // 本地已无记录：服务器记录直接硬删，清残留目录与标记，同样安全幂等
+                    try await HouseRemoteClient.shared.delete(key)
+                    MediaStore.deleteHouseDirectory(roomKey: key)
+                    SyncFailStore.clear(key)
+                    UnreadCloudHouseStore.clear(key)
                 }
+                HouseMediaUploadQueue.removeRoom(key)
+                NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
             } catch {
-                // v2.57（P3-18）：失败带完整原因（String(describing:) 含错误类型，不吃细节），标明删到哪一步失败
+                // 失败带完整原因，标明删到哪一步失败
                 failures.append("\(key)：\(String(describing: error))")
             }
         }
         if failures.isEmpty {
-            completion(.success(note: "云端已删除 \(item.roomKeys.count) 套" + (localCleaned > 0 ? "，本地残留已清 \(localCleaned) 套" : "")))
+            completion(.success(note: "服务器已删除 \(item.roomKeys.count) 套" + (localCleaned > 0 ? "，本地残留已清 \(localCleaned) 套" : "")))
         } else {
-            completion(.failure(message: "这几套云端还没删掉（本地保留）：\(failures.joined(separator: "；"))"))
+            completion(.failure(message: "这几套服务器上还没删掉（本地保留）：\(failures.joined(separator: "；"))"))
         }
     }
 
     private func retryPushUp(_ item: TaskRecord, completion: @escaping (TaskRetryOutcome) -> Void) async {
         guard let ctx = houseContext else {
             completion(.failure(message: "数据容器不可用，请重进 App 再试")); return
-        }
-        guard let config = CosConfig.load(), config.isValid else {
-            completion(.failure(message: "云端配置无效，请先到「云端配置」填写")); return
         }
         let local = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
         var byKey: [String: House] = [:]
@@ -859,10 +819,8 @@ final class TaskRetryPerformer {
                 SyncFailStore.clear(key)
                 continue
             }
-            let record = CloudHouseSync.record(from: house, username: CloudUser.username)
-            LocalHouseLedger.save(house)
             do {
-                _ = try await CloudHouseSync.uploadGuarded(record: record, config: config)
+                _ = try await HouseSyncEngine.shared.pushHouse(house)
                 SyncFailStore.clear(key)
                 house.cloudStatus = .both
             } catch {
@@ -871,7 +829,7 @@ final class TaskRetryPerformer {
         }
         try? ctx.save()
         if failures.isEmpty {
-            completion(.success(note: "已传到云端 \(item.roomKeys.count) 套"))
+            completion(.success(note: "已传到服务器 \(item.roomKeys.count) 套"))
         } else {
             completion(.failure(message: "这几套没传上：\(failures.joined(separator: "、"))"))
         }
@@ -881,9 +839,6 @@ final class TaskRetryPerformer {
         guard let ctx = houseContext else {
             completion(.failure(message: "数据容器不可用，请重进 App 再试")); return
         }
-        guard let config = CosConfig.load(), config.isValid else {
-            completion(.failure(message: "云端配置无效，请先到「云端配置」填写")); return
-        }
         let local = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
         var byKey: [String: House] = [:]
         for h in local where !h.isTrashed { byKey[h.mediaRoomKey] = h }
@@ -892,32 +847,28 @@ final class TaskRetryPerformer {
             guard let house = byKey[key] else { continue }
             let files = house.mediaItems.map { ShareMediaFile(name: $0.fileName, kind: $0.kind) }
             guard !files.isEmpty else { continue }
-            let profile = CosUploader.loadShareProfile()
-            let info = ShareHouseInfo(
-                displayRoomNo: house.displayRoomNo, towerLabel: house.towerLabel,
-                layout: house.layout, statusLabel: house.status.label, priceText: house.priceText,
-                landlord: house.landlord, password: house.password, remark: house.remark,
-                name: profile.name, phone: profile.phone)
             do {
-                _ = try await CosUploader.autoRegenerateMaskedShare(
-                    mediaFiles: files, roomKey: key, info: info, config: config)
-                // 只把这条任务里的文件从待上传登记簿摘掉，别一把清空（同房其他文件可能还没传）
-                for fileName in (item.files ?? files.map { $0.name }) {
-                    HouseMediaUploadQueue.remove(roomKey: key, fileName: fileName)
+                for media in files {
+                    let localURL = MediaStore.url(for: media.name, roomKey: key)
+                    guard FileManager.default.fileExists(atPath: localURL.path),
+                          let data = try? Data(contentsOf: localURL) else {
+                        // 本地文件已失：清队列条目，不再阻塞整房重试
+                        HouseMediaUploadQueue.remove(roomKey: key, fileName: media.name)
+                        continue
+                    }
+                    _ = try await HouseRemoteClient.shared.uploadMedia(
+                        roomKey: key, fileName: media.name, kind: media.kind, data: data)
+                    // 只把这条任务里的文件从待上传登记簿摘掉，别一把清空（同房其他文件可能还没传）
+                    HouseMediaUploadQueue.remove(roomKey: key, fileName: media.name)
                 }
-                // v2.57（P0-1/P1-7）：分享重传成功后同样补写账本引用（当初没敢写的名字现在补上），清单 flush
-                let record = CloudHouseSync.record(from: house, username: CloudUser.username)
+                // 媒体传完后补推房源引用；账本补写失败不判整房失败，提示再点一次
                 do {
-                    _ = try await CloudHouseSync.uploadGuarded(record: record, removedMedia: [], config: config)
+                    _ = try await HouseSyncEngine.shared.pushHouse(house)
                     SyncFailStore.clear(key)
-                    await CloudManifestUpdater.shared.flush()
-                    LocalHouseLedger.save(house)
                 } catch {
-                    // 账本补写失败不判整个任务失败（分享页已生成）；提示用户再点一次
                     failures.append("\(key)（媒体已传上，账本没写上）")
                 }
             } catch {
-                // v2.57（P3-18）：失败带完整原因，方便定位是网络、权限还是转码问题
                 failures.append("\(key)：\(String(describing: error))")
             }
         }
