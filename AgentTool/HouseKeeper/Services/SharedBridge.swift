@@ -29,6 +29,8 @@ enum SharedBridge {
 
     /// 主 App 调用：把非敏感配置镜像进共享区（启动 / 回前台 / 退后台 / 设置变更时）。
     /// 用户名与云函数地址的 setter 已直写共享区，这里兜底覆盖钥匙串旧值等边角。
+    /// 标注 MainActor：需访问 NotifyHub/MeterCloudSync/MeterStore 等 @MainActor 单例的隔离属性。
+    @MainActor
     static func writeMirrors() {
         guard !isExtension else { return }
         let d = defaults
