@@ -2709,6 +2709,20 @@ struct StorageSettingsPage: View {
                 } label: {
                     Label("打开「文件」App 查看数据文件夹", systemImage: "folder")
                 }
+                NavigationLink {
+                    DataPathDiagnosticsView()
+                } label: {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("数据路径诊断")
+                            Text("主库/房源库真实路径、SHA256 指纹、App Group 与跨 App 探针")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: "doc.text.magnifyingglass")
+                    }
+                }
             } header: {
                 Text("存储与清理")
             } footer: {
