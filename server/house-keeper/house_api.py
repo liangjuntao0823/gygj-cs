@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import threading
+import time
 import urllib.parse
 from typing import Any
 
@@ -29,6 +30,10 @@ PREFIX = "/api/house"
 PUBLIC_PREFIX = "/api/public"
 # 媒体上传上限 60MB（图片 / 视频）
 MEDIA_BODY_LIMIT = 60 * 1024 * 1024
+# 备份 zip 上传上限 200MB（全量备份含媒体镜像，体积大于单条媒体）
+BACKUP_BODY_LIMIT = 200 * 1024 * 1024
+# 备份目录归属：当前单库固定 default；阶段 D 可按令牌隔离
+BACKUP_OWNER = "default"
 
 
 def _q(handler: Any) -> dict[str, str]:
@@ -216,6 +221,49 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
                 room_key, file_name = segs[0], segs[1]
                 store.media.delete_house_media(room_key, file_name)
                 return send(200, {"ok": True, "deleted": file_name})
+            return send(405, {"ok": False, "error": "method_not_allowed"})
+
+        # ---- 备份 zip（服务器磁盘；替代旧 COS backups/ 目录）----
+        if path == f"{PREFIX}/backups" and method == "GET":
+            if not handler._require_auth():
+                return True
+            return send(200, {"ok": True,
+                              "backups": store.backups.list_backups(BACKUP_OWNER)})
+
+        if path == f"{PREFIX}/backups" and method == "POST":
+            if not handler._require_auth():
+                return True
+            file_name = handler.headers.get("X-Backup-Name") or _q(handler).get("name", "")
+            is_auto = (handler.headers.get("X-Is-Auto") or "").lower() in ("1", "true", "yes")
+            data = read_raw(BACKUP_BODY_LIMIT)
+            if data is None:
+                return send(400, {"ok": False, "error": "bad_or_too_large"})
+            if not file_name:
+                file_name = f"backup-{int(time.time())}.zip"
+            try:
+                record = store.backups.save(BACKUP_OWNER, file_name, data, is_auto)
+            except ValueError as e:
+                return send(400, {"ok": False, "error": str(e)})
+            return send(200, {"ok": True, "record": record})
+
+        if path.startswith(f"{PREFIX}/backups/"):
+            if not handler._require_auth():
+                return True
+            rest = urllib.parse.unquote(path[len(f"{PREFIX}/backups/"):])
+            segs = [s for s in rest.strip("/").split("/") if s]
+            if len(segs) != 1:
+                return send(404, {"ok": False, "error": "not_found"})
+            name = segs[0]
+            if method == "GET":
+                data = store.backups.read(BACKUP_OWNER, name)
+                if data is None:
+                    return send(404, {"ok": False, "error": "not_found"})
+                return send_file(200, data, "application/zip", download_name=name)
+            if method == "DELETE":
+                deleted = store.backups.delete(BACKUP_OWNER, name)
+                if not deleted:
+                    return send(404, {"ok": False, "error": "not_found"})
+                return send(200, {"ok": True, "deleted": name})
             return send(405, {"ok": False, "error": "method_not_allowed"})
 
 

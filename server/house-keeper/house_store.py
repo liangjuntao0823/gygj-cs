@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import media_store as ms
+import backup_store as bs
 
 # 字段键 -> 中文名（账本与推送展示）
 FIELD_LABELS: dict[str, str] = {
@@ -169,10 +170,12 @@ def _display(field: str, value: Any) -> str:
 class HouseStore:
     """SQLite 房源权威存储；线程安全（连接 check_same_thread=False + 全局锁）。"""
 
-    def __init__(self, db_path: str | Path, media_root: str | Path | None = None):
+    def __init__(self, db_path: str | Path, media_root: str | Path | None = None,
+                 backup_root: str | Path | None = None):
         self.path = Path(db_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.media = ms.MediaStore(media_root or (self.path.parent / "media"))
+        self.backups = bs.BackupStore(backup_root or (self.path.parent / "backups"))
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row

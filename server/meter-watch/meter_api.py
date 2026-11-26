@@ -469,7 +469,9 @@ def serve(store: mw.Store, engine: mw.Engine) -> int:
     import os
     house_db = str(store.home / os.environ.get("HOUSE_DB", "house_v2.db"))
     house_media = str(store.home / os.environ.get("HOUSE_MEDIA_DIR", "media_v2"))
-    house_store = hs.HouseStore(house_db, media_root=house_media)
+    house_backup = str(store.home / os.environ.get("HOUSE_BACKUP_DIR", "backups_v2"))
+    house_store = hs.HouseStore(house_db, media_root=house_media,
+                                backup_root=house_backup)
 
     # 管理后台：鉴权会话 + 服务器看板 + 电表值守 + 房源管理，复用现有 store/hub/house_store
     admin_auth = aauth.AdminAuth(store.home)
