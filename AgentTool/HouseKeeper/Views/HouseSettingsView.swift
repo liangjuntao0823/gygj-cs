@@ -205,7 +205,6 @@ struct CosConfigView: View {
     // v1.34：文件备份 / 恢复 + 清空配置（v1.35：备份直写「备份」文件夹；v1.36：恢复改为列表选择）
     @State private var showRestoreList = false
     @State private var confirmClear = false
-    @State private var showBrowseConfig = false   // v1.7：查看 COS 配置备份文件（内部浏览组件，只读）
     // 房源服务器（8082 权威库）地址与状态
     @State private var endpointInput = ""
     @State private var serverTip: String?
@@ -490,12 +489,6 @@ struct CosConfigView: View {
                 } label: {
                     Label("从备份文件恢复配置", systemImage: "square.and.arrow.down")
                 }
-                // v1.7：查看配置备份文件（内部浏览组件，只读；与恢复选文件同款窗口）
-                Button {
-                    showBrowseConfig = true
-                } label: {
-                    Label("查看配置备份", systemImage: "folder")
-                }
                 // v1.34：清空全部配置并断开与桶的连接
                 Button(role: .destructive) {
                     confirmClear = true
@@ -539,9 +532,6 @@ struct CosConfigView: View {
                     handleRestoreFile(url)
                 }
             )
-        }
-        .sheet(isPresented: $showBrowseConfig) {
-            CosBackupBrowseView()
         }
         .alert("配置结果", isPresented: Binding(
             get: { savedTip != nil },
@@ -1030,143 +1020,6 @@ struct ConfigRestoreListView: View {
     }
 }
 
-// MARK: - v1.7 查看 COS 配置备份文件（内部浏览组件，v1.11 支持左滑删除 + 二级确认）
-
-/// 列出「备份」文件夹根目录的 .json 配置备份文件（桶名_地域_日期.json），v1.11 起支持左滑删除（带二级确认）。
-struct CosBackupBrowseView: View {
-    @Environment(\.dismiss) private var dismiss
-    @State private var files: [ConfigBackupFileEntry] = []
-    @State private var deleteTarget: ConfigBackupFileEntry? = nil
-    @State private var showDeleteConfirm = false
-    @State private var deleteResultTip: String? = nil
-
-    var body: some View {
-        NavigationStack {
-            Group {
-                if files.isEmpty {
-                    VStack(spacing: 12) {
-                        Image(systemName: "tray")
-                            .font(.system(size: 44))
-                            .foregroundColor(.secondary)
-                        Text("还没有配置备份文件")
-                            .font(.headline)
-                        Text("点「备份配置到文件」生成后，备份文件会出现在这里（桶名_地域_日期.json）")
-                            .font(.footnote)
-                            .foregroundColor(.secondary)
-                            .multilineTextAlignment(.center)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    List {
-                        Section("配置备份文件") {
-                            ForEach(files) { file in
-                                VStack(alignment: .leading, spacing: 4) {
-                                    HStack {
-                                        Text(file.name)
-                                            .font(.subheadline.weight(.medium))
-                                            .lineLimit(1)
-                                        Spacer()
-                                        Text(file.sizeText)
-                                            .font(.footnote)
-                                            .foregroundColor(.secondary)
-                                    }
-                                    Text(file.dateText)
-                                        .font(.footnote)
-                                        .foregroundColor(.secondary)
-                                }
-                                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                                    Button(role: .destructive) {
-                                        deleteTarget = file
-                                        showDeleteConfirm = true
-                                    } label: {
-                                        Label("删除", systemImage: "trash")
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    .listStyle(.insetGrouped)
-                }
-            }
-            .navigationTitle("配置备份文件")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("关闭") { dismiss() }
-                }
-            }
-            .confirmationDialog(
-                "删除配置备份文件？",
-                isPresented: $showDeleteConfirm,
-                titleVisibility: .visible,
-                presenting: deleteTarget
-            ) { file in
-                Button("删除", role: .destructive) { performDelete(file) }
-                Button("取消", role: .cancel) {}
-            } message: { file in
-                Text("「\(file.name)」将被永久删除，删除后无法恢复。")
-            }
-            .alert("删除配置备份文件", isPresented: Binding(
-                get: { deleteResultTip != nil },
-                set: { if !$0 { deleteResultTip = nil } }
-            )) {
-                Button("好", role: .cancel) {}
-            } message: {
-                Text(deleteResultTip ?? "")
-            }
-            .onAppear(perform: loadFiles)
-        }
-    }
-
-    /// v1.13 需求16：配置备份文件收拢在 备份/CosConfig/；兼容扫描旧位置（备份/ 根目录残留 json）
-    private func loadFiles() {
-        var entries: [ConfigBackupFileEntry] = []
-        for dir in [CosConfigStore.directory(), DataRoot.url()] {
-            let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
-            for name in names where name.hasSuffix(".json") {
-                let url = dir.appendingPathComponent(name)
-                // 同一文件已收录（如迁移未完成导致的重复），跳过
-                if entries.contains(where: { $0.url.path == url.path }) { continue }
-                let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
-                let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
-                let date = attrs?[.modificationDate] as? Date ?? .distantPast
-                entries.append(ConfigBackupFileEntry(
-                    name: name,
-                    sizeText: ByteCountFormatter.string(fromByteCount: size, countStyle: .file),
-                    dateText: Self.dateFormatter.string(from: date),
-                    url: url
-                ))
-            }
-        }
-        entries.sort { $0.dateText > $1.dateText }
-        files = entries
-    }
-
-    private func performDelete(_ file: ConfigBackupFileEntry) {
-        do {
-            try FileManager.default.removeItem(at: file.url)
-            deleteResultTip = "已删除「\(file.name)」"
-            loadFiles()
-        } catch {
-            deleteResultTip = "删除失败，请检查文件权限后重试"
-        }
-    }
-
-    private static let dateFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd HH:mm"
-        f.locale = Locale(identifier: "zh_CN")
-        return f
-    }()
-}
-
-struct ConfigBackupFileEntry: Identifiable {
-    let id = UUID()
-    let name: String
-    let sizeText: String
-    let dateText: String
-    let url: URL
-}
 
 // MARK: - 名片信息
 
