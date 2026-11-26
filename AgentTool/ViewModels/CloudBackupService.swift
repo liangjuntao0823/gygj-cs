@@ -113,6 +113,7 @@ final class CloudBackupService {
     // MARK: - 上传
 
     /// 上传备份 zip 到服务器（整体上传；媒体已包含在 zip 内，不再单独传媒体镜像）
+#if !APP_EXTENSION
     static func uploadZip(url: URL, progress: @escaping (Double) -> Void) async throws {
         let name = url.lastPathComponent
         let data = try Data(contentsOf: url)
@@ -120,6 +121,13 @@ final class CloudBackupService {
         try await HouseRemoteClient.shared.uploadBackup(name: name, data: data, isAuto: false)
         progress(1.0)
     }
+#else
+    // 分享扩展不参与备份上传；保留壳避免扩展 target 编译断裂
+    static func uploadZip(url: URL, progress: @escaping (Double) -> Void) async throws {
+        throw NSError(domain: "CloudBackupService", code: 0,
+                      userInfo: [NSLocalizedDescriptionKey: "分享扩展不参与备份上传"])
+    }
+#endif
 
 #if !APP_EXTENSION
     /// 全量备份媒体镜像增量（旧 COS sha1 去重镜像）：服务器架构下媒体已含在全量 zip 内，
@@ -185,6 +193,7 @@ final class CloudBackupService {
     /// 实时刷新服务器备份清单并同步到本地权威记录。
     /// 以服务器返回清单为准重建 cloudRecords：服务器真实存在的 → 记录；已删除的 → 本地记录同步移除。
     /// isAuto 优先取服务器标记，缺省时按文件名含「_自动」后缀兜底判定。
+#if !APP_EXTENSION
     static func refreshCloudRecords() async throws {
         let remote = try await HouseRemoteClient.shared.listBackups()
         var records: [CloudRecord] = []
@@ -202,12 +211,22 @@ final class CloudBackupService {
             UserDefaults.standard.set(data, forKey: recordsKey)
         }
     }
+#else
+    // 分享扩展不连接服务器备份面板；空壳避免扩展 target 编译断裂
+    static func refreshCloudRecords() async throws {}
+#endif
 
     /// 删除服务器备份 zip
+#if !APP_EXTENSION
     static func deleteRemoteBackup(name: String) async throws {
         try await HouseRemoteClient.shared.deleteBackup(name: name)
         removeCloudRecord(name: name)
     }
+#else
+    static func deleteRemoteBackup(name: String) async throws {
+        removeCloudRecord(name: name)
+    }
+#endif
 
     // MARK: - v1.13 需求19：删除房源在桶里的整个文件夹 h/<roomKey>/
 
