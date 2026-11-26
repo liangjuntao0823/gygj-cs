@@ -65,40 +65,13 @@ struct HouseDetailView: View {
     //        修复「文件已下载但详情页仍显示空白占位，需重进 App 才显示」的问题
     @State private var mediaRefreshTick = 0
 
-    // MARK: - v2.39 多设备同步防护
-    /// 最近一次单房检测结果（进详情自动检测 + 右上角手动刷新共用）
-    @State private var cloudState: HouseCloudState?
-    @State private var isCheckingCloud = false
-    /// 检测失败（弱网/断网）时的顶部提示，不等于「没有更新」
-    @State private var cloudCheckHint: String?
-    @State private var showCloudUpdateAlert = false
-    @State private var cloudUpdateDiffs: [String] = []
-    @State private var pendingCloudRecord: CloudHouseRecord?
-    @State private var showCannotEditAlert = false
+    /// 单房刷新/更新结果轻提示（通用 toast）
     @State private var cloudToast: String?
 
     // v1.19：把滚动主体拆为独立子视图，避免 Swift 编译器对整个 body 一次类型检查超时
     private var detailScroll: some View {
         ScrollView {
             VStack(spacing: 14) {
-                // v2.39：检测失败（弱网/断网）时的常驻提示——不能把「检测不了」当成「没有更新」
-                if let hint = cloudCheckHint {
-                    HStack(spacing: 6) {
-                        Image(systemName: "wifi.exclamationmark")
-                            .foregroundColor(.orange)
-                        Text(hint)
-                            .font(.footnote)
-                            .foregroundColor(.orange)
-                        Spacer()
-                        Button("重试") { Task { await refreshSingleHouse() } }
-                            .font(.footnote.weight(.semibold))
-                            .foregroundColor(.orange)
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(Color.orange.opacity(0.12))
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                }
                 // v1.44：mediaRefreshTick 变化时强制重建媒体区（自动补缺下载完成后即时显示）
                 mediaSection.id(mediaRefreshTick)
                 infoCard
@@ -197,20 +170,14 @@ struct HouseDetailView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     HStack(spacing: 14) {
-                        // v2.39：单房刷新——只拉这一套的 info.json，不碰其他房源
                         Button {
                             Task { await refreshSingleHouse() }
                         } label: {
-                            if isCheckingCloud {
-                                ProgressView().controlSize(.small)
-                            } else {
-                                Image(systemName: "arrow.clockwise")
-                            }
+                            Image(systemName: "arrow.clockwise")
                         }
-                        .disabled(isCheckingCloud)
-                        .accessibilityLabel("刷新本房云端数据")
+                        .accessibilityLabel("刷新本房")
 
-                        Button("编辑") { openEditor() }
+                        Button("编辑") { showEdit = true }
                     }
                 }
             }
@@ -290,8 +257,6 @@ struct HouseDetailView: View {
             repairMissingMediaIfNeeded()
             // v2.20：进来一次就算已读，房源卡片红框消失
             UnreadCloudHouseStore.clear(house.mediaRoomKey)
-            // v2.39：进详情自动检测云端是否有更新（有更新弹「更新/忽略」，无更新不提示）
-            Task { await checkCloudOnEnter() }
         }
         // v1.44：收到房源数据变更通知（下载完成/编辑保存等）→ 触发媒体区重建，下载后立即显示
         .onReceive(NotificationCenter.default.publisher(for: HouseListView.houseStoreChanged)) { _ in
@@ -354,23 +319,6 @@ struct HouseDetailView: View {
         // v2.53：有变化（含仅媒体变化）→ 详细「本地 vs 云端」差异，确认同步 / 取消
         // v2.57（P1-6）：本机有改动还没传上（SyncFail）时一并警告——此时按云端覆盖会把
         // 没传上去的本机改动（含没传上的媒体）一并丢掉，必须先补传或明确放弃再同步。
-        .alert("本地 vs 云端有差异", isPresented: $showCloudUpdateAlert) {
-            Button("确认同步") { applyCloudUpdate() }
-            Button("取消", role: .cancel) { pendingCloudRecord = nil }
-        } message: {
-            Text(cloudUpdateDiffs.joined(separator: "\n")
-                 + (SyncFailStore.isFailed(house.mediaRoomKey)
-                    ? "\n\n⚠️ 这套房本机还有改动没传上云端（同步失败待补传）。现在按云端覆盖，这些改动和没传上的媒体会被丢掉。建议先到同步任务中心把本机改动补传成功，再回来同步。"
-                    : "")
-                 + "\n\n点「确认同步」按云端更新本地；点「取消」保持本机现状。")
-        }
-        // v2.39：旧数据不许进编辑（保存前还有第二道强校验）
-        .alert("请先同步云端", isPresented: $showCannotEditAlert) {
-            Button("立即同步") { Task { await refreshSingleHouse() } }
-            Button("取消", role: .cancel) {}
-        } message: {
-            Text("这套房的云端数据已被其他设备更新，直接编辑会在保存时被拦下。\n请先点「立即同步」拉取最新数据，再重新编辑。")
-        }
         // v2.39：单房刷新/更新结果轻提示
         .overlay(alignment: .bottom) {
             if let t = cloudToast {
@@ -821,92 +769,14 @@ struct HouseDetailView: View {
         }
     }
 
-    // MARK: - v2.39 单房云端检测 / 更新 / 编辑入口
+    // MARK: - 单房刷新
 
-    /// 进详情自动检测：旧 COS 字段对比检测已下线，进详情不再跑旧链路检测或覆盖告警
-    @MainActor
-    private func checkCloudOnEnter() async {
-        // 服务器下行/冲突检测由同步引擎与 pushHouse 乐观锁承接，本方法保留为占位入口
-    }
-
-    /// 右上角单房刷新：旧桶 info.json 拉取检测已下线
+    /// 右上角单房刷新：旧桶 info.json 拉取检测已下线；服务器下行由同步引擎承接
     @MainActor
     private func refreshSingleHouse() async {
         if HouseServerMode.ready {
             showCloudToast("服务器模式：以服务器房源为准")
         }
-    }
-
-    @MainActor
-    private func runCloudCheck(useCache: Bool, silentWhenFresh: Bool) async {
-        if HouseServerMode.ready { return }
-        guard let config = CosConfig.load(), config.isValid else { return }
-        guard !isCheckingCloud else { return }
-        isCheckingCloud = true
-        let state = await HouseSyncGuard.check(house: house, config: config, useCache: useCache)
-        isCheckingCloud = false
-        cloudState = state
-        switch state {
-        case .updated(let rec, let diffs):
-            cloudCheckHint = nil
-            pendingCloudRecord = rec
-            cloudUpdateDiffs = cloudChangeLines(rec: rec, fieldDiffs: diffs)
-            showCloudUpdateAlert = true
-        case .unknown(let msg):
-            // 检测失败 ≠ 没有更新：常驻提示 + 可重试
-            cloudCheckHint = "云端检测失败（\(msg)），本机数据可能不是最新。"
-        case .fresh:
-            cloudCheckHint = nil
-            if !silentWhenFresh { showCloudToast("已是最新") }
-        case .mediaOnly(let rec):
-            cloudCheckHint = nil
-            if silentWhenFresh {
-                // 进详情自动检测：仅媒体变化不阻断编辑、保存时自动合并，保持静默不弹窗
-            } else {
-                // v2.53：手动刷新时仅媒体变化也弹详细差异 + 确认同步/取消，不再只 toast
-                pendingCloudRecord = rec
-                cloudUpdateDiffs = cloudChangeLines(rec: rec, fieldDiffs: [])
-                showCloudUpdateAlert = true
-            }
-        case .missing:
-            cloudCheckHint = nil
-            if !silentWhenFresh { showCloudToast("云端没有这套房（仅本机）") }
-        }
-    }
-
-    /// v2.53：构造「本地 vs 云端」详细差异行：字段差异 + 媒体（云端有本地无 / 本地有云端无）
-    @MainActor
-    private func cloudChangeLines(rec: CloudHouseRecord, fieldDiffs: [String]) -> [String] {
-        var lines: [String] = []
-        if !fieldDiffs.isEmpty {
-            lines.append("【字段差异】（本地 → 云端）")
-            lines.append(contentsOf: fieldDiffs)
-        }
-        let md = HouseSyncGuard.mediaDiff(record: rec, house: house)
-        if !md.added.isEmpty {
-            lines.append("【云端有、本地没有，同步后会下载】")
-            lines.append(contentsOf: md.added.map { "＋\($0)" })
-        }
-        if !md.removed.isEmpty {
-            lines.append("【本地有、云端没有，同步后会移除】")
-            lines.append(contentsOf: md.removed.map { "－\($0)" })
-        }
-        if lines.isEmpty { lines.append("内容一致，无差异") }
-        return lines
-    }
-
-    /// 点「更新」：旧桶字段覆盖 + 媒体补缺/删除已下线，服务器下行由同步引擎承接
-    private func applyCloudUpdate() {
-        pendingCloudRecord = nil
-    }
-
-    /// 编辑入口：字段有冲突就先拦下（保存时还有第二道强校验兜底）
-    private func openEditor() {
-        if let st = cloudState, st.hasFieldConflict {
-            showCannotEditAlert = true
-            return
-        }
-        showEdit = true
     }
 
     @MainActor
