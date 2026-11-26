@@ -804,9 +804,7 @@ struct DashboardView: View {
             QuickActionEditSheet(dashOrder: $qaDashOrder, moreOrder: $qaMoreOrder)
         }
         .sheet(isPresented: $showAdmin) {
-            // v1.37：App 内管理后台改用原生后台（获客分析/分享记录/桶管理），完全免登录、不走网页、无缓存问题；
-            // 需要手机/电脑自适应网页版时，在原生后台右上角「safari」一键跳浏览器（带免登录口令）
-            AdminDashboardView()
+            NavigationStack { RemoteConfigAdminView() }
         }
         .sheet(isPresented: $showAddDeal) {
             NavigationStack { AddDealView() }
