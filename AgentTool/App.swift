@@ -123,7 +123,116 @@ struct AgentToolApp: App {
         }
     }
 
-    /// 创建两个持久化 ModelContainer（主 App 经营数据 → 默认 store；房源数据 → Documents/备份/housekeeper.store）
+    /// 主库位置：钉死到本 App 容器内的独立文件，避免不同 App 共用同一份 SwiftData 默认库。
+    /// 背景：新旧 App 出现「经营数据条数完全一致、卸载新版旧版数据一起清空」的共用库现象；
+    /// 这里把主库固定到 NSHomeDirectory()/Library/Application Support/AgentToolMain.store，
+    /// 首次升级时把当前默认库（或旧共用库）复制过来，源文件保留不删；找不到源库则返回 nil，
+    /// 继续走系统默认，绝不用空库覆盖用户数据。
+    enum MainStoreLocation {
+        static let fileName = "AgentToolMain.store"
+        private static let migratedFromKey = "diag.mainStoreMigratedFrom"
+
+        static var migratedFrom: String {
+            UserDefaults.standard.string(forKey: migratedFromKey) ?? ""
+        }
+
+        static func perAppURL() -> URL {
+            let home = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+            let dir = home.appendingPathComponent("Library/Application Support", isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            return dir.appendingPathComponent(fileName)
+        }
+
+        private static func size(_ url: URL) -> Int64 {
+            ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.int64Value ?? 0
+        }
+
+        private static func mtime(_ url: URL) -> Date {
+            ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date) ?? .distantPast
+        }
+
+        private static func candidates(schema: Schema) -> [URL] {
+            var list: [URL] = []
+            // SwiftData 默认配置实际会用的 URL（最权威）
+            list.append(ModelConfiguration(schema: schema).url)
+            let fm = FileManager.default
+            if let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+                list.append(base.appendingPathComponent("default.store"))
+                list.append(base.appendingPathComponent(fileName))
+            }
+            // 无沙盒/异常签名时可能落到系统共享目录
+            list.append(URL(fileURLWithPath: "/var/mobile/Library/Application Support/default.store"))
+            if let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first {
+                list.append(docs.appendingPathComponent("default.store"))
+            }
+            for group in ["group.com.gj.tg.shared", "group.com.gj.tg2.shared"] {
+                if let c = fm.containerURL(forSecurityApplicationGroupIdentifier: group) {
+                    list.append(c.appendingPathComponent("default.store"))
+                }
+            }
+            // 兜底：无沙盒/TrollStore 环境下枚举所有 App 容器与 App Group 容器，
+            // 找出真正被两个 App 共用的 default.store（正常沙盒下枚举会失败，无副作用）。
+            let appDirs = (try? fm.contentsOfDirectory(atPath: "/var/mobile/Containers/Data/Application")) ?? []
+            for d in appDirs {
+                guard let bid = containerIdentifier("/var/mobile/Containers/Data/Application/\(d)"),
+                      ["com.gj.tg", "com.gj.tg2"].contains(bid) else { continue }
+                let base = URL(fileURLWithPath: "/var/mobile/Containers/Data/Application/\(d)/Library/Application Support")
+                list.append(base.appendingPathComponent("default.store"))
+            }
+            let groupDirs = (try? fm.contentsOfDirectory(atPath: "/var/mobile/Containers/Shared/AppGroup")) ?? []
+            for d in groupDirs {
+                guard let gid = containerIdentifier("/var/mobile/Containers/Shared/AppGroup/\(d)"),
+                      ["group.com.gj.tg.shared", "group.com.gj.tg2.shared"].contains(gid) else { continue }
+                list.append(URL(fileURLWithPath: "/var/mobile/Containers/Shared/AppGroup/\(d)").appendingPathComponent("default.store"))
+            }
+            return list
+        }
+
+        /// 读取容器元数据里的 MCMMetadataIdentifier，避免误拷其它 App 的 default.store。
+        private static func containerIdentifier(_ dir: String) -> String? {
+            let meta = URL(fileURLWithPath: dir).appendingPathComponent(".com.apple.mobile_container_manager.metadata.plist")
+            guard let data = try? Data(contentsOf: meta),
+                  let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any]
+            else { return nil }
+            return plist["MCMMetadataIdentifier"] as? String
+        }
+
+        private static func isSQLite(_ url: URL) -> Bool {
+            guard let h = try? FileHandle(forReadingFrom: url) else { return false }
+            defer { try? h.close() }
+            let head = h.readData(ofLength: 16)
+            return head == Data("SQLite format 3\u{0}".utf8)
+        }
+
+        /// 返回应使用的主库 URL；找不到可复用数据时返回 nil（继续走系统默认，避免空库覆盖）。
+        static func prepare(schema: Schema) -> URL? {
+            let fm = FileManager.default
+            let dest = perAppURL()
+            if fm.fileExists(atPath: dest.path) {
+                if size(dest) > 0 { return dest }
+                try? fm.removeItem(at: dest)
+            }
+            let existing = candidates(schema: schema)
+                .filter { $0.path != dest.path && fm.fileExists(atPath: $0.path) && size($0) > 20_000 && isSQLite($0) }
+            guard let src = existing.max(by: { mtime($0) < mtime($1) }) else { return nil }
+            do {
+                for suffix in ["", "-wal", "-shm"] {
+                    let s = URL(fileURLWithPath: src.path + suffix)
+                    let d = URL(fileURLWithPath: dest.path + suffix)
+                    guard fm.fileExists(atPath: s.path) else { continue }
+                    if fm.fileExists(atPath: d.path) { try? fm.removeItem(at: d) }
+                    try fm.copyItem(at: s, to: d)
+                }
+                guard size(dest) > 0 else { return nil }
+                UserDefaults.standard.set(src.path, forKey: migratedFromKey)
+                return dest
+            } catch {
+                return nil
+            }
+        }
+    }
+
+    /// 创建两个持久化 ModelContainer（主 App 经营数据 → 容器内 AgentToolMain.store；房源数据 → Documents/备份/housekeeper.store）
     private static func makePersistentContainers() throws -> (ModelContainer, ModelContainer) {
         let mainSchema = Schema([
             Property.self, RentMonthRecord.self, UtilityQuarterRecord.self, UtilitySettlementRecord.self, TodoItem.self,
@@ -131,7 +240,15 @@ struct AgentToolApp: App {
             PayoutRecord.self, PayoutMonthRecord.self, PayoutUtilityRecord.self, UtilitySettlementHistory.self
         ])
         let houseSchema = Schema([House.self, MediaItem.self])
-        let main = try ModelContainer(for: mainSchema)
+        let main: ModelContainer
+        if let url = MainStoreLocation.prepare(schema: mainSchema) {
+            main = try ModelContainer(for: mainSchema, configurations: [
+                ModelConfiguration("MainStore", schema: mainSchema, url: url)
+            ])
+        } else {
+            // 找不到可迁移的旧库：保持原行为，宁可继续共用也不凭空建空库
+            main = try ModelContainer(for: mainSchema)
+        }
         let house = try ModelContainer(for: houseSchema, configurations: [
             ModelConfiguration("HouseStore", schema: houseSchema, url: DataRoot.url().appendingPathComponent("housekeeper.store"))
         ])

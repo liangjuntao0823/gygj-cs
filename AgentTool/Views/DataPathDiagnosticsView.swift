@@ -100,7 +100,11 @@ struct DataPathDiagnosticsView: View {
 
     private var mainStoreSection: some View {
         Section {
-            diagRow("路径", snap.mainPath, mono: true)
+            diagRow("默认假定路径（仅参考）", snap.mainPath, mono: true)
+            diagRow("SwiftData 实际 URL", snap.mainActualPath.isEmpty ? "—" : snap.mainActualPath, mono: true)
+            diagRow("实际库 inode", snap.mainActualInode.isEmpty ? "—" : snap.mainActualInode, mono: true)
+            diagRow("内存模式", snap.mainInMemory ? "是（重启即清空）" : "否")
+            diagRow("主库迁移来源", snap.mainMigratedFrom.isEmpty ? "—（未迁移）" : snap.mainMigratedFrom, mono: true)
             diagRow("是否存在 / 大小", snap.mainExists ? "存在 · \(snap.mainSize)" : "不存在")
             diagRow("最后修改时间", snap.mainMtime)
             diagRow("SHA256 前 8 位", snap.mainSHA.isEmpty ? "—" : snap.mainSHA, mono: true)
@@ -118,13 +122,16 @@ struct DataPathDiagnosticsView: View {
         } header: {
             Text("主库（经营数据）")
         } footer: {
-            Text("主库默认位于 Application Support/default.store。两个 App 显示的 SHA256 前 8 位相同，说明打开的是同一个物理文件。")
+            Text("以「SwiftData 实际 URL」为准；两个 App 显示同一路径或同一 inode，说明打开的是同一个物理文件。默认假定路径可能因签名/App Group 变化而失真。")
         }
     }
 
     private var houseStoreSection: some View {
         Section {
             diagRow("路径", snap.housePath, mono: true)
+            diagRow("SwiftData 实际 URL", snap.houseActualPath.isEmpty ? "—" : snap.houseActualPath, mono: true)
+            diagRow("实际库 inode", snap.houseActualInode.isEmpty ? "—" : snap.houseActualInode, mono: true)
+            diagRow("内存模式", snap.houseInMemory ? "是（重启即清空）" : "否")
             diagRow("是否存在 / 大小", snap.houseExists ? "存在 · \(snap.houseSize)" : "不存在")
             diagRow("最后修改时间", snap.houseMtime)
             HStack {
@@ -289,6 +296,14 @@ struct DataPathDiagnosticsView: View {
         s.mainSHA = mainInfo.hash
         s.walText = Self.sidecarText(for: mainURL)
 
+        let mainConfigs = mainContext.container.configurations
+        s.mainActualPath = mainConfigs.map { $0.url.path }.joined(separator: " | ")
+        s.mainInMemory = mainConfigs.contains { $0.isStoredInMemoryOnly }
+        if let actual = mainConfigs.compactMap({ $0.url }).first {
+            s.mainActualInode = Self.inodeText(actual)
+        }
+        s.mainMigratedFrom = AgentToolApp.MainStoreLocation.migratedFrom
+
         s.mainCounts = [
             countRow("房源（Property）", Property.self),
             countRow("成交（DealRecord）", DealRecord.self),
@@ -312,6 +327,12 @@ struct DataPathDiagnosticsView: View {
         s.houseSize = houseInfo.sizeText
         s.houseMtime = houseInfo.modifiedText
         if let ctx = houseContext {
+            let cfgs = ctx.container.configurations
+            s.houseActualPath = cfgs.map { $0.url.path }.joined(separator: " | ")
+            s.houseInMemory = cfgs.contains { $0.isStoredInMemoryOnly }
+            if let actual = cfgs.compactMap({ $0.url }).first {
+                s.houseActualInode = Self.inodeText(actual)
+            }
             do {
                 s.houseCount = "\(try ctx.fetchCount(FetchDescriptor<House>()))"
                 s.mediaCount = "\(try ctx.fetchCount(FetchDescriptor<MediaItem>()))"
@@ -426,6 +447,10 @@ struct DataPathDiagnosticsView: View {
         lines.append("")
         lines.append("[主库]")
         lines.append("路径：\(snap.mainPath)")
+        lines.append("SwiftData 实际 URL：\(snap.mainActualPath)")
+        lines.append("实际库 inode：\(snap.mainActualInode)")
+        lines.append("内存模式：\(snap.mainInMemory ? "是（重启即清空）" : "否")")
+        lines.append("主库迁移来源：\(snap.mainMigratedFrom.isEmpty ? "—（未迁移）" : snap.mainMigratedFrom)")
         lines.append("存在 / 大小：\(snap.mainExists ? "存在" : "不存在") / \(snap.mainSize)")
         lines.append("最后修改：\(snap.mainMtime)")
         lines.append("SHA256 前 8 位：\(snap.mainSHA.isEmpty ? "—" : snap.mainSHA)")
@@ -437,6 +462,9 @@ struct DataPathDiagnosticsView: View {
         lines.append("")
         lines.append("[房源库]")
         lines.append("路径：\(snap.housePath)")
+        lines.append("SwiftData 实际 URL：\(snap.houseActualPath)")
+        lines.append("实际库 inode：\(snap.houseActualInode)")
+        lines.append("内存模式：\(snap.houseInMemory ? "是（重启即清空）" : "否")")
         lines.append("存在 / 大小：\(snap.houseExists ? "存在" : "不存在") / \(snap.houseSize)")
         lines.append("最后修改：\(snap.houseMtime)")
         lines.append("House：\(snap.houseCount)")
@@ -510,8 +538,15 @@ struct DataPathDiagnosticsView: View {
         )
     }
 
-    private static func shaPrefix8(_ url: URL) -> String {
-        guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]) else { return "" }
+    /// 文件资源标识（iOS 上通常对应 inode）；两个 App 显示同一值说明指向同一物理文件
+    private static func inodeText(_ url: URL) -> String {
+        guard let id = (try? url.resourceValues(forKeys: [.fileResourceIdentifierKey]))?.fileResourceIdentifier else {
+            return ""
+        }
+        return String(describing: id)
+    }
+
+    private static func shaPrefix8(_ url: URL) -> String {        guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]) else { return "" }
         let digest = SHA256.hash(data: data)
         return digest.prefix(8).map { String(format: "%02x", $0) }.joined()
     }
@@ -577,12 +612,19 @@ private struct DiagSnapshot {
     var mainMtime = ""
     var mainSHA = ""
     var walText = ""
+    var mainActualPath = ""
+    var mainActualInode = ""
+    var mainInMemory = false
+    var mainMigratedFrom = ""
     var mainCounts: [CountItem] = []
     var mainCountError = ""
     var housePath = ""
     var houseExists = false
     var houseSize = ""
     var houseMtime = ""
+    var houseActualPath = ""
+    var houseActualInode = ""
+    var houseInMemory = false
     var houseCount = "—"
     var mediaCount = "—"
     var houseError = ""
