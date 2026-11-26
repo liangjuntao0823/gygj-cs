@@ -333,11 +333,11 @@ enum HouseLedgerStore {
 
     /// 把某房待确认事件逐条上报服务器；成功并入本地正式账本并清 pending，失败保留 + markDirty
     static func syncPending(roomKey: String) async {
-        guard HouseServerMode.ready else { markDirty(roomKey: roomKey); return }
+        guard HouseServerMode.ready else { markDirty(roomKey); return }
         guard await HouseLedgerSyncGate.shared.begin(roomKey) else { return }
         defer { Task { await HouseLedgerSyncGate.shared.end(roomKey) } }
         let pending = pendingEvents(roomKey: roomKey)
-        guard !pending.isEmpty else { clearDirty(roomKey: roomKey); return }
+        guard !pending.isEmpty else { clearDirty(roomKey); return }
         var uploaded: [HouseLedgerEvent] = []
         var failed = false
         for ev in pending {
@@ -353,9 +353,9 @@ enum HouseLedgerStore {
             removePendingEvents(roomKey: roomKey, eventIds: Set(uploaded.map { $0.id }))
         }
         if failed {
-            markDirty(roomKey: roomKey)
+            markDirty(roomKey)
         } else {
-            clearDirty(roomKey: roomKey)
+            clearDirty(roomKey)
         }
     }
 
