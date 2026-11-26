@@ -183,6 +183,22 @@ enum ExtensionHouseClient {
         }
     }
 
+    /// 下载服务器单个媒体二进制（扩展内预览用；落本地临时目录后再加载）
+    static func downloadMedia(roomKey: String, fileName: String) async throws -> Data {
+        let req = try request("/api/house/media/\(encoded(roomKey))/\(encoded(fileName))", method: "GET")
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse else {
+            throw ExtHouseError(message: "媒体下载失败（服务器响应无效）")
+        }
+        if http.statusCode == 403 {
+            throw ExtHouseError(message: "暂无房源访问权限，请联系管理员开通", forbidden: true)
+        }
+        guard http.statusCode == 200 else {
+            throw ExtHouseError(message: "媒体下载失败（服务器 \(http.statusCode)）")
+        }
+        return data
+    }
+
     /// 新增/编辑；expectedRevision 为编辑前修订号（乐观锁），新增传 nil；返回服务器回写的权威记录
     static func upsert(_ record: CloudHouseRecord, expectedRevision: Int?) async throws -> CloudHouseRecord {
         let media: [[String: Any]] = record.mediaNames.map { name in
