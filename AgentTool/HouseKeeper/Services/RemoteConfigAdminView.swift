@@ -1,8 +1,8 @@
 import SwiftUI
 
 // MARK: - v1.82 远程配置原生化（中文显示 + 排版优化）
-/// 读取：云函数 act=configGet（带口令）→ 未配置/为空时用默认模板填充
-/// 保存：POST act=configSave（自动 version+1）→ 云端生效 + 写本地缓存（断网兜底）
+/// 读取：服务器 fetchConfig → 未配置/为空时用默认模板填充
+/// 保存：服务器 putConfig（自动 version+1）→ 云端生效 + 写本地缓存
 /// 所有配置项显示中文名称（英文 key 以小字副标题展示，便于对照后台文档）
 struct RemoteConfigAdminView: View {
     @State private var config = RemoteConfig.Payload()
@@ -316,49 +316,14 @@ struct RemoteConfigAdminView: View {
         loading = true
         statusText = ""
         Task { @MainActor in
-            if HouseServerMode.ready {
-                do {
-                    let dict = try await HouseRemoteClient.shared.fetchConfig()
-                    if let fetched = Self.payload(from: dict) {
-                        config = fetched
-                        syncAIModels()
-                    } else {
-                        config = Self.defaultTemplate()
-                        aiModelsJSON = ""
-                    }
-                    fillUpdateForm()
-                    loaded = true
-                    statusText = "已加载服务器配置 v\(config.version)"
-                    loading = false
-                    return
-                } catch {
-                    statusText = "服务器配置加载失败：\(error.localizedDescription)，回退旧云端"
-                }
-            }
-            loading = false
-            loadLegacyCloudFunction()
-        }
-    }
-
-    private func loadLegacyCloudFunction() {
-        loading = true
-        statusText = ""
-        let u = (CloudUser.username).addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-        guard let url = URL(string: "\(CloudConfig.functionURL)?act=configGet&k=\(CloudConfig.passwordHash)&u=\(u)") else {
-            loading = false
-            statusText = "云函数地址无效，请先在「设置 → 云端配置」填写"
-            return
-        }
-        URLSession.shared.dataTask(with: url) { data, resp, _ in
-            DispatchQueue.main.async {
+            guard HouseServerMode.ready else {
                 loading = false
-                guard let data = data,
-                      let obj = try? JSONDecoder().decode(ConfigGetResponse.self, from: data),
-                      obj.ok else {
-                    statusText = "加载失败：无法连接云函数，请检查网络与地址"
-                    return
-                }
-                if let fetched = obj.config {
+                statusText = "未连接服务器，无法加载配置"
+                return
+            }
+            do {
+                let dict = try await HouseRemoteClient.shared.fetchConfig()
+                if let fetched = Self.payload(from: dict) {
                     config = fetched
                     syncAIModels()
                 } else {
@@ -367,9 +332,13 @@ struct RemoteConfigAdminView: View {
                 }
                 fillUpdateForm()
                 loaded = true
-                statusText = "已加载云端配置 v\(config.version)"
+                statusText = "已加载服务器配置 v\(config.version)"
+                loading = false
+            } catch {
+                loading = false
+                statusText = "服务器配置加载失败：\(error.localizedDescription)"
             }
-        }.resume()
+        }
     }
 
     private func syncAIModels() {
@@ -414,52 +383,26 @@ struct RemoteConfigAdminView: View {
         var body = config
         body.updatedBy = CloudUser.username
 
-        if HouseServerMode.ready {
-            Task { @MainActor in
-                do {
-                    guard let dict = Self.dictionary(from: body) else {
-                        throw NSError(domain: "RemoteConfigAdmin", code: -1,
-                                       userInfo: [NSLocalizedDescriptionKey: "配置编码失败"])
-                    }
-                    try await HouseRemoteClient.shared.putConfig(dict)
-                    RemoteConfig.apply(body)
-                    saving = false
-                    statusText = "已保存 ✓ 服务器配置 v\(body.version)，App 下次启动/同步即生效"
-                } catch {
-                    saving = false
-                    statusText = "保存失败：\(error.localizedDescription)"
-                }
-            }
-            return
-        }
-        saveLegacyCloudFunction(body: body)
-    }
-
-    private func saveLegacyCloudFunction(body: RemoteConfig.Payload) {
-        let u = (CloudUser.username).addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-        guard let url = URL(string: "\(CloudConfig.functionURL)?act=configSave&k=\(CloudConfig.passwordHash)&u=\(u)"),
-              let payload = try? JSONEncoder().encode(body) else {
+        guard HouseServerMode.ready else {
             saving = false
-            statusText = "保存失败：参数无效"
+            statusText = "未连接服务器，无法保存配置"
             return
         }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.httpBody = payload
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        URLSession.shared.dataTask(with: request) { data, _, _ in
-            DispatchQueue.main.async {
-                saving = false
-                guard let data = data,
-                      let obj = try? JSONDecoder().decode(ConfigSaveResponse.self, from: data),
-                      obj.ok else {
-                    statusText = "保存失败：云函数未确认（请检查网络与口令）"
-                    return
+        Task { @MainActor in
+            do {
+                guard let dict = Self.dictionary(from: body) else {
+                    throw NSError(domain: "RemoteConfigAdmin", code: -1,
+                                   userInfo: [NSLocalizedDescriptionKey: "配置编码失败"])
                 }
+                try await HouseRemoteClient.shared.putConfig(dict)
                 RemoteConfig.apply(body)
-                statusText = "已保存 ✓ 配置版本 v\(obj.version ?? body.version)，App 下次启动/同步即生效"
+                saving = false
+                statusText = "已保存 ✓ 服务器配置 v\(body.version)，App 下次启动/同步即生效"
+            } catch {
+                saving = false
+                statusText = "保存失败：\(error.localizedDescription)"
             }
-        }.resume()
+        }
     }
 
     private func fillUpdateForm() {
@@ -627,18 +570,4 @@ struct RemoteConfigAdminView: View {
         p.changelog = []
         return p
     }
-}
-
-// MARK: 云函数响应
-
-private struct ConfigGetResponse: Codable {
-    let ok: Bool
-    let config: RemoteConfig.Payload?
-    let error: String?
-}
-
-private struct ConfigSaveResponse: Codable {
-    let ok: Bool
-    let version: Int?
-    let error: String?
 }
