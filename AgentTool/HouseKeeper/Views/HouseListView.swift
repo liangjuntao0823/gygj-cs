@@ -554,15 +554,6 @@ struct HouseListView: View {
         }
     }
 
-    /// v2.9（P1-1）：检测失败提示（断网/超时/未配置云），与「无变化」区分，不再静默吞错。
-    private func showCloudDetectFailedHint() {
-        let now = Date().timeIntervalSince1970
-        let last = UserDefaults.standard.double(forKey: "cloudLedgerHintShownAt")
-        if now - last < 5 { return }
-        UserDefaults.standard.set(now, forKey: "cloudLedgerHintShownAt")
-        showToast("云端检测失败：请检查网络或云配置后重试")
-    }
-
     /// 旧 COS 清单变更感知已下线：服务器模式下权威库由 HouseSyncEngine.pull 增量对账，本方法恒返回无变化。
     static func detectCloudLedgerChange(houseContext _: ModelContext?) async -> CloudChangeState {
         .noChange

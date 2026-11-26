@@ -715,27 +715,6 @@ struct CosConfigView: View {
         }
     }
 
-    /// v1.18：下载云端部署包——从 App 内导出 zip 到「备份」文件夹（内含 deploy.py 脚本 + 图文说明，给房东部署云端后台用）
-    /// v1.40 第4点：入口改为图文教程页内按钮；顺带修复路径（此前 DataRoot 已是「备份」，又拼了一层「备份」导致导到 备份/备份/）
-    private func downloadDeployPack() {
-        guard let url = Bundle.main.url(forResource: "CloudDeployPackage", withExtension: "zip") else {
-            savedTip = "未找到云端部署包资源，请确认安装的是最新版 App"
-            return
-        }
-        let dir = DataRoot.url()
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let target = dir.appendingPathComponent("云端部署包.zip")
-        do {
-            if FileManager.default.fileExists(atPath: target.path) {
-                try? FileManager.default.removeItem(at: target)
-            }
-            try FileManager.default.copyItem(at: url, to: target)
-            savedTip = "云端部署包已导出到本地 ✅\n位置：文件 App → 公寓管家 → 备份 → 云端部署包.zip\n内含 deploy.py 部署脚本 + 图文说明，发给房东在电脑上解压运行即可在自己腾讯云部署后台。"
-        } catch {
-            savedTip = "导出失败：\(error.localizedDescription)"
-        }
-    }
-
     // MARK: - v1.19 多用户：保存用户名 / 导出「给别人用」的配置
 
     /// v2.18：列云端 users/ 目录下已有的用户名（COS ListObjectsV2 delimiter="/" 的 CommonPrefixes）
@@ -860,19 +839,6 @@ struct CosConfigView: View {
         self.functionURL = CloudConfig.functionURL
         self.username = CloudUser.username
         savedTip = "共享配置已导入 ✅\n存储桶：\(bucket) / 地域：\(region)\n云函数地址：\(functionURL.isEmpty ? "（未填）" : functionURL)\n用户名：\(uname.isEmpty ? "（未填）" : uname)\n可点「保存并验证连接」确认可用"
-    }
-
-    /// 取当前最上层 VC（分享面板 / 弹窗用）——优先找前台活跃场景的 keyWindow
-    private func topMostViewController() -> UIViewController? {
-        for scene in UIApplication.shared.connectedScenes {
-            guard let ws = scene as? UIWindowScene, ws.activationState == .foregroundActive else { continue }
-            let root = ws.keyWindow?.rootViewController ?? ws.windows.first?.rootViewController
-            guard let root else { continue }
-            var top = root
-            while let presented = top.presentedViewController { top = presented }
-            return top
-        }
-        return nil
     }
 
     /// v1.35：访问储存桶——用当前填写的桶名/地域打开腾讯云 COS 控制台对应桶页面（默认浏览器）
