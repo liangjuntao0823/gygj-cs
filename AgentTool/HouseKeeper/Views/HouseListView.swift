@@ -1651,8 +1651,7 @@ struct HouseListView: View {
 
     // MARK: - v1.19 云端房源同步（共享房源）
 
-    /// 把单套房源推送到云端账本（读改写，同房号覆盖）。无云存储配置则跳过（仅本地）。
-    /// v1.72（#7）：动作按场景命名（切换状态同步…）；（#8）账本上传也驱动卡片进度条；（#6）写本地账本镜像。
+    /// 状态切换上行：服务器模式推服务器权威库（失败入待补传队列）；旧 COS 账本/媒体上行已下线，非服务器模式仅本机落库。
     private func pushHouseToCloud(_ house: House, action: String = "同步房源（本地→云端）", changeText: String = "") {
         // 服务器模式：状态切换直接推服务器权威库，不走旧 COS 账本链路；失败入待补传队列
         if HouseServerMode.ready {
@@ -1680,44 +1679,7 @@ struct HouseListView: View {
             }
             return
         }
-        guard let config = CosConfig.load() else { return }
-        let record = CloudHouseSync.record(from: house, username: CloudUser.username)
-        let roomKey = house.mediaRoomKey
-        let roomNo = house.displayRoomNo
-        LocalHouseLedger.save(house)
-        HouseSyncProgress.shared.begin(roomKey: roomKey, direction: .upload, progress: 0.2, label: "同步账本")
-        Task {
-            do {
-                // v2.36（#6）：状态切换改走 uploadGuarded 合并写——先读云端再合并媒体名单、revision+1，
-                // 不再裸 upload 覆盖他人刚写入的数据/媒体
-                _ = try await CloudHouseSync.uploadGuarded(record: record, config: config)
-                HouseSyncProgress.shared.end()
-                await MainActor.run {
-                    house.cloudStatus = .both
-                    SyncFailStore.clear(roomKey)
-                    try? houseModelContext?.save()
-                    // v2.44：状态切换同步结果
-                    HouseActionNotifier.shared.send(
-                        key: "status.\(roomKey)",
-                        title: "状态已同步",
-                        body: "\(roomNo) 已改为\(house.status.label)，桶内已更新"
-                    )
-                }
-                BackupLogStore.log(category: "房源", action: action, result: "成功", detail: changeText, room: roomNo, cloud: true)
-            } catch {
-                HouseSyncProgress.shared.end()
-                await MainActor.run {
-                    SyncFailStore.mark(roomKey)
-                    HouseActionNotifier.shared.send(
-                        key: "statusfail.\(roomKey)",
-                        title: "状态同步失败",
-                        body: "\(roomNo) 已改本机，桶内没同步上：\(error.localizedDescription)",
-                        silent: true
-                    )
-                }
-                BackupLogStore.log(category: "房源", action: action, result: "失败", detail: "同步失败：\(error.localizedDescription)", room: roomNo, cloud: true)
-            }
-        }
+        // 旧桶账本上行已下线：非服务器模式仅本机落库，不再上传旧 COS 账本/媒体
     }
 
     /// v2.50：云端有更新横幅——常驻顶栏，只有点右侧 ✕ 才收起；同步成功后自动收起。
