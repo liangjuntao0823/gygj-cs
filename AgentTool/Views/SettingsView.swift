@@ -98,8 +98,6 @@ struct SettingsView: View {
     @State private var meterLinkTip: String?
     /// v2.18：全量备份进度（0~1）；nil = 没在跑。此前只有一句「正在生成全量备份…」，几十秒没反馈像卡死
     @ObservedObject private var backupProgress = FullBackupProgressHub.shared
-    // b206：一级菜单「云端推送」副标题实时反映绑定账号、设备数与电表通知开关
-    @ObservedObject private var notifyHub = NotifyHub.shared
 
     /// v1.41：刷新分享水印入口副标题（返回设置页 / 页面出现时读取最新 store，立即反映开关状态）
     private func refreshWatermarkSubtitle() {
@@ -682,20 +680,6 @@ struct SettingsView: View {
     private var servicesSection: some View {
         Section {
             NavigationLink {
-                NotifyHubSettingsView()
-            } label: {
-                Label {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("云端推送通道")
-                        Text("账号隔离 · 多设备 Bark · 电表/到期/收租")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                } icon: {
-                    Image(systemName: "bell.badge.fill")
-                }
-            }
-            NavigationLink {
                 MeterSettingsDetailView()
             } label: {
                 Label {
@@ -1045,10 +1029,6 @@ struct SettingsView: View {
                                 subtitle: "电费 / 水费单价 · 默认预存 · 账单模板") { DefaultsSettingsPage() }
                     settingsRow("外部服务", icon: "antenna.radiowaves.left.and.right",
                                 subtitle: "电表监控 · 安居客后台 · AI 助手") { ServicesSettingsPage() }
-                    settingsRow("云端推送", icon: "bell.badge.fill",
-                                subtitle: notifyHub.isBound
-                                    ? "\(notifyHub.username.isEmpty ? "已绑定" : notifyHub.username) · \(notifyHub.devices.count) 台设备 · 电表通知\(notifyHub.channelEnabled && notifyHub.meterModuleEnabled ? "开" : "关")"
-                                    : "未绑定 · 电表告警 / 将来到期收租通知") { CloudPushSettingsView() }
                     settingsRow("存储与清理", icon: "internaldrive",
                                 subtitle: "数据文件夹 · AI 产物 · 下载的安装包 · 桶孤儿媒体") { StorageSettingsPage() }
                     // v2.51：电梯码（全屏展示 + 更换 + 一键打开方式）
@@ -1060,10 +1040,6 @@ struct SettingsView: View {
                     Text("点分组进对应的二级页；最下面「关于」仍是本机版本、检查更新与更新介绍。")
                 }
                 aboutSection
-            }
-            .task {
-                // 进入设置页静默刷新推送账号档案（开关/设备数/最近投递）；失败保留本机缓存展示
-                if NotifyHub.shared.isBound { await NotifyHub.shared.refreshMe() }
             }
             // v1.9：背景挂载滚动监听（不占任何 Form 行/间距，顶部不再有空白行）
             .background(
@@ -1176,20 +1152,12 @@ struct SettingsView: View {
     // v1.54：全量重建全部房源的脱敏版分享 H5——
     // 云端旧分享页全部删除（旧链接立即失效）+ 每间房重新生成最新 H5（无媒体房源只删旧页不生成）
     private func rebuildAllShareH5() {
-        guard houseModelContext != nil else {
-            houseCacheTip = "数据容器不可用，请重启 App 后重试"
-            return
-        }
-        // 服务器模式：App 内分享不生成 H5 分享链接，此重建入口跳过
-        if HouseServerMode.ready {
-            houseCacheTip = "当前为 App 内分享，不生成 H5 分享链接"
-            return
-        }
-        guard let config = CosConfig.load(), config.isValid else {
+        guard let ctx = houseModelContext,
+              let config = CosConfig.load(), config.isValid else {
             houseCacheTip = "请先到「云端配置」填写 COS 配置并验证通过"
             return
         }
-        let houses = (try? houseModelContext?.fetch(FetchDescriptor<House>())) ?? []
+        let houses = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
         let active = houses.filter { !($0.isDeleted ?? false) }
         let profile = CosUploader.loadShareProfile()
         // 主线程先拷贝全部值类型，Task 内不再触碰 SwiftData 模型
@@ -2536,20 +2504,12 @@ struct ShareSettingsPage: View {
     }
 
     private func rebuildAllShareH5() {
-        guard houseModelContext != nil else {
-            houseCacheTip = "数据容器不可用，请重启 App 后重试"
-            return
-        }
-        // 服务器模式：App 内分享不生成 H5 分享链接，此重建入口跳过
-        if HouseServerMode.ready {
-            houseCacheTip = "当前为 App 内分享，不生成 H5 分享链接"
-            return
-        }
-        guard let config = CosConfig.load(), config.isValid else {
+        guard let ctx = houseModelContext,
+              let config = CosConfig.load(), config.isValid else {
             houseCacheTip = "请先到「云端配置」填写 COS 配置并验证通过"
             return
         }
-        let houses = (try? houseModelContext?.fetch(FetchDescriptor<House>())) ?? []
+        let houses = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
         let active = houses.filter { !($0.isDeleted ?? false) }
         let profile = CosUploader.loadShareProfile()
         let items = active.map { h -> (files: [ShareMediaFile], roomKey: String, info: ShareHouseInfo) in
@@ -3177,6 +3137,20 @@ struct StorageSettingsPage: View {
                 } label: {
                     Label("打开「文件」App 查看数据文件夹", systemImage: "folder")
                 }
+                NavigationLink {
+                    DataPathDiagnosticsView()
+                } label: {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("数据路径诊断")
+                            Text("主库/房源库真实路径、SHA256 指纹、App Group 与跨 App 探针")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: "doc.text.magnifyingglass")
+                    }
+                }
             } header: {
                 Text("存储与清理")
             } footer: {
@@ -3418,7 +3392,7 @@ struct OrphanScanProgressOverlay: View {
     }
 }
 
-// MARK: - v2.51 电梯码快捷入口（gongyuguanjia-fwq://elevator）
+// MARK: - v2.51 电梯码快捷入口（gongyuguanjia://elevator）
 
 /// 全局电梯码展示状态：URL Scheme / 设置页预览 都走这里
 final class ElevatorCodeCenter: ObservableObject {
@@ -3569,7 +3543,7 @@ struct ElevatorCodeSettingsPage: View {
     @State private var reloadTick = 0
     @State private var alertText: String?
 
-    private let deepLink = "gongyuguanjia-fwq://elevator"
+    private let deepLink = "gongyuguanjia://elevator"
 
     var body: some View {
         Form {

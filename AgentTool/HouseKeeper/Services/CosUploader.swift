@@ -95,46 +95,23 @@ enum KeychainKey {
 }
 
 enum KeychainStore {
-    private static let service = "com.gj.tg2.housekeeper"
-
-    /// 仅用于定位条目（删除/更新）的精简 query，不含 data/accessible，
-    /// 避免额外属性导致 SecItemDelete/Update 匹配不到旧项。
-    private static func identityQuery(_ key: String) -> [String: Any] {
-        [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: key
-        ]
-    }
+    private static let service = "com.zfgj.housekeeper"
 
     /// v1.20：返回写入结果（true=成功）。此前写入失败被静默吞掉，用户以为保存成功实际没写入。
     /// kSecAttrAccessibleAfterFirstUnlock 提高开机解锁前访问的可靠性
     @discardableResult
     static func save(_ value: String, for key: String) -> Bool {
         let data = Data(value.utf8)
-        // 先用精简 query 彻底删除同 service+account 的旧项
-        SecItemDelete(identityQuery(key) as CFDictionary)
-        let addQuery: [String: Any] = [
+        let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: key,
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
         ]
-        let status = SecItemAdd(addQuery as CFDictionary, nil)
-        if status == errSecSuccess { return true }
-        if status == errSecDuplicateItem {
-            // 旧项极端情况下仍在：改用 Update 真正写入，而不是把 duplicate 当成功
-            let updateStatus = SecItemUpdate(
-                identityQuery(key) as CFDictionary,
-                [
-                    kSecValueData as String: data,
-                    kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
-                ] as CFDictionary
-            )
-            return updateStatus == errSecSuccess
-        }
-        return false
+        SecItemDelete(query as CFDictionary)
+        let status = SecItemAdd(query as CFDictionary, nil)
+        return status == errSecSuccess || status == errSecDuplicateItem
     }
 
     static func load(_ key: String) -> String? {
@@ -150,13 +127,6 @@ enum KeychainStore {
               let data = item as? Data else { return nil }
         return String(data: data, encoding: .utf8)
     }
-
-    /// 真正删除条目；不存在也视为成功（幂等）
-    @discardableResult
-    static func delete(_ key: String) -> Bool {
-        let status = SecItemDelete(identityQuery(key) as CFDictionary)
-        return status == errSecSuccess || status == errSecItemNotFound
-    }
 }
 
 // MARK: - COS 配置
@@ -167,24 +137,9 @@ struct CosConfig {
     let secretId: String
     let secretKey: String
     let customDomain: String   // v1.19：自定义域名（如 cdn.example.com），空 = 用默认域名
-    /// 临时凭证（STS）会话令牌；永久密钥场景为空串。非空时预签名会带上
-    /// x-cos-security-token 并参与签名，secretId/secretKey 此时为临时密钥。
-    let sessionToken: String
-
-    var isUsingSTS: Bool { !sessionToken.isEmpty }
 
     var isValid: Bool {
         !bucket.isEmpty && !region.isEmpty && !secretId.isEmpty && !secretKey.isEmpty
-    }
-
-    init(bucket: String, region: String, secretId: String, secretKey: String,
-         customDomain: String, sessionToken: String = "") {
-        self.bucket = bucket
-        self.region = region
-        self.secretId = secretId
-        self.secretKey = secretKey
-        self.customDomain = customDomain
-        self.sessionToken = sessionToken
     }
 
     /// 从钥匙串读取配置（自动去掉首尾空格，避免复制粘贴带入空白导致签名失败）
@@ -2100,12 +2055,7 @@ enum CosUploader {
         let headerValue = pairs.map { "\($0.key)=\($0.value)" }.joined(separator: "&")
 
         // v1.13：URL query 参数（ListObjects 等）——key 原样（已小写）、value RFC3986 编码，按字典序
-        // 临时凭证：x-cos-security-token 必须作为 URL 参数参与签名，COS 才认可
-        var allParams = params
-        if config.isUsingSTS {
-            allParams.append(("x-cos-security-token", config.sessionToken))
-        }
-        let sortedParams = allParams.map { (key: $0.0.lowercased(), value: urlEncode($0.1)) }.sorted { $0.key < $1.key }
+        let sortedParams = params.map { (key: $0.0.lowercased(), value: urlEncode($0.1)) }.sorted { $0.key < $1.key }
         let paramList = sortedParams.map(\.key).joined(separator: ";")
         let paramValue = sortedParams.map { "\($0.key)=\($0.value)" }.joined(separator: "&")
 
