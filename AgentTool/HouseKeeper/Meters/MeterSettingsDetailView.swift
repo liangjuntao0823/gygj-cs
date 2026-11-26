@@ -159,7 +159,6 @@ struct MeterSettingsDetailView: View {
 private struct MeterCloudWatchSection: View {
     @EnvironmentObject private var store: MeterStore
 
-    @State private var endpointInput = ""
     @State private var codeInput = ""
     @State private var tip: String?
     @State private var busy = false
@@ -195,23 +194,9 @@ private struct MeterCloudWatchSection: View {
                     Text("电表云端接入")
                         .font(.system(size: 12))
                         .foregroundColor(.themeText3)
-                    Text("服务器地址")
-                        .font(.system(size: 12))
+                    Text("服务器地址在「设置 → 云端配置」统一维护")
+                        .font(.system(size: 11))
                         .foregroundColor(.themeText3)
-                    HStack(spacing: 8) {
-                        TextField("http://114.132.93.85:8082", text: $endpointInput)
-                            .keyboardType(.URL)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                            .font(.system(size: 13))
-                            .lineLimit(1)
-                        Button("保存") { saveEndpointOnly() }
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundColor(.themeAccentDark)
-                    }
-                    .padding(9)
-                    .background(Color.themeBorder.opacity(0.3))
-                    .clipShape(RoundedRectangle(cornerRadius: 9))
 
                     if tokenSaved {
                         HStack(spacing: 6) {
@@ -315,7 +300,6 @@ private struct MeterCloudWatchSection: View {
         }
         .onAppear {
             appearCount += 1
-            endpointInput = store.settings.cloudEndpoint
             tokenSaved = sync.hasToken
             let hours = store.settings.cloudPollMinutes / 60
             pollTag = (1...12).contains(hours) ? hours : 1
@@ -368,7 +352,6 @@ private struct MeterCloudWatchSection: View {
         busy = true
         defer { busy = false }
         tip = nil
-        saveEndpointOnly(showTip: false)
 
         if !sync.hasToken {
             let code = codeInput.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -412,21 +395,9 @@ private struct MeterCloudWatchSection: View {
     private func enrollOnly() async {
         busy = true
         defer { busy = false }
-        saveEndpointOnly(showTip: false)
         if await performEnroll(), store.settings.cloudWatchEnabled {
             _ = await sync.pushConfig(store: store, enabled: true)
         }
-    }
-
-    @MainActor
-    private func saveEndpointOnly(showTip: Bool = true) {
-        let v = endpointInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !v.isEmpty else { return }
-        let old = store.settings.cloudEndpointRaw ?? ""
-        guard v != old else { return }
-        store.settings.cloudEndpoint = v
-        store.saveSettings() // 开关未开且未曾开启时，同步钩子不会发网络请求
-        if showTip { tip = "服务器地址已保存" }
     }
 
     @MainActor
@@ -489,7 +460,7 @@ struct NotifyHubSettingsView: View {
                         .foregroundColor(.themeAccentDark)
                 }
             } footer: {
-                Text("推送通道与电表云端轮询共用同一台服务器，地址可在「电表监控设置 → 云端轮询 → 电表云端接入」修改。通道按账号隔离：服务器只把事件发到该账号绑定的手机，将来多人使用也不会互推；各业务模块的通知开关在「设置 → 云端推送」首页。")
+                Text("推送通道与电表云端轮询共用同一台服务器，地址在「设置 → 云端配置」统一修改。通道按账号隔离：服务器只把事件发到该账号绑定的手机，将来多人使用也不会互推；各业务模块的通知开关在「设置 → 云端推送」首页。")
             }
 
             if !hub.isBound {

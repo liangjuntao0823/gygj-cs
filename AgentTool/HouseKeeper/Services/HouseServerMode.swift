@@ -30,6 +30,6 @@ enum HouseServerMode {
     /// 未接入时给用户的引导文案
     static var notReadyReason: String {
         if !enabled { return "服务器模式已关闭" }
-        return "尚未接入服务器，请到「电表监控设置」完成接入"
+        return "尚未绑定账号令牌"
     }
 }

@@ -190,9 +190,11 @@ enum CosConfigBackup {
 
 struct CosConfigView: View {
     @State private var username = ""
-    // 房源服务器（8082 权威库）地址与状态
+    // 房源服务器（8082 权威库）地址与状态；全工程唯一地址编辑入口，电表/通知通道复用同一地址
     @State private var endpointInput = ""
     @State private var serverTip: String?
+    @State private var tipPositive = true
+    @State private var busy = false
     @State private var savedTip: String?
 
     init() {
@@ -222,32 +224,39 @@ struct CosConfigView: View {
                     .keyboardType(.URL)
                 HStack(spacing: 12) {
                     Button {
-                        saveServerEndpoint()
+                        connect()
                     } label: {
-                        Label("保存", systemImage: "checkmark.circle")
-                            .font(.subheadline)
-                            .fontWeight(.medium)
-                            .frame(maxWidth: .infinity)
+                        HStack(spacing: 6) {
+                            if busy { ProgressView().controlSize(.small) }
+                            Label("连接", systemImage: "link")
+                        }
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+                        .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(Color(red: 31/255, green: 58/255, blue: 95/255))
+                    .disabled(busy)
                     Button {
-                        clearServerEndpoint()
+                        disconnect()
                     } label: {
-                        Label("恢复默认", systemImage: "arrow.counterclockwise")
+                        Label("断开连接", systemImage: "link.slash")
                             .font(.subheadline)
                             .fontWeight(.medium)
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
+                    .disabled(busy)
                 }
                 if let serverTip {
-                    Text(serverTip).font(.footnote).foregroundColor(.green)
+                    Text(serverTip)
+                        .font(.footnote)
+                        .foregroundColor(tipPositive ? .green : .red)
                 }
             } header: {
                 Text("房源服务器（台账权威库）")
             } footer: {
-                Text("房源文字台账、状态与修订记录存到这台服务器；未接入服务器时回退本机数据。")
+                Text("房源文字台账、状态与修订记录存到这台服务器；未接入服务器时回退本机数据。点「连接」验证地址与账号权限；「断开连接」只清空服务器地址，本机账号令牌保留。")
             }
 
             Section {
@@ -270,6 +279,7 @@ struct CosConfigView: View {
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
             username = CloudUser.username
+            endpointInput = MeterStore.shared.settings.cloudEndpointRaw ?? ""
         }
         .alert("配置结果", isPresented: Binding(
             get: { savedTip != nil },
@@ -281,19 +291,34 @@ struct CosConfigView: View {
         }
     }
 
-    private func saveServerEndpoint() {
+    /// 连接：先把输入地址落盘，再打 health + stats 验证可达性与账号权限
+    private func connect() {
+        guard !busy else { return }
         let v = endpointInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !v.isEmpty else { serverTip = "地址不能为空"; return }
+        guard !v.isEmpty else {
+            serverTip = "地址不能为空"
+            tipPositive = false
+            return
+        }
         MeterStore.shared.settings.cloudEndpoint = v
         MeterStore.shared.saveSettings()
-        serverTip = "服务器地址已保存"
+        busy = true
+        serverTip = nil
+        Task {
+            let result = await HouseRemoteClient.shared.testConnection()
+            busy = false
+            serverTip = result.summary
+            tipPositive = result.isPositive
+        }
     }
 
-    private func clearServerEndpoint() {
+    /// 断开：清空服务器地址（回退默认），本机账号令牌不动
+    private func disconnect() {
         MeterStore.shared.settings.cloudEndpointRaw = nil
         MeterStore.shared.saveSettings()
         endpointInput = ""
-        serverTip = "已恢复默认服务器地址"
+        serverTip = "已断开：服务器地址已清空（账号令牌保留）"
+        tipPositive = false
     }
 
     private func saveUsername() {
@@ -692,11 +717,11 @@ struct RoomsShareView: View {
                 linkTip = "链接长期有效；房源、名片或二维码更新后，租客刷新页面即为最新"
             } else {
                 cosLink = ""
-                linkTip = "服务器地址未配置，请到「电表监控设置」检查服务器地址"
+                linkTip = "尚未接入服务器：请到「云端配置」检查服务器地址或账号绑定"
             }
             return
         }
         cosLink = ""
-        linkTip = "服务器地址未配置，请到「电表监控设置」检查服务器地址"
+        linkTip = "尚未接入服务器：请到「云端配置」检查服务器地址或账号绑定"
     }
 }

@@ -795,7 +795,7 @@ final class NotifyHub: ObservableObject {
     var channelEnabled: Bool { prefs.enabled ?? true }
     var meterModuleEnabled: Bool { prefs.modules?["meter"] ?? true }
 
-    /// 与电表云端值守共用同一台服务器（8082 同进程挂载 /api/notify），地址在「电表监控设置」里改
+    /// 与电表云端值守共用同一台服务器（8082 同进程挂载 /api/notify），地址在「设置 → 云端配置」里改
     var endpoint: String {
         var s = MeterStore.shared.settings.cloudEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
         if s.isEmpty { s = MeterCloudConfig.defaultEndpoint }
@@ -839,7 +839,7 @@ final class NotifyHub: ObservableObject {
                          auth: Bool = true) async throws -> NotifyHubResponse {
         guard let url = buildURL(sub) else {
             throw NSError(domain: "NotifyHub", code: -1,
-                          userInfo: [NSLocalizedDescriptionKey: "服务器地址无效，可到「电表监控设置 → 云端轮询 → 电表云端接入」检查服务器地址"])
+                          userInfo: [NSLocalizedDescriptionKey: "服务器地址无效，可到「设置 → 云端配置」检查服务器地址"])
         }
         var req = URLRequest(url: url)
         req.httpMethod = method

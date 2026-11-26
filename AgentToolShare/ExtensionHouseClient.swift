@@ -103,7 +103,7 @@ enum ExtensionHouseClient {
                                 body: [String: Any]? = nil) throws -> URLRequest {
         guard let base = URL(string: endpoint),
               let url = URL(string: path, relativeTo: base) else {
-            throw ExtHouseError(message: "服务器地址无效，请到电表监控设置检查服务器地址")
+            throw ExtHouseError(message: "服务器地址无效，请到「云端配置」检查服务器地址")
         }
         var req = URLRequest(url: url)
         req.httpMethod = method

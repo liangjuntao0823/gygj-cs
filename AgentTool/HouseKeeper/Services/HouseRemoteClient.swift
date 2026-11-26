@@ -117,6 +117,29 @@ struct HouseAPIError: LocalizedError {
     var errorDescription: String? { message }
 }
 
+/// 「连接」测试结果：服务器可达 + 令牌状态
+enum HouseConnectionCheck: Equatable {
+    /// 可达，且本机令牌有效、具备房源权限
+    case connectedWithAuth
+    /// 可达，但本机尚未绑定账号令牌
+    case reachableNoToken
+    /// 连接失败，带可读原因
+    case failed(String)
+
+    var summary: String {
+        switch self {
+        case .connectedWithAuth: return "连接成功：服务器可达，账号已具备房源权限"
+        case .reachableNoToken: return "服务器可达，但本机尚未绑定账号令牌（账号在云端推送/电表接入页绑定）"
+        case .failed(let reason): return reason
+        }
+    }
+
+    var isPositive: Bool {
+        if case .failed = self { return false }
+        return true
+    }
+}
+
 // MARK: - 客户端
 
 @MainActor
@@ -146,7 +169,7 @@ final class HouseRemoteClient {
                              body: [String: Any]? = nil) async throws -> (Data, HTTPURLResponse) {
         guard let base = URL(string: endpoint),
               let url = URL(string: path, relativeTo: base) else {
-            throw HouseAPIError(message: "服务器地址无效，请到「电表监控设置」检查服务器地址")
+            throw HouseAPIError(message: "服务器地址无效，请在「云端配置」检查服务器地址")
         }
         var req = URLRequest(url: url)
         req.httpMethod = method
@@ -241,6 +264,52 @@ final class HouseRemoteClient {
             throw HouseAPIError(message: "读取统计失败（服务器 \(http.statusCode)）")
         }
         return try decode(RemoteHouseStats.self, data: data)
+    }
+
+    /// 连接测试：先打公开 health 验证地址可达；有本机令牌再用 stats 校验鉴权与房源权限。
+    /// 不抛错，结果统一回 HouseConnectionCheck，便于设置页直接展示成功/失败原因。
+    func testConnection() async -> HouseConnectionCheck {
+        guard let base = URL(string: endpoint),
+              let healthURL = URL(string: "/api/house/health", relativeTo: base) else {
+            return .failed("服务器地址无效")
+        }
+        // 1) 公开 health：验证地址可达、服务在线
+        do {
+            var req = URLRequest(url: healthURL)
+            req.httpMethod = "GET"
+            req.timeoutInterval = 8
+            let (_, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse else { return .failed("服务器无响应") }
+            guard http.statusCode == 200 else {
+                return .failed("服务器响应异常（HTTP \(http.statusCode)）")
+            }
+        } catch {
+            return .failed("无法连接到服务器：\(error.localizedDescription)")
+        }
+
+        // 2) 可达但本机无令牌：提示未绑定账号，不算失败
+        guard let t = token, !t.isEmpty else { return .reachableNoToken }
+
+        // 3) 有令牌：stats 校验鉴权与房源权限
+        guard let statsURL = URL(string: "/api/house/stats", relativeTo: base) else {
+            return .failed("服务器地址无效")
+        }
+        do {
+            var req = URLRequest(url: statsURL)
+            req.httpMethod = "GET"
+            req.timeoutInterval = 8
+            req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization")
+            let (_, resp) = try await URLSession.shared.data(for: req)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            switch code {
+            case 200: return .connectedWithAuth
+            case 401: return .failed("令牌无效或已过期，请重新绑定账号")
+            case 403: return .failed("当前账号暂无房源访问权限")
+            default: return .failed("鉴权失败（HTTP \(code)）")
+            }
+        } catch {
+            return .failed("令牌校验失败：\(error.localizedDescription)")
+        }
     }
 
     // MARK: 媒体（服务器本地磁盘，二进制直传/直出）
