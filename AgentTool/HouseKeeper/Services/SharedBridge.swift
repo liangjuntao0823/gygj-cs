@@ -24,6 +24,8 @@ enum SharedBridge {
     static let kPasswordHash = "share.mirror.passwordHash"
     static let kCompress = "share.mirror.compressOnShare"
     static let kCustomDomain = "share.mirror.customDomain"
+    static let kEndpoint = "share.mirror.endpoint"
+    static let kToken = "share.mirror.houseToken"
 
     /// 主 App 调用：把非敏感配置镜像进共享区（启动 / 回前台 / 退后台 / 设置变更时）。
     /// 用户名与云函数地址的 setter 已直写共享区，这里兜底覆盖钥匙串旧值等边角。
@@ -37,6 +39,14 @@ enum SharedBridge {
             ?? RemoteConfig.feature("compressUpload", true)
         d.set(compress, forKey: kCompress)
         d.set(CosConfig.load()?.customDomain ?? "", forKey: kCustomDomain)
+        #if !APP_EXTENSION
+        // 服务器地址与房源/通知令牌镜像进 App Group 共享区，供分享扩展直连服务器；
+        // 扩展进程读不到主 App 的 standard UserDefaults 与内存缓存，只能经共享区取。
+        d.set(NotifyHub.shared.endpoint, forKey: kEndpoint)
+        if let t = MeterCloudSync.shared.token, !t.isEmpty {
+            d.set(t, forKey: kToken)
+        }
+        #endif
     }
 
     /// v2.70 兜底：覆盖安装后主 App 尚未启动、镜像还没写时，扩展用与 App 默认口径同源的
@@ -57,6 +67,24 @@ enum SharedBridge {
     }
 
     static var mirroredCustomDomain: String { defaults.string(forKey: kCustomDomain) ?? "" }
+
+    /// 扩展读服务器端点：镜像优先；未镜像过按主 App 默认地址兜底（与 MeterCloudConfig.defaultEndpoint 同值）。
+    /// 规范化口径对齐 NotifyHub.endpoint：补 http:// 前缀、去尾斜杠。
+    static var mirroredEndpoint: String {
+        var s = (defaults.string(forKey: kEndpoint) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.isEmpty { s = "http://114.132.93.85:8082" }
+        if !s.hasPrefix("http://"), !s.hasPrefix("https://") { s = "http://" + s }
+        while s.hasSuffix("/") { s.removeLast() }
+        return s
+    }
+
+    /// 扩展读房源/通知令牌（App Group 镜像；为空返回 nil，扩展按未接入服务器处理）
+    static var mirroredHouseToken: String? {
+        let s = (defaults.string(forKey: kToken) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return s.isEmpty ? nil : s
+    }
 
     /// 一次性迁移：共享区无值时把 standard 旧值补进去（只补不覆盖，幂等）。
     /// 用于用户名/云函数地址/两队列等历史键，升级后两进程收敛到同一份。
