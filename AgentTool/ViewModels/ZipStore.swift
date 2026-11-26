@@ -130,12 +130,6 @@ enum ZipStore {
         progress?(1.0)
     }
 
-    /// 解析 zip 中央目录，返回条目列表（失败抛错）
-    static func listEntries(at url: URL) throws -> [ZipEntry] {
-        let data = try Data(contentsOf: url)
-        return try parseCentralDirectory(data)
-    }
-
     /// 按路径提取单个文件数据（STORE 模式）
     static func extract(at url: URL, path: String) throws -> Data {
         let data = try Data(contentsOf: url)

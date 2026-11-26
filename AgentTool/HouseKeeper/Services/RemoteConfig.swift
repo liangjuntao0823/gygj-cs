@@ -255,15 +255,6 @@ final class UpdateCenter: ObservableObject {
             launchPopupVersion = a.version
         }
     }
-
-    /// 回前台节流检查（6 小时内不重复联网）
-    @MainActor
-    static func checkIfDue() {
-        guard autoCheckEnabled else { return }
-        let last = UserDefaults.standard.double(forKey: lastCheckKey)
-        guard Date().timeIntervalSince1970 - last > 6 * 3600 else { return }
-        Task { await UpdateCenter.shared.runCheck(showPopup: false) }
-    }
 }
 
 /// 安装包下载器：桶内取（优先）或直链下载 → 存到 Documents/Updates/ → 可选 sha256 校验
