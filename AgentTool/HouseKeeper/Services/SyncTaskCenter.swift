@@ -344,8 +344,7 @@ func begin(id: UUID,
 
     // MARK: v2.52 上传任务手动取消
 
-    /// 点「取消」：先真正中断 Task；Task 内 catch 到取消会调 finishCancelled。
-    /// 兜底：1.5 秒后仍在进行中（取消信号没被接住）就强制转「已取消」，不让界面一直卡着。
+    /// 点「取消」：先真正中断 Task；兜底 1.5 秒后仍在进行中（取消信号没被接住）就强制转「已取消」，不让界面一直卡着。
     func requestCancel(id: UUID) {
         UploadTaskRegistry.shared.cancel(id)
         Task {
@@ -359,23 +358,6 @@ func begin(id: UUID,
                 persist()
             }
         }
-    }
-
-    /// 上传 Task 捕获到取消后回调：进行中 → 已取消（留在待处理区，可重试/彻底删除）
-    func finishCancelled(id: UUID) {
-        guard let idx = running.firstIndex(where: { $0.id == id }) else { return }
-        var item = running.remove(at: idx)
-        item.state = .cancelled
-        item.finishedAt = Date()
-        item.failure = "已手动取消，本地文件没动；可重试或彻底删除"
-        item.currentFileFraction = nil
-        item.bytesPerSecond = nil
-        if let dup = failed.firstIndex(where: { $0.kind == item.kind && $0.roomKeys == item.roomKeys }) {
-            failed[dup] = item
-        } else {
-            failed.insert(item, at: 0)
-        }
-        persist()
     }
 
     /// 彻底删除任务条目（不删本地媒体文件、不碰云端）——仅用于没有回滚载荷的历史任务兜底
@@ -404,14 +386,6 @@ func begin(id: UUID,
         item.done = 0
         transient = item
         return item.id
-    }
-
-    func advanceTransient(id: UUID, done: Int, total: Int? = nil, note: String? = nil) {
-        guard var item = transient, item.id == id else { return }
-        item.done = max(0, done)
-        if let total { item.total = max(1, total) }
-        if let note { item.note = note }
-        transient = item
     }
 
     /// 结束临时进度：无论成败都只关闭，不写任何历史
@@ -552,20 +526,6 @@ func begin(id: UUID,
                 Task { @MainActor in self?.migrateMediaQueue() }
             }
             .store(in: &sinks)
-    }
-
-    /// 一批任务结算时，把同一批房号下零散的单房记录收掉，只留总任务一条
-    /// （批量导入必然产生「整批总任务 + 每套房单独记录」，不收掉会刷一屏）
-    func absorbBatch(roomKeys: [String], kinds: [SyncTaskKind] = [.media, .pushUp], since: Date? = nil) {
-        guard !roomKeys.isEmpty else { return }
-        let keySet = Set(roomKeys)
-        failed.removeAll { item in
-            guard kinds.contains(item.kind) else { return false }
-            guard item.roomKeys.allSatisfy({ keySet.contains($0) }) else { return false }
-            guard let since else { return true }
-            return item.createdAt >= since
-        }
-        persist()
     }
 
     private func absorbNewSyncFailures() {
