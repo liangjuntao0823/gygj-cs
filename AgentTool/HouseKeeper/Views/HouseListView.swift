@@ -1453,32 +1453,25 @@ struct HouseListView: View {
             return
         }
 
-        // 双端删除：无云端配置 → 云端本来就没有，只删本地
-        guard let config = CosConfig.load(), config.isValid else {
-            for h in houses where keys.contains(h.mediaRoomKey) {
-                MediaStore.deleteHouseDirectory(roomKey: h.mediaRoomKey)
-                SyncFailStore.clear(h.mediaRoomKey)
-                UnreadCloudHouseStore.clear(h.mediaRoomKey)
-                ctx.delete(h)
-            }
-            do {
-                try ctx.save()
-            } catch {
-                showToast(RemoteConfig.tip("deleteFail", "删除失败：{error}").replacingOccurrences(of: "{error}", with: error.localizedDescription), isError: true)
-                return
-            }
-            deleteTarget = nil
-            if isBatchDelete { exitMultiSelect() }
-            isBatchDelete = false
-            for key in keys { HouseMediaUploadQueue.removeRoom(key) }
-            NotificationCenter.default.post(name: Self.houseStoreChanged, object: nil)
-            showToast("已删除本地 \(keys.count) 套（未配置云端，无需再删云端）")
+        // 未接入服务器：旧桶删除编排已下线，双端删除仅删本地（目录/状态标记/待传队列/记录）
+        for h in houses where keys.contains(h.mediaRoomKey) {
+            MediaStore.deleteHouseDirectory(roomKey: h.mediaRoomKey)
+            SyncFailStore.clear(h.mediaRoomKey)
+            UnreadCloudHouseStore.clear(h.mediaRoomKey)
+            ctx.delete(h)
+        }
+        do {
+            try ctx.save()
+        } catch {
+            showToast(RemoteConfig.tip("deleteFail", "删除失败：{error}").replacingOccurrences(of: "{error}", with: error.localizedDescription), isError: true)
             return
         }
-
-        // 双端删除（先云后本）：云端先删。删完云端的房才动本地；
-        // 云端失败的房本地先不删（防“复活”），挂任务中心标明失败环节，云端重试成功后再清本地。
-        runCloudThenLocalDelete(keys: keys, config: config, ctx: ctx)
+        deleteTarget = nil
+        if isBatchDelete { exitMultiSelect() }
+        isBatchDelete = false
+        for key in keys { HouseMediaUploadQueue.removeRoom(key) }
+        NotificationCenter.default.post(name: Self.houseStoreChanged, object: nil)
+        showToast("已删除本地 \(keys.count) 套")
     }
 
     /// v2.57（P1-2）：双端删除执行体——先逐套删云端，成功一套删一套本地；全部云端成功的房本地立即清、
