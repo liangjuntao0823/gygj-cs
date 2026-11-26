@@ -264,20 +264,6 @@ enum MediaStore {
         }
     }
 
-    /// v1.35：已收录房源套数——以 Media/ 下房号文件夹数量为准（旧版平铺文件不计入）
-    static func houseCount() -> Int {
-        let dir = mediaDirectory()
-        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return 0 }
-        var count = 0
-        for name in names {
-            var isDir: ObjCBool = false
-            if FileManager.default.fileExists(atPath: dir.appendingPathComponent(name).path, isDirectory: &isDir), isDir.boolValue {
-                count += 1
-            }
-        }
-        return count
-    }
-
     /// 房号变更时，把旧房号目录整体迁移到新房号目录（编辑房号后媒体不丢失）
     static func migrateHouseDirectory(from oldKey: String, to newKey: String) {
         guard oldKey != newKey, !oldKey.isEmpty, !newKey.isEmpty else { return }
