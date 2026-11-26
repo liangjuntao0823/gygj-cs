@@ -127,7 +127,7 @@ struct SettingsView: View {
                 Label {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("我的用户名")
-                        Text("操作日志 / 分享 / 统计都带这个名字；在「云端配置」里可下拉选云端已有的用户名")
+                        Text("操作日志 / 分享 / 统计都带这个名字")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -145,7 +145,7 @@ struct SettingsView: View {
                 Label {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("云端配置")
-                        Text("COS 存储桶 / 密钥 / 自定义域名 / 云函数地址")
+                        Text("服务器地址 / 用户名")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -2118,7 +2118,7 @@ struct AccountSettingsPage: View {
                     Label {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("我的用户名")
-                            Text("操作日志 / 分享 / 统计都带这个名字；在「云端配置」里可下拉选云端已有的用户名")
+                            Text("操作日志 / 分享 / 统计都带这个名字")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
@@ -2136,7 +2136,7 @@ struct AccountSettingsPage: View {
                     Label {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("云端配置")
-                            Text("COS 存储桶 / 密钥 / 自定义域名 / 云函数地址")
+                            Text("服务器地址 / 用户名")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
