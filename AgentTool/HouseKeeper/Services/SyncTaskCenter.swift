@@ -395,42 +395,11 @@ func begin(id: UUID,
                           room: item.roomKeys.first ?? "", cloud: false)
     }
 
-    /// v2.53：「彻底取消」= 全量撤回。有回滚载荷则本地+云端、媒体+账本全部恢复原样；
-    /// 撤回中任务转「进行中」显示「正在撤回…」，成功后移除条目（不进最近完成），
-    /// 失败回待处理区、可再次撤回。无载荷的历史任务退化为仅删条目。
+    /// 「彻底取消」：旧链的本地+云端全量撤回随旧桶下线；历史任务这里仅删除任务条目，不再回滚改动。
     func revoke(id: UUID, houseContext: ModelContext?) {
         guard let idx = failed.firstIndex(where: { $0.id == id }) else { return }
-        var item = failed.remove(at: idx)
-        guard let payload = item.rollback, let ctx = houseContext else {
-            // 旧任务 / 无房源上下文：无法全量撤回，按旧口径仅删条目
-            persist()
-            return
-        }
-        item.state = .running
-        item.failure = ""
-        item.note = "正在撤回…"
-        item.done = 0
-        item.finishedAt = nil
-        running.append(item)
+        failed.remove(at: idx)
         persist()
-        let work = Task {
-            let result = await HouseUploadRollbacker.revoke(item, payload: payload, ctx: ctx)
-            UploadTaskRegistry.shared.unregister(item.id)
-            if let rIdx = running.firstIndex(where: { $0.id == item.id }) {
-                if result.failed {
-                    var back = running.remove(at: rIdx)
-                    back.state = .failed
-                    back.failure = "撤回未完成：\(result.errorText)"
-                    back.note = "可再次点「彻底取消」继续撤回"
-                    failed.insert(back, at: 0)
-                    persist()
-                } else {
-                    running.remove(at: rIdx)
-                    persist()
-                }
-            }
-        }
-        UploadTaskRegistry.shared.register(item.id, task: work)
     }
 
     // MARK: 临时进度（总刷新 / 整次同步，不进任务中心）

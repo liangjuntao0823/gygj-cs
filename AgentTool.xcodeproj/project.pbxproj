@@ -65,7 +65,6 @@
 		A10000010000000000000117 /* NetworkMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000117 /* NetworkMonitor.swift */; };
 		A10000010000000000000140 /* MediaPendingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000140 /* MediaPendingView.swift */; };
 		A10000010000000000000141 /* SyncTaskCenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000141 /* SyncTaskCenter.swift */; };
-		A10000010000000000000401 /* HouseUploadRollbacker.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000401 /* HouseUploadRollbacker.swift */; };
 		A10000010000000000000150 /* GlobalAlertCenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000150 /* GlobalAlertCenter.swift */; };
 		A10000010000000000000202 /* MeterModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000202 /* MeterModels.swift */; };
 		A10000010000000000000203 /* MeterStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000203 /* MeterStore.swift */; };
@@ -179,7 +178,6 @@
 		B10000010000000000000117 /* NetworkMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkMonitor.swift; sourceTree = "<group>"; };
 		B10000010000000000000140 /* MediaPendingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaPendingView.swift; sourceTree = "<group>"; };
 		B10000010000000000000141 /* SyncTaskCenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncTaskCenter.swift; sourceTree = "<group>"; };
-		B10000010000000000000401 /* HouseUploadRollbacker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseUploadRollbacker.swift; sourceTree = "<group>"; };
 		B10000010000000000000150 /* GlobalAlertCenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlobalAlertCenter.swift; sourceTree = "<group>"; };
 		B10000010000000000000202 /* MeterModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeterModels.swift; sourceTree = "<group>"; };
 		B10000010000000000000203 /* MeterStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeterStore.swift; sourceTree = "<group>"; };
@@ -418,7 +416,6 @@
 				B10000010000000000000117 /* NetworkMonitor.swift */,
 				B10000010000000000000141 /* SyncTaskCenter.swift */,
 				B10000010000000000000150 /* GlobalAlertCenter.swift */,
-				B10000010000000000000401 /* HouseUploadRollbacker.swift */,
 				SF01 /* SharedBridge.swift */,
 				SF02 /* ShareModels.swift */,
 				SF12 /* ShareLocalInbox.swift */,
@@ -623,7 +620,6 @@
 				A10000010000000000000117 /* NetworkMonitor.swift in Sources */,
 				A10000010000000000000141 /* SyncTaskCenter.swift in Sources */,
 				A10000010000000000000150 /* GlobalAlertCenter.swift in Sources */,
-				A10000010000000000000401 /* HouseUploadRollbacker.swift in Sources */,
 				A10000010000000000000501 /* HouseRemoteClient.swift in Sources */,
 				A10000010000000000000502 /* HouseSyncEngine.swift in Sources */,
 				A10000010000000000000503 /* HouseServerMode.swift in Sources */,
