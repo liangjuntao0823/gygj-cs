@@ -67,18 +67,6 @@ struct SettingsView: View {
     @State private var showBackupCenterRestore = false // 恢复选择器
     @State private var showLogsView = false           // 操作日志
     @State private var showCrashLogsView = false      // v1.17 需求2：崩溃日志查看器（内置，右上角导出 txt）
-    // v2.7（P2⑯）：手动触发桶孤儿媒体清理
-    @State private var showOrphanCleanConfirm = false
-    @State private var orphanCleanResult: String?
-    @State private var orphanCleaning = false
-    @State private var orphanList: [HouseListView.OrphanMedia] = []   // b117：扫描到的孤儿清单
-    @State private var showOrphanListConfirm = false                    // b117：列出清单后二次确认
-    // v2.47：扫描进度弹窗
-    @State private var scanFraction = 0.0
-    @State private var scanStageText = ""
-    @State private var orphanControl: HouseListView.OrphanScanControl?
-    @State private var orphanScanBackgrounded = false
-    @State private var orphanTaskID: UUID?
     @AppStorage("autoBackupRetentionDays") private var backupRetentionDays = 7   // 自动备份保留天数（默认7天，可调）
     @State private var autoBackupEnabled = false
     @State private var backupFrequency = "day"
@@ -334,63 +322,6 @@ struct SettingsView: View {
                     Text(aiCacheSizeText())
                         .foregroundColor(.secondary)
                 }
-            }
-            // v2.7（P2⑯）：手动触发桶孤儿媒体清理——b117：先扫描列清单，用户确认后再删
-            Button {
-                startOrphanScan()
-            } label: {
-                Label {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(orphanCleaning ? "正在扫描云端…" : "清理桶孤儿媒体")
-                        Text("先列出孤儿名单+详细路径，确认后再删除；操作日志会记录")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                } icon: {
-                    Image(systemName: "trash.circle")
-                }
-            }
-            .disabled(orphanCleaning)
-
-            // b117：列出孤儿清单的确认弹窗
-            .alert("发现 \(orphanList.count) 个孤儿媒体", isPresented: $showOrphanListConfirm) {
-                Button("取消", role: .cancel) { orphanList = [] }
-                Button("确认删除", role: .destructive) {
-                    orphanCleaning = true
-                    Task {
-                    await MediaActivityGate.shared.beginCleanup()
-                    defer { Task { await MediaActivityGate.shared.endCleanup() } }
-                        do {
-                            guard let config = CosConfig.load() else {
-                                orphanCleanResult = "请先在「云端配置」填写 COS 配置"
-                                return
-                            }
-                            let list = orphanList
-                            let deleted = await HouseListView.deleteOrphanMedia(list, config: config)
-                            let paths = list.prefix(20).map { $0.path }.joined(separator: "\n")
-                            let more = list.count > 20 ? "\n…等共 \(list.count) 个" : ""
-                            BackupLogStore.log(category: "同步", action: "桶孤儿清理（手动）", result: deleted == list.count ? "成功" : "部分成功",
-                                               detail: "删除 \(deleted)/\(list.count) 个：\n\(paths)\(more)", cloud: true)
-                            orphanCleanResult = "已删除 \(deleted)/\(list.count) 个孤儿媒体（详见操作日志）"
-                        } catch {
-                            orphanCleanResult = "清理失败：\(error.localizedDescription)"
-                        }
-                        orphanList = []
-                        orphanCleaning = false
-                    }
-                }
-            } message: {
-                let preview = orphanList.prefix(15).map { $0.path }.joined(separator: "\n")
-                let more = orphanList.count > 15 ? "\n…等共 \(orphanList.count) 个" : ""
-                Text("以下文件不在任何房源账本名单里，将被删除：\n\(preview)\(more)")
-            }
-            .alert("桶孤儿清理", isPresented: Binding(
-                get: { orphanCleanResult != nil },
-                set: { if !$0 { orphanCleanResult = nil } }
-            )) {
-                Button("好", role: .cancel) { orphanCleanResult = nil }
-            } message: {
-                Text(orphanCleanResult ?? "")
             }
             Button {
                 openHouseDataFolder()
@@ -838,14 +769,6 @@ struct SettingsView: View {
         NavigationStack {
             settingsFormFull
         }
-        .overlay {
-            if orphanCleaning && !orphanScanBackgrounded {
-                OrphanScanProgressOverlay(
-                    fraction: scanFraction, stage: scanStageText,
-                    onBackground: { orphanScanBackgrounded = true },
-                    onCancel: { Task { await orphanControl?.cancel() } })
-            }
-        }
     }
 
     /// v1.6：设置页主体拆为独立属性（避免 body 表达式 type-check 超时）
@@ -896,82 +819,6 @@ struct SettingsView: View {
             }
     }
 
-    /// 开扫：建控制令牌与中心任务，注册重试入口（重试时整体重新建一套）
-    @MainActor
-    private func startOrphanScan() {
-        orphanCleaning = true
-        orphanScanBackgrounded = false
-        scanFraction = 0
-        let control = HouseListView.OrphanScanControl()
-        orphanControl = control
-        orphanTaskID = SyncTaskCenter.shared.begin(
-            kind: .orphan, title: "清理桶孤儿媒体", total: 1)
-        TaskRetryPerformer.shared.orphanScan = {
-            await startOrphanScanAndRun()
-        }
-        Task {
-            await MediaActivityGate.shared.beginCleanup()
-            defer { Task { await MediaActivityGate.shared.endCleanup() } }
-            await runOrphanScan(control: control)
-        }
-    }
-
-    /// 重试入口：重新建一套令牌与任务再跑
-    @MainActor
-    private func startOrphanScanAndRun() async {
-        orphanCleaning = true
-        orphanScanBackgrounded = false
-        scanFraction = 0
-        let control = HouseListView.OrphanScanControl()
-        orphanControl = control
-        orphanTaskID = SyncTaskCenter.shared.begin(
-            kind: .orphan, title: "清理桶孤儿媒体", total: 1)
-        await MediaActivityGate.shared.beginCleanup()
-        defer { Task { await MediaActivityGate.shared.endCleanup() } }
-        await runOrphanScan(control: control)
-    }
-
-    /// 孤儿扫描主流程（手动触发与任务中心重试共用）。
-    /// 取消：立即停止扫描，一个文件都不删，进最近完成并写明已取消。
-    @MainActor
-    private func runOrphanScan(control: HouseListView.OrphanScanControl) async {
-        guard let id = orphanTaskID else { return }
-        do {
-            guard let config = CosConfig.load() else {
-                orphanCleanResult = "请先在「云端配置」填写 COS 配置"
-                SyncTaskCenter.shared.finish(id: id, success: false,
-                                            failure: "没读到 COS 配置，先到「云端配置」填好再重试")
-                orphanCleaning = false
-                return
-            }
-            let list = try await HouseListView.scanOrphanMedia(config: config, control: control) { done, total, room in
-                Task { @MainActor in
-                    scanFraction = Double(done) / Double(max(1, total))
-                    scanStageText = room.isEmpty ? "正在列桶…" : "正在核对 \(room)（\(done)/\(total)）"
-                    SyncTaskCenter.shared.advance(id: id, done: done, total: max(1, total),
-                                                  note: "正在核对 \(room)")
-                }
-            }
-            if await control.isCancelled {
-                // 取消本次：停止扫描，不删任何文件
-                SyncTaskCenter.shared.cancel(id: id, note: "已取消本次扫描，未删除任何文件")
-                orphanCleanResult = "已取消本次扫描，未删除任何文件"
-            } else if list.isEmpty {
-                orphanCleanResult = "扫描完成：没有发现孤儿媒体"
-                SyncTaskCenter.shared.finish(id: id, success: true, note: "没有发现孤儿媒体")
-            } else {
-                orphanList = list
-                SyncTaskCenter.shared.finish(id: id, success: true,
-                                            note: "发现 \(list.count) 个孤儿，确认名单后再删")
-                showOrphanListConfirm = true
-            }
-        } catch {
-            orphanCleanResult = "扫描失败：\(error.localizedDescription)"
-            SyncTaskCenter.shared.finish(id: id, success: false,
-                                        failure: "扫描失败：\(error.localizedDescription)，点重试")
-        }
-        orphanCleaning = false
-    }
 
     /// 导航栏（回收站入口）与进入页面时的初始化
     private var settingsFormChrome: some View {
@@ -3098,15 +2945,6 @@ struct StorageSettingsPage: View {
     @State private var showAlert = false
     @State private var showAICacheConfirm = false
     @State private var showIpaClearConfirm = false
-    @State private var orphanCleaning = false
-    @State private var orphanCleanResult: String?
-    @State private var orphanList: [HouseListView.OrphanMedia] = []
-    @State private var showOrphanListConfirm = false
-    @State private var scanFraction = 0.0
-    @State private var scanStageText = ""
-    @State private var orphanControl: HouseListView.OrphanScanControl?
-    @State private var orphanTaskID: UUID?
-    @State private var orphanScanBackgrounded = false
 
     /// v2.23：已下载的安装包占用文案（个数 · 大小）
     private func downloadedPackagesText() -> String {
@@ -3183,38 +3021,9 @@ struct StorageSettingsPage: View {
                 Text("数据存放在「公寓管家」文件夹内的 backups / media 两个子文件夹；换机或重装时整个文件夹拷回原位即可还原。")
             }
 
-            Section {
-                Button {
-                    startOrphanScan()
-                } label: {
-                    Label {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(orphanCleaning ? "正在扫描云端…" : "清理桶孤儿媒体")
-                            Text("先列出孤儿名单+详细路径，确认后再删除；操作日志会记录")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                    } icon: {
-                        Image(systemName: "trash.circle")
-                    }
-                }
-                .disabled(orphanCleaning)
-            } header: {
-                Text("云端清理")
-            } footer: {
-                Text("只删不在任何房源账本名单里的桶内媒体对象，不影响正在使用的照片视频。")
-            }
         }
         .navigationTitle("存储与清理")
         .navigationBarTitleDisplayMode(.inline)
-        .overlay {
-            if orphanCleaning && !orphanScanBackgrounded {
-                OrphanScanProgressOverlay(
-                    fraction: scanFraction, stage: scanStageText,
-                    onBackground: { orphanScanBackgrounded = true },
-                    onCancel: { Task { await orphanControl?.cancel() } })
-            }
-        }
         .alert("提示", isPresented: $showAlert) {
             Button("确定", role: .cancel) { }
         } message: {
@@ -3240,45 +3049,6 @@ struct StorageSettingsPage: View {
         } message: {
             Text("将删除 Updates 文件夹里已下载的全部 .ipa（不影响已安装的 App，也不影响下次更新下载）。")
         }
-        .alert("发现 \(orphanList.count) 个孤儿媒体", isPresented: $showOrphanListConfirm) {
-            Button("取消", role: .cancel) { orphanList = [] }
-            Button("确认删除", role: .destructive) {
-                orphanCleaning = true
-                Task {
-                await MediaActivityGate.shared.beginCleanup()
-                defer { Task { await MediaActivityGate.shared.endCleanup() } }
-                    do {
-                        guard let config = CosConfig.load() else {
-                            orphanCleanResult = "请先在「云端配置」填写 COS 配置"
-                            return
-                        }
-                        let list = orphanList
-                        let deleted = await HouseListView.deleteOrphanMedia(list, config: config)
-                        let paths = list.prefix(20).map { $0.path }.joined(separator: "\n")
-                        let more = list.count > 20 ? "\n…等共 \(list.count) 个" : ""
-                        BackupLogStore.log(category: "同步", action: "桶孤儿清理（手动）", result: deleted == list.count ? "成功" : "部分成功",
-                                           detail: "删除 \(deleted)/\(list.count) 个：\n\(paths)\(more)", cloud: true)
-                        orphanCleanResult = "已删除 \(deleted)/\(list.count) 个孤儿媒体（详见操作日志）"
-                    } catch {
-                        orphanCleanResult = "清理失败：\(error.localizedDescription)"
-                    }
-                    orphanList = []
-                    orphanCleaning = false
-                }
-            }
-        } message: {
-            let preview = orphanList.prefix(15).map { $0.path }.joined(separator: "\n")
-            let more = orphanList.count > 15 ? "\n…等共 \(orphanList.count) 个" : ""
-            Text("以下文件不在任何房源账本名单里，将被删除：\n\(preview)\(more)")
-        }
-        .alert("桶孤儿清理", isPresented: Binding(
-            get: { orphanCleanResult != nil },
-            set: { if !$0 { orphanCleanResult = nil } }
-        )) {
-            Button("好", role: .cancel) { orphanCleanResult = nil }
-        } message: {
-            Text(orphanCleanResult ?? "")
-        }
     }
 
     private func openHouseDataFolder() {
@@ -3290,133 +3060,8 @@ struct StorageSettingsPage: View {
         }
     }
 
-    /// 开扫：建令牌与中心任务，注册重试入口
-    @MainActor
-    private func startOrphanScan() {
-        orphanCleaning = true
-        orphanScanBackgrounded = false
-        scanFraction = 0
-        let control = HouseListView.OrphanScanControl()
-        orphanControl = control
-        orphanTaskID = SyncTaskCenter.shared.begin(
-            kind: .orphan, title: "清理桶孤儿媒体", total: 1)
-        TaskRetryPerformer.shared.orphanScan = {
-            await startOrphanScanAndRun()
-        }
-        Task {
-            await MediaActivityGate.shared.beginCleanup()
-            defer { Task { await MediaActivityGate.shared.endCleanup() } }
-            await runOrphanScan(control: control)
-        }
-    }
-
-    /// 重试入口：重新建一套再跑
-    @MainActor
-    private func startOrphanScanAndRun() async {
-        orphanCleaning = true
-        orphanScanBackgrounded = false
-        scanFraction = 0
-        let control = HouseListView.OrphanScanControl()
-        orphanControl = control
-        orphanTaskID = SyncTaskCenter.shared.begin(
-            kind: .orphan, title: "清理桶孤儿媒体", total: 1)
-        await MediaActivityGate.shared.beginCleanup()
-        defer { Task { await MediaActivityGate.shared.endCleanup() } }
-        await runOrphanScan(control: control)
-    }
-
-    /// 孤儿扫描主流程（手动触发与任务中心重试共用）；取消即停止扫描，一个文件都不删
-    @MainActor
-    private func runOrphanScan(control: HouseListView.OrphanScanControl) async {
-        guard let id = orphanTaskID else { return }
-        do {
-            guard let config = CosConfig.load() else {
-                orphanCleanResult = "请先在「云端配置」填写 COS 配置"
-                SyncTaskCenter.shared.finish(id: id, success: false,
-                                            failure: "没读到 COS 配置，先到「云端配置」填好再重试")
-                orphanCleaning = false
-                return
-            }
-            let list = try await HouseListView.scanOrphanMedia(config: config, control: control) { done, total, room in
-                Task { @MainActor in
-                    scanFraction = Double(done) / Double(max(1, total))
-                    scanStageText = room.isEmpty ? "正在列桶…" : "正在核对 \(room)（\(done)/\(total)）"
-                    SyncTaskCenter.shared.advance(id: id, done: done, total: max(1, total),
-                                                  note: "正在核对 \(room)")
-                }
-            }
-            if await control.isCancelled {
-                SyncTaskCenter.shared.cancel(id: id, note: "已取消本次扫描，未删除任何文件")
-                orphanCleanResult = "已取消本次扫描，未删除任何文件"
-            } else if list.isEmpty {
-                orphanCleanResult = "扫描完成：没有发现孤儿媒体"
-                SyncTaskCenter.shared.finish(id: id, success: true, note: "没有发现孤儿媒体")
-            } else {
-                orphanList = list
-                SyncTaskCenter.shared.finish(id: id, success: true,
-                                            note: "发现 \(list.count) 个孤儿，确认名单后再删")
-                showOrphanListConfirm = true
-            }
-        } catch {
-            orphanCleanResult = "扫描失败：\(error.localizedDescription)"
-            SyncTaskCenter.shared.finish(id: id, success: false,
-                                        failure: "扫描失败：\(error.localizedDescription)，点重试")
-        }
-        orphanCleaning = false
-    }
 }
 
-
-// v2.47：桶孤儿媒体扫描进度弹窗
-struct OrphanScanProgressOverlay: View {
-    let fraction: Double
-    let stage: String
-    var onBackground: () -> Void = {}
-    var onCancel: () -> Void = {}
-
-    var body: some View {
-        ZStack {
-            Color.black.opacity(0.35).ignoresSafeArea()
-            VStack(spacing: 14) {
-                ProgressView(value: max(0, min(1, fraction)))
-                    .progressViewStyle(.linear)
-                    .tint(.white)
-                Text(stage.isEmpty ? "正在扫描云端…" : stage)
-                    .font(.footnote.weight(.medium))
-                    .foregroundColor(.white)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
-                Text("\(Int(max(0, min(1, fraction)) * 100))%")
-                    .font(.caption)
-                    .foregroundColor(.white.opacity(0.85))
-                HStack(spacing: 12) {
-                    Button {
-                        onBackground()
-                    } label: {
-                        Text("后台运行")
-                            .font(.footnote.weight(.medium))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 12).padding(.vertical, 7)
-                            .background(Color.white.opacity(0.18), in: Capsule())
-                    }
-                    Button {
-                        onCancel()
-                    } label: {
-                        Text("取消本次")
-                            .font(.footnote.weight(.medium))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 12).padding(.vertical, 7)
-                            .background(Color.white.opacity(0.18), in: Capsule())
-                    }
-                }
-            }
-            .padding(22)
-            .frame(maxWidth: 300)
-            .background(Color.black.opacity(0.65))
-            .clipShape(RoundedRectangle(cornerRadius: 14))
-        }
-    }
-}
 
 // MARK: - v2.51 电梯码快捷入口（gongyuguanjia-fwq://elevator）
 
