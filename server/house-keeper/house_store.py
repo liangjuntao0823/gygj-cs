@@ -296,11 +296,12 @@ class HouseStore:
             op = str(event.get("operator") or operator or "未知用户")
             action = str(event.get("action") or "")
             detail = str(event.get("detail") or "")
+            migrated = 1 if event.get("migrated") in (True, 1, "1", "true", "True") else 0
             conn.execute(
                 "INSERT OR IGNORE INTO ledger_events "
                 "(id,room_key,ts,operator,action,detail,migrated) "
-                "VALUES (?,?,?,?,?,?,0)",
-                (event_id, room_key, ts, op, action, detail))
+                "VALUES (?,?,?,?,?,?,?)",
+                (event_id, room_key, ts, op, action, detail, migrated))
             for ch in event.get("fieldChanges") or []:
                 conn.execute(
                     "INSERT OR IGNORE INTO field_changes "
