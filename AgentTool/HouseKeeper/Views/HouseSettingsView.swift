@@ -1339,29 +1339,8 @@ struct ShareProfileView: View {
         return p.isEmpty ? "13288251132" : p
     }
 
-    /// v1.42：把本地二维码立即同步到云端桶 users/<用户名>/qrcode.jpg（已发出的 H5 链接动态引用桶 URL，
-    /// 保存/清除后无需重新分享即生效）。未配置云存储或上传失败时静默跳过（下次分享时仍会照常上传）。
-    private func syncQRToCloud(clear: Bool) {
-        // 服务器模式：二维码只存本机 QrcodeStore，不再上传存储桶
-        if HouseServerMode.ready { return }
-        guard let config = CosConfig.load() else { return }
-        Task {
-            do {
-                if clear {
-                    if let url = try? CosUploader.presignedURL(for: CloudUser.qrPath, method: "DELETE", expires: 600, headers: [], config: config) {
-                        var req = URLRequest(url: url)
-                        req.httpMethod = "DELETE"
-                        _ = try? await URLSession.shared.data(for: req)
-                    }
-                } else if let data = QrcodeStore.loadData(),
-                          let jpeg = UIImage(data: data)?.jpegData(compressionQuality: 0.9) {
-                    try await CosUploader.upload(data: jpeg, to: CloudUser.qrPath, contentType: "image/jpeg", config: config)
-                }
-            } catch {
-                // 静默：网络/配置问题不阻塞本地保存，分享时会再次上传
-            }
-        }
-    }
+    /// 旧桶二维码上行已下线：二维码只存本机 QrcodeStore；服务器名片/二维码上行通道待阶段 B 接入。
+    private func syncQRToCloud(clear: Bool) {}
 
     var body: some View {
         Form {
@@ -1491,23 +1470,8 @@ struct ShareProfileView: View {
         }
     }
 
-    /// v1.47：把名片姓名/电话同步到云端 users/<用户名>/profile.json——公开选房 H5（?act=rooms）
-    /// 每次打开/刷新实时读取它，改名片后租客刷新页面即显示最新（二维码图已由 syncQRToCloud 上传 qrcode.jpg）。
-    private func syncProfileToCloud(name: String, phone: String) {
-        // 服务器模式：姓名/电话只存本机钥匙串，不上传服务器或存储桶
-        if HouseServerMode.ready { return }
-        guard let config = CosConfig.load() else { return }
-        Task {
-            do {
-                let obj: [String: Any] = ["name": name, "phone": phone, "updated": ISO8601DateFormatter().string(from: Date())]
-                if let data = try? JSONSerialization.data(withJSONObject: obj, options: []) {
-                    try await CosUploader.upload(data: data, to: CloudUser.userRootPrefix + "profile.json", contentType: "application/json", config: config)
-                }
-            } catch {
-                // 静默：网络/配置问题不阻塞本地保存，下次分享时仍会照常上传
-            }
-        }
-    }
+    /// 旧桶名片上行已下线：姓名/电话只存本机钥匙串；服务器名片上行通道待阶段 B 接入。
+    private func syncProfileToCloud(name: String, phone: String) {}
 
     /// 保存分享名片信息（姓名/电话）到钥匙串
     private func saveShareProfile() {
@@ -1598,11 +1562,8 @@ struct RoomsShareView: View {
         }
     }
 
-    /// v1.50：App 本地生成选房静态壳并上传 COS，用 presignedGetURL 生成链接——
-    /// 与单房分享 H5 完全同机制：链接走自定义域名（微信按网页打开+抓卡片），
-    /// 页面 JS 每次打开/刷新实时拉 rooms_json，房源/名片/二维码变化刷新即最新。
+    /// 选房页由服务器本地托管静态壳，长期有效，房源/名片刷新即最新；旧桶 H5 壳上传链路已下线。
     private func refreshLink() async {
-        // 服务器模式：选房页由服务器本地托管静态壳，长期有效，房源/名片刷新即最新
         if HouseServerMode.ready {
             if let h5 = HouseRemoteClient.h5URL() {
                 cosLink = h5.absoluteString
@@ -1613,35 +1574,7 @@ struct RoomsShareView: View {
             }
             return
         }
-        guard let config = CosConfig.load() else {
-            cosLink = ""
-            linkTip = "尚未配置云端\n请先到「设置 → 房源分享 → 云端配置」填写 COS 密钥并保存验证"
-            return
-        }
-        guard !config.customDomain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            cosLink = ""
-            linkTip = "请先在云端配置填写「自定义域名」\n（与单房分享 H5 相同，否则微信会把链接当文件下载）"
-            return
-        }
-        guard !CloudConfig.functionURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            cosLink = ""
-            linkTip = "请先在云端配置填写「云函数地址」\n（选房页数据靠云函数实时提供）"
-            return
-        }
-        do {
-            let remotePath = CloudUser.userRootPrefix + "rooms/index.html"
-            // v1.55：重新生成前先删除旧壳对象 → 旧链接立即失效（COS 对已删对象返回 404，不再能打开）
-            try? await CloudBackupService.deleteRemoteObject(name: remotePath, config: config)
-            // v1.55：链接有效期按「设置 → 房源分享 → 选房链接有效期」动态控制（默认 2 天）
-            let days = roomsLinkExpiryDays
-            let url = try CosUploader.presignedGetURL(for: remotePath, expires: days * 86400, config: config)
-            let html = CosUploader.buildRoomsShellHTML(config: config, shellURL: url.absoluteString)
-            try await CosUploader.upload(data: Data(html.utf8), to: remotePath, contentType: "text/html; charset=utf-8", config: config)
-            cosLink = url.absoluteString
-            linkTip = "当前链接 \(days) 天内有效，到期后请重新生成并发新链接给租客"
-        } catch {
-            cosLink = ""
-            linkTip = "生成失败：\(error.localizedDescription)\n请检查云端配置与网络后重试"
-        }
+        cosLink = ""
+        linkTip = "服务器地址未配置，请到「电表监控设置」检查服务器地址"
     }
 }
