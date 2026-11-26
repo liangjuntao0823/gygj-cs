@@ -14,7 +14,6 @@ enum SyncTaskKind: String, Codable, CaseIterable {
     case retry       // 补漏与失败重试
     case orphan      // 清理桶孤儿媒体
     case mediaDelete // 删云端媒体（本地已删，云端对象没删掉）
-    case houseDraft  // 断网时没提交成功的房源改动（原草稿箱，现并入任务中心）
 
     var displayName: String {
         switch self {
@@ -25,7 +24,6 @@ enum SyncTaskKind: String, Codable, CaseIterable {
         case .retry: return "补漏与失败重试"
         case .orphan: return "清理桶孤儿媒体"
         case .mediaDelete: return "删云端媒体"
-        case .houseDraft: return "提交房源改动"
         }
     }
 
@@ -38,7 +36,6 @@ enum SyncTaskKind: String, Codable, CaseIterable {
         case .retry: return "wrench.and.screwdriver"
         case .orphan: return "trash.circle"
         case .mediaDelete: return "trash.slash"
-        case .houseDraft: return "square.and.pencil"
         }
     }
 
@@ -548,8 +545,6 @@ func begin(id: UUID,
         }
         // 3) 旧的待补传媒体队列整体迁移进来（队列本身保留，只做「待上传豁免」登记，不再自动补传）
         migrateMediaQueue()
-        // 3.1) 原来的草稿箱并入任务中心：草稿不再是独立入口，统一按「提交房源改动」待处理
-        migrateDrafts()
         if failed.count > maxFailed { failed = Array(failed.prefix(maxFailed)) }
         persist()
 
@@ -565,33 +560,6 @@ func begin(id: UUID,
                 Task { @MainActor in self?.migrateMediaQueue() }
             }
             .store(in: &sinks)
-        NotificationCenter.default.publisher(for: HouseDraftStore.didChange)
-            .sink { [weak self] _ in
-                Task { @MainActor in self?.migrateDrafts() }
-            }
-            .store(in: &sinks)
-    }
-
-    /// 草稿箱并入任务中心：一条草稿 = 一条「提交房源改动」待处理，重试即提交
-    private func migrateDrafts() {
-        let drafts = HouseDraftStore.shared.drafts
-        // 草稿已经提交成功/被删掉的，对应的任务同步收掉
-        let aliveKeys = Set(drafts.map { $0.roomKey })
-        failed.removeAll { $0.kind == .houseDraft && !aliveKeys.contains($0.roomKeys.first ?? "") }
-        for draft in drafts {
-            if let i = failed.firstIndex(where: { $0.kind == .houseDraft && $0.roomKeys == [draft.roomKey] }) {
-                failed[i].note = draft.changeSummary
-                failed[i].failure = "\(draft.displayRoomNo) 的改动只存本机，没提交到云端；点重试"
-                continue
-            }
-            var item = TaskRecord(kind: .houseDraft, title: "提交房源改动",
-                                  roomKeys: [draft.roomKey], total: 1, state: .failed)
-            item.note = draft.changeSummary
-            item.failure = "\(draft.displayRoomNo) 的改动只存本机，没提交到云端；点重试"
-            item.finishedAt = Date()
-            failed.insert(item, at: 0)
-        }
-        persist()
     }
 
     /// 一批任务结算时，把同一批房号下零散的单房记录收掉，只留总任务一条
@@ -747,8 +715,6 @@ final class TaskRetryPerformer {
             await retryPushUp(item, completion: completion)
         case .mediaDelete:
             await retryMediaDelete(item, completion: completion)
-        case .houseDraft:
-            await retryHouseDraft(item, completion: completion)
         case .media, .retry:
             if item.isHouseUpload == true {
                 await retryHouseUpload(item, completion: completion)
@@ -888,26 +854,6 @@ final class TaskRetryPerformer {
             completion(.success(note: "云端已删掉 \(files.count) 个媒体"))
         } else {
             completion(.failure(message: "还有 \(failures.count) 个媒体没删掉，可再点重试"))
-        }
-    }
-
-    /// 提交房源改动（原草稿）：走原来的草稿提交逻辑，冲突时保留草稿并提示重新编辑
-    private func retryHouseDraft(_ item: TaskRecord, completion: @escaping (TaskRetryOutcome) -> Void) async {
-        guard let ctx = houseContext else {
-            completion(.failure(message: "数据容器不可用，请重进 App 再试")); return
-        }
-        guard let roomKey = item.roomKeys.first,
-              let draft = HouseDraftStore.shared.drafts.first(where: { $0.roomKey == roomKey }) else {
-            completion(.success(note: "这条改动已经提交过了"))
-            return
-        }
-        do {
-            let msg = try await HouseDraftSubmitter.submit(draft: draft, ctx: ctx, force: false)
-            completion(.success(note: msg))
-        } catch let e as HouseDraftError {
-            completion(.failure(message: e.errorDescription ?? "提交失败"))
-        } catch {
-            completion(.failure(message: error.localizedDescription))
         }
     }
 
