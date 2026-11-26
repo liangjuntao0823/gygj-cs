@@ -72,6 +72,17 @@ struct RemoteFieldChange: Codable, Hashable {
     let newValue: String
 }
 
+struct RemoteLedgerWriteItem: Codable {
+    let ok: Bool?
+    let id: String?
+    let deduplicated: Bool?
+}
+
+struct RemoteLedgerWriteResult: Codable {
+    let ok: Bool
+    let results: [RemoteLedgerWriteItem]?
+}
+
 struct RemoteHouseStats: Codable {
     let ok: Bool
     let total: Int
@@ -195,6 +206,33 @@ final class HouseRemoteClient {
             throw HouseAPIError(message: "读取账本失败（服务器 \(http.statusCode)）")
         }
         return try decode(RemoteLedgerList.self, data: data).ledger
+    }
+
+    /// 上报一条账本事件（append-only，服务器按事件 id 幂等去重）；不进实时广播
+    func appendLedger(roomKey: String, event: HouseLedgerEvent) async throws {
+        let ts = ISO8601DateFormatter().string(from: event.date)
+        let changes = event.fieldChanges.map { ch -> [String: String] in
+            ["field": ch.field, "oldValue": ch.oldValue, "newValue": ch.newValue]
+        }
+        let body: [String: Any] = [
+            "id": event.id,
+            "ts": ts,
+            "operator": operatorName,
+            "originDeviceId": originDeviceId,
+            "action": event.action,
+            "detail": event.detail,
+            "migrated": event.migrated,
+            "fieldChanges": changes,
+        ]
+        let path = "/api/house/houses/\(encodedRoomKey(roomKey))/ledger"
+        let (data, http) = try await makeRequest(path, method: "POST", body: body)
+        guard http.statusCode == 200 else {
+            throw HouseAPIError(message: "账本同步失败（服务器 \(http.statusCode)）")
+        }
+        let result = try decode(RemoteLedgerWriteResult.self, data: data)
+        guard result.ok else {
+            throw HouseAPIError(message: "服务器未接收账本事件")
+        }
     }
 
     func stats() async throws -> RemoteHouseStats {

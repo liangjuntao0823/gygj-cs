@@ -417,6 +417,7 @@ class Store:
         token = secrets.token_hex(24)
         tenants[token] = {
             "enabled": False,           # App 打开云端值守开关并 PUT config 后才置 true
+            "house_access": True,       # 房源库访问授权；后台可置 False 仅保留电表通道
             "created_at": iso_now(),
             "updated_at": iso_now(),
             "device": str(device or "")[:120],
@@ -442,6 +443,8 @@ class Store:
             return None
         if "enabled" in payload:
             tenant["enabled"] = bool(payload["enabled"])
+        if "house_access" in payload:
+            tenant["house_access"] = bool(payload["house_access"])
         if "device" in payload:
             tenant["device"] = str(payload.get("device") or "")[:120]
         tenant["updated_at"] = iso_now()

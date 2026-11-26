@@ -103,6 +103,19 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
             return None
         return handler.rfile.read(length)
 
+    # 鉴权 + 房源库授权粒度：令牌有效但 house_access=False 的租户仅保留电表通道，
+    # 房源相关接口回 403；缺省视为授权，兼容存量租户。公开通道 /api/public/* 不经过这里。
+    def auth_house() -> bool:
+        auth = handler._require_auth()
+        if not auth:
+            return False  # _require_auth 已回 401
+        _, tenant = auth
+        if isinstance(tenant, dict) and tenant.get("house_access") is False:
+            send(403, {"ok": False, "error": "forbidden",
+                       "detail": "暂无房源访问权限"})
+            return False
+        return True
+
     try:
         # ---- 公开只读：脱敏房源 + 媒体（访客无 token，H5/分享页用）----
         if path == f"{PUBLIC_PREFIX}/rooms" and method == "GET":
@@ -135,18 +148,18 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
             return send(200, {"ok": True, "service": "house-keeper", **store.stats()})
 
         if path == f"{PREFIX}/stats" and method == "GET":
-            if not handler._require_auth():
+            if not auth_house():
                 return True
             return send(200, {"ok": True, **store.stats()})
 
         # ---- 名片（姓名 / 电话；二维码图片走媒体通道）----
         if path == f"{PREFIX}/profile" and method == "GET":
-            if not handler._require_auth():
+            if not auth_house():
                 return True
             return send(200, {"ok": True, "profile": store.profile_get()})
 
         if path == f"{PREFIX}/profile" and method == "PUT":
-            if not handler._require_auth():
+            if not auth_house():
                 return True
             body = handler._read_json()
             if body is None:
@@ -159,12 +172,12 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
 
         # ---- 分享记录 ----
         if path == f"{PREFIX}/share-records" and method == "GET":
-            if not handler._require_auth():
+            if not auth_house():
                 return True
             return send(200, {"ok": True, "records": store.share_records_list()})
 
         if path == f"{PREFIX}/share-records" and method == "POST":
-            if not handler._require_auth():
+            if not auth_house():
                 return True
             body = handler._read_json() or {}
             rec = store.share_records_add(
@@ -176,12 +189,12 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
 
         # ---- 远程配置 / 在线更新块（服务器权威，本地可改后回写）----
         if path == f"{PREFIX}/config" and method == "GET":
-            if not handler._require_auth():
+            if not auth_house():
                 return True
             return send(200, {"ok": True, "config": store.config_get("app")})
 
         if path == f"{PREFIX}/config" and method == "PUT":
-            if not handler._require_auth():
+            if not auth_house():
                 return True
             body = handler._read_json()
             if body is None:
@@ -191,7 +204,7 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
 
         # ---- 房源媒体（服务器磁盘；二进制直传/直出）----
         if path.startswith(f"{PREFIX}/media/"):
-            if not handler._require_auth():
+            if not auth_house():
                 return True
             rest = urllib.parse.unquote(path[len(f"{PREFIX}/media/"):])
             segs = [s for s in rest.strip("/").split("/") if s]
@@ -225,13 +238,13 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
 
         # ---- 备份 zip（服务器磁盘；替代旧 COS backups/ 目录）----
         if path == f"{PREFIX}/backups" and method == "GET":
-            if not handler._require_auth():
+            if not auth_house():
                 return True
             return send(200, {"ok": True,
                               "backups": store.backups.list_backups(BACKUP_OWNER)})
 
         if path == f"{PREFIX}/backups" and method == "POST":
-            if not handler._require_auth():
+            if not auth_house():
                 return True
             file_name = handler.headers.get("X-Backup-Name") or _q(handler).get("name", "")
             is_auto = (handler.headers.get("X-Is-Auto") or "").lower() in ("1", "true", "yes")
@@ -247,7 +260,7 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
             return send(200, {"ok": True, "record": record})
 
         if path.startswith(f"{PREFIX}/backups/"):
-            if not handler._require_auth():
+            if not auth_house():
                 return True
             rest = urllib.parse.unquote(path[len(f"{PREFIX}/backups/"):])
             segs = [s for s in rest.strip("/").split("/") if s]
@@ -269,7 +282,7 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
 
         # ---- 集合级 ----
         if path == f"{PREFIX}/houses" and method == "GET":
-            if not handler._require_auth():
+            if not auth_house():
                 return True
             q = _q(handler)
             since = int(q["since"]) if q.get("since", "").isdigit() else None
@@ -278,7 +291,7 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
             return send(200, {"ok": True, **payload})
 
         if path in (f"{PREFIX}/houses", f"{PREFIX}/houses:batch") and method == "POST":
-            if not handler._require_auth():
+            if not auth_house():
                 return True
             body = handler._read_json()
             if body is None:
@@ -312,13 +325,13 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
         segs = [s for s in rest.strip("/").split("/") if s]
 
         if len(segs) == 1 and method == "GET":
-            if not handler._require_auth():
+            if not auth_house():
                 return True
             doc = store.get_house(segs[0])
             return send(200 if doc else 404, doc or {"ok": False, "error": "not_found"})
 
         if len(segs) == 1 and method == "DELETE":
-            if not handler._require_auth():
+            if not auth_house():
                 return True
             body = handler._read_json() or {}
             operator = str(body.get("operator") or "未知用户")
@@ -329,7 +342,7 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
             return send(200, {"ok": True, **doc})
 
         if len(segs) == 2 and segs[1] == "restore" and method == "POST":
-            if not handler._require_auth():
+            if not auth_house():
                 return True
             body = handler._read_json() or {}
             operator = str(body.get("operator") or "未知用户")
@@ -339,10 +352,28 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
             return send(200, {"ok": True, **doc})
 
         if len(segs) == 2 and segs[1] == "ledger" and method == "GET":
-            if not handler._require_auth():
+            if not auth_house():
                 return True
             return send(200, {"ok": True, "roomKey": segs[0],
                               "ledger": store.ledger(segs[0])})
+
+        if len(segs) == 2 and segs[1] == "ledger" and method == "POST":
+            if not auth_house():
+                return True
+            body = handler._read_json() or {}
+            operator = str(body.get("operator") or "未知用户")
+            events = body.get("events") if isinstance(body.get("events"), list) else [body]
+            results = []
+            for ev in events:
+                if not isinstance(ev, dict):
+                    continue
+                try:
+                    res = store.append_ledger_event(segs[0], ev, operator=operator)
+                    results.append({"ok": True, **res})
+                except Exception as e:
+                    results.append({"ok": False, "error": "bad_request",
+                                    "detail": str(e)[:200]})
+            return send(200, {"ok": all(r["ok"] for r in results), "results": results})
 
         return send(404, {"ok": False, "error": "not_found"})
     except Exception:

@@ -213,6 +213,9 @@ struct CosConfigView: View {
                             .font(.footnote)
                     }
                 }
+                Toggle("启用服务器同步", isOn: Binding(
+                    get: { HouseServerMode.enabled },
+                    set: { HouseServerMode.enabled = $0 }))
                 TextField("服务器地址", text: $endpointInput)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()

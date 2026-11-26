@@ -303,12 +303,13 @@ enum HouseLedgerStore {
 
     /// v2.52：有云配置就后台合并上传；无配置/无效配置也标记待同步，配置好后启动自动补
     static func scheduleSync(roomKey: String) {
-        // 服务器模式：账本权威源在 8082 服务器库，切割期旧 COS 桶只作回退底、不回写；
-        // 待确认事件保留本机 pending 兜底，不向旧桶发起账本写请求。
+        // 服务器模式：账本权威源在 8082 服务器库，待确认事件逐条 POST 服务器上行；
+        // 成功并入本地正式账本，失败保留 pending 并入 dirty 名单待下次补传。
         // 分享扩展不含服务器模式判定，条件编译剔除该分支，保持旧链路兜底。
         #if !APP_EXTENSION
         if HouseServerMode.ready {
             markDirty(roomKey)
+            Task { await syncPending(roomKey: roomKey) }
             return
         }
         #endif
@@ -321,6 +322,48 @@ enum HouseLedgerStore {
             catch { markDirty(roomKey) }
         }
     }
+
+    #if !APP_EXTENSION
+    /// 读取某房待确认事件（持锁；供上行补传使用）
+    static func pendingEvents(roomKey: String) -> [HouseLedgerEvent] {
+        fileLock.lock()
+        defer { fileLock.unlock() }
+        return loadPendingUnlocked(roomKey: roomKey)
+    }
+
+    /// 把某房待确认事件逐条上报服务器；成功并入本地正式账本并清 pending，失败保留 + markDirty
+    static func syncPending(roomKey: String) async {
+        guard HouseServerMode.ready else { markDirty(roomKey: roomKey); return }
+        guard await HouseLedgerSyncGate.shared.begin(roomKey) else { return }
+        defer { Task { await HouseLedgerSyncGate.shared.end(roomKey) } }
+        let pending = pendingEvents(roomKey: roomKey)
+        guard !pending.isEmpty else { clearDirty(roomKey: roomKey); return }
+        var uploaded: [HouseLedgerEvent] = []
+        var failed = false
+        for ev in pending {
+            do {
+                try await HouseRemoteClient.shared.appendLedger(roomKey: roomKey, event: ev)
+                uploaded.append(ev)
+            } catch {
+                failed = true
+            }
+        }
+        if !uploaded.isEmpty {
+            _ = mergeAndSave(roomKey: roomKey, events: uploaded)
+            removePendingEvents(roomKey: roomKey, eventIds: Set(uploaded.map { $0.id }))
+        }
+        if failed {
+            markDirty(roomKey: roomKey)
+        } else {
+            clearDirty(roomKey: roomKey)
+        }
+    }
+
+    /// 补传所有 dirty 房号的待确认账本事件（全量同步时调用）
+    static func flushPendingAll() async {
+        for k in dirtyRoomKeys() { await syncPending(roomKey: k) }
+    }
+    #endif
 
     // MARK: 云端合并（append-only 按事件 id 取并集）
 

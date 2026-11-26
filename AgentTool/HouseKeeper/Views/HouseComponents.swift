@@ -40,28 +40,20 @@ enum UnreadCloudHouseStore {
 
 // MARK: - v2.24 同步失败标记
 
-/// 房源「账本推送云端失败」的轻量标记（存 UserDefaults，成功推送后自动清除）。
-/// 用途：卡片上标「未同步」，让用户知道这次编辑只落在本机、云端还没收到。
+/// 房源「推送服务器失败」的轻量标记——已收编进统一待补传登记簿 HousePendingRegistry，
+/// 本类型保留为兼容门面：任务中心与卡片红点继续走原接口，底层与 HousePendingUploader 同一份集合。
 enum SyncFailStore {
-    private static let storageKey = "house_sync_failed_keys"
-    static let didChange = Notification.Name("houseSyncFailedKeysChanged")
+    static let didChange = HousePendingRegistry.didChange
 
-    static func all() -> Set<String> { Set(UserDefaults.standard.stringArray(forKey: storageKey) ?? []) }
+    static func all() -> Set<String> { HousePendingRegistry.keys() }
     static func isFailed(_ roomKey: String) -> Bool { all().contains(roomKey) }
 
     static func mark(_ roomKey: String) {
-        guard !roomKey.isEmpty else { return }
-        var set = all(); set.insert(roomKey)
-        UserDefaults.standard.set(Array(set), forKey: storageKey)
-        NotificationCenter.default.post(name: didChange, object: nil)
+        HousePendingRegistry.insert(roomKey)
     }
 
     static func clear(_ roomKey: String) {
-        var set = all()
-        guard set.contains(roomKey) else { return }
-        set.remove(roomKey)
-        UserDefaults.standard.set(Array(set), forKey: storageKey)
-        NotificationCenter.default.post(name: didChange, object: nil)
+        HousePendingRegistry.remove(roomKey)
     }
 }
 

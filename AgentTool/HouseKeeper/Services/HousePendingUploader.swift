@@ -10,30 +10,64 @@
 import Foundation
 import SwiftData
 
+/// 待补传登记簿（唯一底层集合）。
+/// 旧 SyncFailStore「同步失败标记」与新 HousePendingUploader「待提交房号」共用同一份存储，
+/// 避免两套登记簿漂移；写入/移除后发 didChange 通知，任务中心与卡片红点实时吸收。
+enum HousePendingRegistry {
+    static let pendingKey = "house.pending.roomKeys.v1"
+    private static let legacyKey = "house_sync_failed_keys"
+    static let didChange = Notification.Name("housePendingRegistryChanged")
+
+    static func keys() -> Set<String> {
+        migrateLegacyIfNeeded()
+        return Set(UserDefaults.standard.stringArray(forKey: pendingKey) ?? [])
+    }
+
+    static func insert(_ roomKey: String) {
+        guard !roomKey.isEmpty else { return }
+        var set = keys()
+        set.insert(roomKey)
+        UserDefaults.standard.set(Array(set), forKey: pendingKey)
+        NotificationCenter.default.post(name: didChange, object: nil)
+    }
+
+    static func remove(_ roomKey: String) {
+        var set = keys()
+        guard set.contains(roomKey) else { return }
+        set.remove(roomKey)
+        UserDefaults.standard.set(Array(set), forKey: pendingKey)
+        NotificationCenter.default.post(name: didChange, object: nil)
+    }
+
+    /// 一次性把旧「账本未同步」标记键并入新键，随后旧键清空
+    private static func migrateLegacyIfNeeded() {
+        let legacy = Set(UserDefaults.standard.stringArray(forKey: legacyKey) ?? [])
+        guard !legacy.isEmpty else { return }
+        var set = keys()
+        set.formUnion(legacy)
+        UserDefaults.standard.set(Array(set), forKey: pendingKey)
+        UserDefaults.standard.removeObject(forKey: legacyKey)
+    }
+}
+
 @MainActor
 final class HousePendingUploader {
     static let shared = HousePendingUploader()
-    private let pendingKey = "house.pending.roomKeys.v1"
-    private let defaults = UserDefaults.standard
 
     private init() {}
 
     var pendingKeys: [String] {
-        defaults.stringArray(forKey: pendingKey) ?? []
+        Array(HousePendingRegistry.keys()).sorted()
     }
 
     var hasPending: Bool { !pendingKeys.isEmpty }
 
     func markPending(_ roomKey: String) {
-        var s = Set(pendingKeys)
-        s.insert(roomKey)
-        defaults.set(Array(s), forKey: pendingKey)
+        HousePendingRegistry.insert(roomKey)
     }
 
     func clearPending(_ roomKey: String) {
-        var s = Set(pendingKeys)
-        s.remove(roomKey)
-        defaults.set(Array(s), forKey: pendingKey)
+        HousePendingRegistry.remove(roomKey)
     }
 
     /// 联网后按序补传所有待提交房源；返回成功数

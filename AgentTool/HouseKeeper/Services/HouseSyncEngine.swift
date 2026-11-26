@@ -203,6 +203,7 @@ final class HouseSyncEngine: ObservableObject {
             try await pushHouse(h)
         }
         _ = try await pull(context: context)
+        await HouseLedgerStore.flushPendingAll()
         statusText = "同步完成 · \(DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short))"
     }
 

@@ -57,5 +57,47 @@ class DeliverPendingTests(unittest.TestCase):
         self.assertEqual(store.marked, [])
 
 
+class FakeAuthHandler:
+    def __init__(self, tenant):
+        self._tenant = tenant
+        self.sent = []
+        self.headers = {}
+
+    def _require_auth(self):
+        if self._tenant is None:
+            self.sent.append((401, {"ok": False, "error": "unauthorized"}))
+            return None
+        return ("tok", self._tenant)
+
+    def _send(self, obj, code):
+        self.sent.append((code, obj))
+
+
+class StatsStore:
+    def stats(self):
+        return {"total": 1}
+
+
+class HouseAuthTests(unittest.TestCase):
+    def test_forbidden_when_no_house_access(self):
+        h = FakeAuthHandler({"house_access": False})
+        done = house_api.route_request(h, "GET", "/api/house/stats", StatsStore(), None)
+        self.assertTrue(done)
+        self.assertEqual(h.sent[0][0], 403)
+        self.assertEqual(h.sent[0][1]["error"], "forbidden")
+
+    def test_allowed_when_default_authorized(self):
+        h = FakeAuthHandler({"enabled": True})
+        done = house_api.route_request(h, "GET", "/api/house/stats", StatsStore(), None)
+        self.assertTrue(done)
+        self.assertEqual(h.sent[0][0], 200)
+
+    def test_unauthorized_returns_401(self):
+        h = FakeAuthHandler(None)
+        done = house_api.route_request(h, "GET", "/api/house/stats", StatsStore(), None)
+        self.assertTrue(done)
+        self.assertEqual(h.sent[0][0], 401)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -278,6 +278,38 @@ class HouseStore:
                 })
             return out
 
+    def append_ledger_event(self, room_key: str, event: dict[str, Any],
+                            operator: str = "") -> dict[str, Any]:
+        """追加一条真实账本事件（append-only，按事件 id 幂等去重）。
+        账本事件只作操作留痕，不进 outbox、不触发实时广播。"""
+        room_key = str(room_key or "").strip()
+        if not room_key:
+            raise ValueError("roomKey required")
+        event_id = str(event.get("id") or "").strip() or secrets.token_hex(8)
+        with self._lock:
+            conn = self._conn
+            already = conn.execute(
+                "SELECT 1 FROM ledger_events WHERE id=?", (event_id,)).fetchone()
+            if already:
+                return {"id": event_id, "deduplicated": True}
+            ts = str(event.get("ts") or iso(now_local()))
+            op = str(event.get("operator") or operator or "未知用户")
+            action = str(event.get("action") or "")
+            detail = str(event.get("detail") or "")
+            conn.execute(
+                "INSERT OR IGNORE INTO ledger_events "
+                "(id,room_key,ts,operator,action,detail,migrated) "
+                "VALUES (?,?,?,?,?,?,0)",
+                (event_id, room_key, ts, op, action, detail))
+            for ch in event.get("fieldChanges") or []:
+                conn.execute(
+                    "INSERT OR IGNORE INTO field_changes "
+                    "(event_id,field,old_value,new_value) VALUES (?,?,?,?)",
+                    (event_id, str(ch.get("field") or ""),
+                     str(ch.get("oldValue") or ""), str(ch.get("newValue") or "")))
+            conn.commit()
+            return {"id": event_id, "deduplicated": False}
+
     # ------------------------------------------------------------------
     # 写入：新增 / 编辑（核心）
     # ------------------------------------------------------------------

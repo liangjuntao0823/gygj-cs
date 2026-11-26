@@ -176,6 +176,33 @@ class HouseStoreTests(unittest.TestCase):
         doc = self.store.import_house(payload)
         self.assertEqual(len(doc["media"]), 1)
 
+    def test_append_ledger_event_writes_and_dedupes(self):
+        ev = {"id": "LED-1", "ts": "2026-11-26T12:00:00+08:00",
+              "action": "编辑保存", "detail": "租金调整",
+              "fieldChanges": [{"field": "price", "oldValue": "1000",
+                                "newValue": "1100"}]}
+        res = self.store.append_ledger_event("1-2059", ev, operator="涛(iPhone)")
+        self.assertFalse(res["deduplicated"])
+        led = self.store.ledger("1-2059")
+        self.assertEqual(len(led), 1)
+        self.assertFalse(led[0]["migrated"])
+        self.assertEqual(led[0]["action"], "编辑保存")
+        self.assertEqual(led[0]["operator"], "涛(iPhone)")
+        self.assertEqual(led[0]["fieldChanges"][0]["newValue"], "1100")
+        # 同 id 重复追加：幂等去重，不进 outbox
+        again = self.store.append_ledger_event("1-2059", ev, operator="涛(iPhone)")
+        self.assertTrue(again["deduplicated"])
+        self.assertEqual(len(self.store.ledger("1-2059")), 1)
+        self.assertEqual(len(self.store.pending_outbox()), 0)
+
+    def test_append_ledger_event_auto_id(self):
+        res = self.store.append_ledger_event("1-2059", {"action": "补齐媒体"},
+                                             operator="明")
+        self.assertTrue(res["id"])
+        led = self.store.ledger("1-2059")
+        self.assertEqual(len(led), 1)
+        self.assertEqual(led[0]["detail"], "")
+
 
 class BroadcastTests(unittest.TestCase):
     def setUp(self):
