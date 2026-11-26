@@ -823,27 +823,18 @@ struct HouseDetailView: View {
 
     // MARK: - v2.39 单房云端检测 / 更新 / 编辑入口
 
-    /// 进详情自动检测：只判断「有没有更新」，无更新不弹任何东西
+    /// 进详情自动检测：旧 COS 字段对比检测已下线，进详情不再跑旧链路检测或覆盖告警
     @MainActor
     private func checkCloudOnEnter() async {
-        // 服务器模式：房源权威库在 8082，进详情不再跑旧 COS 字段对比检测，避免弹旧链路覆盖告警
-        guard !HouseServerMode.ready else { return }
-        guard CosConfig.load()?.isValid == true else { return }
-        await runCloudCheck(useCache: true, silentWhenFresh: true)
+        // 服务器下行/冲突检测由同步引擎与 pushHouse 乐观锁承接，本方法保留为占位入口
     }
 
-    /// 右上角单房刷新：只拉这一套的 info.json，强制不走缓存
+    /// 右上角单房刷新：旧桶 info.json 拉取检测已下线
     @MainActor
     private func refreshSingleHouse() async {
-        guard !HouseServerMode.ready else {
+        if HouseServerMode.ready {
             showCloudToast("服务器模式：以服务器房源为准")
-            return
         }
-        guard CosConfig.load()?.isValid == true else {
-            showCloudToast("未配置云存储，无法检测")
-            return
-        }
-        await runCloudCheck(useCache: false, silentWhenFresh: false)
     }
 
     @MainActor
@@ -904,24 +895,9 @@ struct HouseDetailView: View {
         return lines
     }
 
-    /// 点「更新」：字段覆盖 + 媒体补缺/删除
+    /// 点「更新」：旧桶字段覆盖 + 媒体补缺/删除已下线，服务器下行由同步引擎承接
     private func applyCloudUpdate() {
-        if HouseServerMode.ready { pendingCloudRecord = nil; return }
-        guard let rec = pendingCloudRecord,
-              let config = CosConfig.load(), config.isValid else { return }
         pendingCloudRecord = nil
-        Task { @MainActor in
-            do {
-                let summary = try await HouseSyncGuard.apply(record: rec, to: house,
-                                                             ctx: modelContext, config: config)
-                mediaRefreshTick += 1
-                showCloudToast(summary)
-                // v2.45：云端账本历史一并拉到本机
-                try? await HouseLedgerStore.pull(roomKey: house.mediaRoomKey, config: config)
-            } catch {
-                cloudCheckHint = "更新失败：\(error.localizedDescription)"
-            }
-        }
     }
 
     /// 编辑入口：字段有冲突就先拦下（保存时还有第二道强校验兜底）
@@ -1181,12 +1157,8 @@ struct HouseDetailView: View {
         s.filter { !$0.isWhitespace }
     }
 
-    /// 分享入口（v1.21）：先做前置校验（配置 / 素材），再弹「脱敏 / 完整」选择器
+    /// 分享入口：仅做素材前置校验（旧 COS 配置校验已下线，分享回退本地媒体 + 文字系统面板）
     private func shareHouseCard() {
-        guard let config = CosConfig.load(), config.isValid else {
-            shareError = "请先到「设置 → 房源分享 → 远程配置」填写云存储配置（腾讯云 COS），再分享卡片链接"
-            return
-        }
         guard !house.mediaItems.isEmpty else {
             shareError = "这套房源还没有照片或视频，先编辑添加素材再分享"
             return
