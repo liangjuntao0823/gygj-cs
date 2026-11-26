@@ -3056,41 +3056,20 @@ struct HouseListView: View {
             Task { try? await HouseRemoteClient.shared.addShareRecord(roomKey: roomKey, channel: "app内分享", summary: info.shareText) }
             return
         }
-        guard let config = CosConfig.load(), config.isValid else {
-            infoMessage = "请先到「设置 → 房源分享 → 远程配置」填写云存储配置（腾讯云 COS）并保存验证，再分享卡片链接"; showInfoAlert = true
-            return
+        // 旧桶卡片链接已下线：未接入服务器回退本地媒体 + 纯文字系统分享
+        let localUrls = files.compactMap { f in
+            let u = MediaStore.url(for: f.name, roomKey: roomKey)
+            return FileManager.default.fileExists(atPath: u.path) ? u : nil
         }
-        isGenerating = true
-        generateTip = "正在上传照片和视频…"
-        generateProgress = 0
-        Task {
-            do {
-                let url = try await CosUploader.shareCard(mediaFiles: files, roomKey: roomKey, info: info, mode: mode, config: config) { p in
-                    Task { @MainActor in self.generateProgress = p }
-                }
-                await MainActor.run {
-                    isGenerating = false
-                    shareQueue = [[url]]
-                    shareIndex = 0
-                    presentShareStep([url])
-                    singleShareHouse = nil
-                }
-            } catch {
-                await MainActor.run {
-                    isGenerating = false
-                    infoMessage = error.localizedDescription; showInfoAlert = true
-                    singleShareHouse = nil
-                }
-            }
-        }
+        let items: [Any] = localUrls + [info.shareText]
+        shareQueue = [items]
+        shareIndex = 0
+        presentShareStep(items)
+        singleShareHouse = nil
     }
 
     private func startMultiShare() {
         guard !selectedHouseIDs.isEmpty else { return }
-        guard let config = CosConfig.load(), config.isValid else {
-            infoMessage = "请先到「设置 → 房源分享 → 远程配置」填写云存储配置（腾讯云 COS）并保存验证，再分享卡片链接"; showInfoAlert = true
-            return
-        }
         // 过滤出有素材的房源（无照片视频的无法生成卡片）
         let shareable = houses.filter { selectedHouseIDs.contains($0.id) && !$0.mediaItems.isEmpty }
         guard !shareable.isEmpty else {
@@ -3155,15 +3134,12 @@ struct HouseListView: View {
             return
         }
 
-        guard let config = CosConfig.load(), config.isValid else {
-            infoMessage = "请先到「设置 → 房源分享 → 远程配置」填写云存储配置（腾讯云 COS）并保存验证，再分享卡片链接"; showInfoAlert = true
-            return
-        }
-
-        // 主线程先构建值类型数组（Task 闭包内不触碰 @Model）
-        let rooms = sortedShareable.map { house -> ShareCollectionItem in
-            ShareCollectionItem(
-                roomKey: house.mediaRoomKey,
+        // 旧桶合集卡片已下线：未接入服务器按套分批本地媒体 + 纯文字依次系统分享
+        var localBatches: [[Any]] = []
+        for house in sortedShareable {
+            let roomKey = house.mediaRoomKey
+            let profile = CosUploader.loadShareProfile()
+            let info = ShareHouseInfo(
                 displayRoomNo: house.displayRoomNo,
                 towerLabel: house.towerLabel,
                 layout: house.layout,
@@ -3172,33 +3148,18 @@ struct HouseListView: View {
                 landlord: house.landlord,
                 password: house.password,
                 remark: house.remark,
-                mediaFiles: house.mediaItems.map { ShareMediaFile(name: $0.fileName, kind: $0.kind) }
+                name: profile.name,
+                phone: profile.phone
             )
-        }
-
-        isGenerating = true
-        generateTip = "正在生成合集分享卡片（共 \(sortedShareable.count) 套）…"
-        generateProgress = 0
-
-        Task {
-            do {
-                let url = try await CosUploader.shareCollection(rooms: rooms, mode: mode, config: config) { p in
-                    Task { @MainActor in self.generateProgress = p }
-                }
-                await MainActor.run {
-                    isGenerating = false
-                    shareQueue = [[url]]
-                    shareIndex = 0
-                    presentShareStep([url])
-                }
-            } catch {
-                await MainActor.run {
-                    isGenerating = false
-                    infoMessage = error.localizedDescription; showInfoAlert = true
-                    exitMultiSelect()
-                }
+            let urls = house.mediaItems.compactMap { item -> URL? in
+                let u = MediaStore.url(for: item.fileName, roomKey: roomKey)
+                return FileManager.default.fileExists(atPath: u.path) ? u : nil
             }
+            localBatches.append(urls + [info.shareText])
         }
+        shareQueue = localBatches
+        shareIndex = 0
+        presentShareStep(localBatches[0])
     }
 
     private func showSaveToast(_ msg: String) {
