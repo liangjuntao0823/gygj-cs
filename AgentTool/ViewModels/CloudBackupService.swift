@@ -1,22 +1,24 @@
 import Foundation
 
-// MARK: - v1.12 云端备份服务（COS）
-// 桶内专门文件夹「backups/」用于备份（与分享链接的根目录隔离）：
+// MARK: - 云端备份服务（服务器磁盘）
+// 备份实体落服务器本地磁盘（替代旧 COS 桶 backups/ 目录）：
 //   · 快速备份：备份后自动上传（断网/失败自动加入重试队列，下次启动或回前台自动重试）
-//   · 全量备份：查看器里手动上传（zip 本体 PUT + 媒体按 sha1 增量，已存在跳过）
-//   · 云端文件清单用本地 UserDefaults 记录维护（避免 ListObjects 签名复杂度）
-//   · 云端自动清理：只清「快速_」自动上传的 zip，保留最近 10 份；全量手动上传不自动删除
-//   · 未配置 COS：快速备份仅存本地，查看器标记「未上传（未配置云端）」
+//   · 全量备份：查看器里手动上传（zip 本体整体上传，媒体已含在 zip 内）
+//   · 云端文件清单由服务器返回，本地 UserDefaults 同步维护权威记录
+//   · 云端自动清理：只清「快速_」且含「_自动」后缀的自动备份，保留最近 10 份；全量手动上传不自动删除
+//   · 未连服务器：快速备份仅存本地，查看器标记「未上传」
 
 final class CloudBackupService {
     static let shared = CloudBackupService()
     private init() {}
 
-    // v1.24 多用户隔离：备份 zip 按用户名分目录 backups/<用户名>/，各用户只看得到自己的备份；
-    // 媒体镜像 backups/media/ 按 sha1 去重共享（不含隐私，保留全局）。
-    // v1.40 第6点：全部私有数据收进用户目录 users/<用户名>/ —— 备份 zip 与媒体镜像都改到用户目录下
-    static var cloudBackupPrefix: String { CloudUser.backupPrefix }     // 备份 zip 云端目录（按用户隔离）
-    static var cloudMediaPrefix: String { CloudUser.mediaMirrorPrefix } // 媒体镜像云端目录（按 sha1 去重，v1.40 起收进用户目录）
+    // 服务器备份条目日期解析（ISO8601，带时区偏移）
+    private static var dateFormatter: DateFormatter {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd'T'HH:mm:ssZ"
+        return f
+    }
 
     // MARK: - 云端记录（本地权威清单）
 
@@ -41,7 +43,6 @@ final class CloudBackupService {
     }
 
     static func uploadState(of name: String) -> String {
-        guard CosConfig.load()?.isValid == true else { return "未上传（未配置云端）" }
         if isUploaded(name: name) { return "已上传云端" }
         if pendingUploadNames().contains(name) { return "未上传（将自动重试）" }
         return "未上传"
@@ -89,8 +90,7 @@ final class CloudBackupService {
 
 #if !APP_EXTENSION // v2.68：分享扩展不编译备份 zip 链路（依赖 BackupV5Manager/ZipStore/MediaFingerprintV5）
     /// 启动/回前台时重试全部待上传（快速备份 zip）
-    static func retryPendingUploads(config: CosConfig? = nil) async {
-        guard let config = config ?? CosConfig.load(), config.isValid else { return }
+    static func retryPendingUploads() async {
         let pending = pendingUploadNames()
         guard !pending.isEmpty else { return }
         for name in pending {
@@ -100,131 +100,63 @@ final class CloudBackupService {
                 continue
             }
             do {
-                try await uploadZip(url: local, config: config) { _ in }
+                try await uploadZip(url: local) { _ in }
                 recordUpload(name: name, size: BackupV5Manager.fileSize(at: local), date: Date(), isAuto: true)
             } catch {
                 // 保留队列，下次再试
             }
         }
-        await enforceCloudRetention(config: config)
+        await enforceCloudRetention()
     }
 #endif
 
     // MARK: - 上传
 
-    /// 上传备份 zip（流式 fromFile，带进度 0~1）
-    static func uploadZip(url: URL, config: CosConfig, progress: @escaping (Double) -> Void) async throws {
+    /// 上传备份 zip 到服务器（整体上传；媒体已包含在 zip 内，不再单独传媒体镜像）
+    static func uploadZip(url: URL, progress: @escaping (Double) -> Void) async throws {
         let name = url.lastPathComponent
-        let remotePath = cloudBackupPrefix + name
-        let contentType = "application/zip"
-        let signedURL = try CosUploader.presignedPutURL(for: remotePath, contentType: contentType, config: config)
-        var request = URLRequest(url: signedURL)
-        request.httpMethod = "PUT"
-        request.setValue(contentType, forHTTPHeaderField: "Content-Type")
-
-        let delegate = UploadProgressDelegate(onProgress: progress)
-        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
-        let task = session.uploadTask(with: request, fromFile: url)
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            delegate.onCompletion = { error in
-                if let error = error {
-                    cont.resume(throwing: error)
-                } else {
-                    cont.resume()
-                }
-            }
-            task.resume()
-        }
+        let data = try Data(contentsOf: url)
+        progress(0.5)
+        try await HouseRemoteClient.shared.uploadBackup(name: name, data: data, isAuto: false)
+        progress(1.0)
     }
 
 #if !APP_EXTENSION
-    /// 全量备份媒体增量上传：按 media_manifest 的 sha1 判断是否已在云端（backups/media/<sha1>/<文件名>），
-    /// 已存在跳过（省流量），否则从 zip 内提取上传。progress 0~1
-    static func uploadFullMedia(zipURL: URL, config: CosConfig, progress: @escaping (Double) -> Void) async throws {
-        guard let manifestData = try? ZipStore.extract(at: zipURL, path: "media_manifest.json"),
-              let fingerprints = try? JSONDecoder().decode([MediaFingerprintV5].self, from: manifestData) else {
-            return  // 无清单（异常备份）视为无可增量上传
-        }
-        let total = max(fingerprints.count, 1)
-        var done = 0
-        for fp in fingerprints {
-            // 云端对象名：backups/media/<sha1前2位>/<sha1>-<文件名>（sha1 目录避免单目录对象过多）
-            let digestPrefix = fp.sha1.isEmpty ? "unknown" : String(fp.sha1.prefix(2))
-            let remotePath = cloudMediaPrefix + "\(digestPrefix)/\(fp.sha1)-\(fp.fileName)"
-            let exists = await remoteExists(path: remotePath, config: config)
-            if !exists {
-                let data = try ZipStore.extract(at: zipURL, path: "media/\(fp.roomKey)/\(fp.fileName)")
-                try await CosUploader.upload(data: data, to: remotePath, contentType: fp.kind == "video" ? "video/quicktime" : "image/jpeg", config: config)
-            }
-            done += 1
-            progress(Double(done) / Double(total))
-        }
+    /// 全量备份媒体镜像增量（旧 COS sha1 去重镜像）：服务器架构下媒体已含在全量 zip 内，
+    /// 不再单独上传媒体镜像；保留方法壳避免调用点编译断裂，直接完成进度。
+    static func uploadFullMedia(zipURL: URL, progress: @escaping (Double) -> Void) async throws {
         progress(1.0)
     }
 #endif
 
 #if !APP_EXTENSION
     /// 自动上传快速备份（失败入队重试，成功后清理队列并执行云端保留）
-    static func autoUploadFastBackup(zipURL: URL, config: CosConfig?) async {
-        guard let config = config ?? CosConfig.load(), config.isValid else {
-            enqueuePendingUpload(name: zipURL.lastPathComponent)
-            return
-        }
+    static func autoUploadFastBackup(zipURL: URL) async {
         do {
-            try await uploadZip(url: zipURL, config: config) { _ in }
+            try await uploadZip(url: zipURL) { _ in }
             recordUpload(name: zipURL.lastPathComponent, size: BackupV5Manager.fileSize(at: zipURL), date: Date(), isAuto: true)
         } catch {
             enqueuePendingUpload(name: zipURL.lastPathComponent)
         }
-        await enforceCloudRetention(config: config)
+        await enforceCloudRetention()
     }
 #endif
 
-    // MARK: - 存在探测 / 下载 / 删除
+    // MARK: - 下载 / 删除
 
-    /// GET 探测对象是否存在（200 = 存在）
-    static func remoteExists(path: String, config: CosConfig) async -> Bool {
-        guard let url = try? CosUploader.presignedGetURL(for: path, expires: 300, config: config) else { return false }
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        do {
-            let (_, response) = try await URLSession.shared.data(for: request)
-            if let http = response as? HTTPURLResponse, http.statusCode == 200 {
-                return true
-            }
-            return false
-        } catch {
-            return false
-        }
-    }
-
-    /// 下载云端备份 zip 到本地（流式 downloadTask），返回文件 URL
-    /// v1.13 需求15：下载前先检查本地是否已有该备份（同名 zip 或 下载_ 前缀副本）→ 有则直接返回本地文件，不重复下载
-    /// v1.13 需求12：下载完成后逐文件 CRC 核对（防损坏/不完整），失败删除临时文件并抛错
+    /// 下载服务器备份 zip 到本地，返回文件 URL。
+    /// 下载前先检查本地是否已有该备份（同名 zip 或 下载_ 前缀副本）→ 有则直接复用；
+    /// 下载完成后逐文件 CRC 核对（防损坏/不完整），失败删除临时文件并抛错。
+    /// 落盘直接使用服务器原名（快速_/全量_ 前缀），本地备份列表可直接识别并恢复。
 #if !APP_EXTENSION
-    /// v1.14 需求1：下载落盘直接使用云端原名（快速_/全量_ 前缀），不再加「下载_」前缀，
-    ///              这样 app 备份列表能直接识别并显示下载下来的备份
-    static func downloadBackup(name: String, config: CosConfig) async throws -> URL {
-        // 需求15：本地已有同名文件 → 直接复用本地，无需下载
+    static func downloadBackup(name: String) async throws -> URL {
         if let existing = localCopyIfExists(name: name) {
             return existing
         }
-        let remotePath = cloudBackupPrefix + name
-        guard let url = try? CosUploader.presignedGetURL(for: remotePath, expires: 3600, config: config) else {
-            throw CosUploader.CosError.invalidConfig
-        }
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        let (tempURL, response) = try await URLSession.shared.download(for: request)
-        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-            try? FileManager.default.removeItem(at: tempURL)
-            throw CosUploader.CosError.uploadFailed("云端下载失败（HTTP \(http.statusCode)）")
-        }
-        // v1.14 需求1：落盘用云端原名（与本地快速/全量备份同目录同命名，列表直接可见可恢复）
+        let data = try await HouseRemoteClient.shared.downloadBackup(name: name)
         let dest = BackupV5Manager.backupsDirectory.appendingPathComponent(name)
         try? FileManager.default.removeItem(at: dest)
-        try FileManager.default.moveItem(at: tempURL, to: dest)
-        // 需求12：逐文件 CRC 核对（STORE 模式 zip，中央目录 crc32 与实际数据段比对）
+        try data.write(to: dest)
         do {
             _ = try ZipStore.verifyAllEntriesCRC(at: dest)
         } catch {
@@ -250,26 +182,20 @@ final class CloudBackupService {
     }
 #endif
 
-    /// v1.13 需求7：实时刷新桶内备份清单并同步到本地权威记录。
-    /// 以 COS ListObjects 为准重建 cloudRecords（剔除媒体镜像 backups/media/ 前缀）：
-    /// 桶里真实存在的 → 记录（含本机未上传过的其他设备备份）；桶里已删除的 → 本地记录同步移除。
-    /// isAuto 判定：文件名含「_自动」后缀（与 BackupV5Manager.fileName 命名一致）。
-    static func refreshCloudRecords(config: CosConfig) async throws {
-        // delimiter="/" 只取备份根目录对象，跳过 backups/media/ 媒体镜像（海量对象）
-        let objects = try await CosUploader.listObjects(prefix: cloudBackupPrefix, delimiter: "/", config: config)
-        // 只取备份 zip（排除 backups/media/ 媒体镜像目录）
+    /// 实时刷新服务器备份清单并同步到本地权威记录。
+    /// 以服务器返回清单为准重建 cloudRecords：服务器真实存在的 → 记录；已删除的 → 本地记录同步移除。
+    /// isAuto 优先取服务器标记，缺省时按文件名含「_自动」后缀兜底判定。
+    static func refreshCloudRecords() async throws {
+        let remote = try await HouseRemoteClient.shared.listBackups()
         var records: [CloudRecord] = []
-        for obj in objects {
-            let key = obj.name
-            guard key.hasPrefix(cloudBackupPrefix), !key.hasPrefix(cloudMediaPrefix) else { continue }
-            let fileName = String(key.dropFirst(cloudBackupPrefix.count))
-            guard fileName.hasSuffix(".zip") else { continue }
+        for item in remote {
+            guard item.name.hasSuffix(".zip") else { continue }
+            let date = item.date.flatMap { dateFormatter.date(from: $0) } ?? Date()
             records.append(CloudRecord(
-                name: fileName,
-                size: obj.size,
-                date: obj.date == .distantPast ? Date() : obj.date,
-                isAuto: fileName.contains("_自动")
-            ))
+                name: item.name,
+                size: item.size ?? 0,
+                date: date,
+                isAuto: item.isAuto ?? item.name.contains("_自动")))
         }
         records.sort { $0.date > $1.date }
         if let data = try? JSONEncoder().encode(records) {
@@ -277,18 +203,9 @@ final class CloudBackupService {
         }
     }
 
-    /// 删除云端备份对象
-    static func deleteRemoteBackup(name: String, config: CosConfig) async throws {
-        let remotePath = cloudBackupPrefix + name
-        guard let url = try? CosUploader.presignedURL(for: remotePath, method: "DELETE", expires: 600, headers: [], config: config) else {
-            throw CosUploader.CosError.invalidConfig
-        }
-        var request = URLRequest(url: url)
-        request.httpMethod = "DELETE"
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
-            throw CosUploader.CosError.uploadFailed("云端删除失败（HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)）" + CosUploader.extractCosError(from: data))
-        }
+    /// 删除服务器备份 zip
+    static func deleteRemoteBackup(name: String) async throws {
+        try await HouseRemoteClient.shared.deleteBackup(name: name)
         removeCloudRecord(name: name)
     }
 
@@ -362,40 +279,14 @@ final class CloudBackupService {
 
     // MARK: - 云端保留（快速_ 且文件名带 _自动 的自动备份保留最近 10 份）
 
-    /// v1.13 需求10：只清理「文件名含 _自动 后缀」的自动备份，保留最近 10 份；
+    /// 只清理「文件名含 _自动 后缀」的自动备份，保留最近 10 份；
     /// 手动备份（文件名不带 _自动，含手动快速备份与手动全量上传）一律不清理。
-    static func enforceCloudRetention(config: CosConfig? = nil) async {
-        guard let config = config ?? CosConfig.load(), config.isValid else { return }
+    static func enforceCloudRetention() async {
         var records = cloudRecords().filter { $0.name.hasPrefix("快速_") && $0.name.contains("_自动") }
         records.sort { $0.date > $1.date }
         guard records.count > 10 else { return }
         for record in records.dropFirst(10) {
-            try? await deleteRemoteBackup(name: record.name, config: config)
+            try? await deleteRemoteBackup(name: record.name)
         }
-    }
-}
-
-// MARK: - 上传进度 Delegate
-
-private final class UploadProgressDelegate: NSObject, URLSessionTaskDelegate {
-    private let onProgress: (Double) -> Void
-    var onCompletion: ((Error?) -> Void)?
-    private var lastReported: Double = -1
-
-    init(onProgress: @escaping (Double) -> Void) {
-        self.onProgress = onProgress
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64, totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {
-        guard totalBytesExpectedToSend > 0 else { return }
-        let p = min(Double(totalBytesSent) / Double(totalBytesExpectedToSend), 1.0)
-        if p - lastReported >= 0.01 || p >= 1.0 {
-            lastReported = p
-            onProgress(p)
-        }
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        onCompletion?(error)
     }
 }

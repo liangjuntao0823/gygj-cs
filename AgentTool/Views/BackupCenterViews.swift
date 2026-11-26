@@ -468,20 +468,16 @@ struct BackupFileBrowseViewV5: View {
         cloudRecords = CloudBackupService.cloudRecords()
     }
 
-    /// v1.13 需求7：实时刷新桶内备份并同步显示
+    /// 实时刷新服务器备份清单并同步显示
     private func refreshCloud() {
-        guard let config = CosConfig.load(), config.isValid else {
-            showMessageInContext("未配置云端（腾讯云 COS）。请先到「设置 → 远程配置」填写并保存验证后再刷新。")
-            return
-        }
         isRefreshingCloud = true
         Task {
             do {
-                try await CloudBackupService.refreshCloudRecords(config: config)
+                try await CloudBackupService.refreshCloudRecords()
                 await MainActor.run {
                     isRefreshingCloud = false
                     reloadTick += 1
-                    showMessageInContext("云端备份已刷新，与桶内文件同步一致")
+                    showMessageInContext("云端备份已刷新，与服务器文件同步一致")
                 }
             } catch {
                 await MainActor.run {
@@ -501,7 +497,7 @@ struct BackupFileBrowseViewV5: View {
                 BackupLogStore.log(category: "备份", action: "快速备份", result: "成功", detail: url.lastPathComponent, checksum: BackupV5Manager.sha1OfFile(at: url) ?? "")
                 // 自动上传云端（后台；失败自动入队重试）
                 Task {
-                    await CloudBackupService.autoUploadFastBackup(zipURL: url, config: nil)
+                    await CloudBackupService.autoUploadFastBackup(zipURL: url)
                     await MainActor.run { reloadTick += 1 }
                 }
                 showMessageInContext(RemoteConfig.tip("quickBackupOk", "快速备份成功：{file}\n已自动上传云端（若网络失败会在下次打开 App 时自动重试）").replacingOccurrences(of: "{file}", with: url.lastPathComponent))
@@ -533,47 +529,23 @@ struct BackupFileBrowseViewV5: View {
         }
     }
 
-    /// v1.14 需求4：手动上传备份到云端。
-    /// 快速备份只传 zip 本体（不含照片视频文件）；全量备份传 zip + 媒体增量（sha1 去重）。
+    /// 手动上传备份到服务器。快速/全量均整体上传 zip（媒体已含在全量 zip 内）。
     private func uploadBackup(url: URL, kind: BackupKindV5) {
-        guard let config = CosConfig.load(), config.isValid else {
-            showMessageInContext("未配置云端（腾讯云 COS）。请到「设置 → 远程配置」填写并保存验证后再上传。")
-            return
-        }
         uploadingName = url.lastPathComponent
         uploadProgress = 0
         uploadStage = "正在上传备份文件…"
         let isFast = (kind == .fast)
         Task {
             do {
-                try await CloudBackupService.uploadZip(url: url, config: config) { p in
+                try await CloudBackupService.uploadZip(url: url) { p in
                     Task { @MainActor in self.uploadProgress = p }
                 }
-                if isFast {
-                    // 快速备份：zip 即完整内容，直接完成
-                    await MainActor.run {
-                        CloudBackupService.recordUpload(name: url.lastPathComponent, size: BackupV5Manager.fileSize(at: url), date: Date(), isAuto: false)
-                        uploadingName = nil
-                        BackupLogStore.log(category: "上传", action: "快速备份上传", result: "成功", detail: url.lastPathComponent, cloud: true)
-                        showMessageInContext("已上传云端：\(url.lastPathComponent)")
-                        reloadTick += 1
-                    }
-                } else {
-                    // 媒体增量（按 sha1 去重，已存在跳过）
-                    await MainActor.run {
-                        uploadProgress = 0.99
-                        uploadStage = "正在核对照片视频（增量上传）…"
-                    }
-                    try await CloudBackupService.uploadFullMedia(zipURL: url, config: config) { p in
-                        Task { @MainActor in self.uploadProgress = 0.99 + p * 0.01 }
-                    }
-                    await MainActor.run {
-                        CloudBackupService.recordUpload(name: url.lastPathComponent, size: BackupV5Manager.fileSize(at: url), date: Date(), isAuto: false)
-                        uploadingName = nil
-                        BackupLogStore.log(category: "上传", action: "全量备份上传", result: "成功", detail: url.lastPathComponent, cloud: true)
-                        showMessageInContext("已上传云端：\(url.lastPathComponent)")
-                        reloadTick += 1
-                    }
+                await MainActor.run {
+                    CloudBackupService.recordUpload(name: url.lastPathComponent, size: BackupV5Manager.fileSize(at: url), date: Date(), isAuto: false)
+                    uploadingName = nil
+                    BackupLogStore.log(category: "上传", action: isFast ? "快速备份上传" : "全量备份上传", result: "成功", detail: url.lastPathComponent, cloud: true)
+                    showMessageInContext("已上传云端：\(url.lastPathComponent)")
+                    reloadTick += 1
                 }
             } catch {
                 await MainActor.run {
@@ -586,21 +558,17 @@ struct BackupFileBrowseViewV5: View {
     }
 
     private func downloadCloud(_ record: CloudBackupService.CloudRecord) {
-        guard let config = CosConfig.load(), config.isValid else {
-            showMessageInContext("未配置云端（腾讯云 COS）。")
-            return
-        }
-        // v1.13 需求15：本地已有该备份 → 提示无需下载，不重复下载
+        // 本地已有该备份 → 提示无需下载，不重复下载
         if let existing = CloudBackupService.localCopyIfExists(name: record.name) {
             showMessageInContext("本地已存在该备份：\(existing.lastPathComponent)\n无需重复下载，可直接在本地备份中恢复。")
             return
         }
         uploadingName = record.name
         uploadProgress = 0
-        uploadStage = "正在从云端下载…"
+        uploadStage = "正在从服务器下载…"
         Task {
             do {
-                let local = try await CloudBackupService.downloadBackup(name: record.name, config: config)
+                let local = try await CloudBackupService.downloadBackup(name: record.name)
                 await MainActor.run {
                     uploadingName = nil
                     showMessageInContext("已下载到本机：\(local.lastPathComponent)")
@@ -618,13 +586,9 @@ struct BackupFileBrowseViewV5: View {
     private func performDelete() {
         guard let target = deleteTarget else { return }
         if target.isCloud {
-            guard let config = CosConfig.load(), config.isValid else {
-                showMessageInContext("未配置云端（腾讯云 COS）。")
-                return
-            }
             Task {
                 do {
-                    try await CloudBackupService.deleteRemoteBackup(name: target.name, config: config)
+                    try await CloudBackupService.deleteRemoteBackup(name: target.name)
                     await MainActor.run {
                         BackupLogStore.log(category: "删除", action: "云端删除", result: "成功", detail: target.name, cloud: true)
                         reloadTick += 1
@@ -658,16 +622,12 @@ struct BackupFileBrowseViewV5: View {
         Task {
             do {
                 if let cloudName = target.cloudName {
-                    // 云端：先查本地是否已有该备份（v1.13 需求15：有 → 直接按本地恢复，无 → 自动下载到本地后恢复）
-                    guard let config = CosConfig.load(), config.isValid else {
-                        throw BackupV5Error.invalidBackup("未配置云端（腾讯云 COS）")
-                    }
-                    // v1.14 需求3：明确提示恢复来源（本地复用 or 云端下载）
+                    // 云端：先查本地是否已有该备份（有 → 直接按本地恢复，无 → 自动下载到本地后恢复）
                     let localHit = CloudBackupService.localCopyIfExists(name: cloudName)
                     restoreStage = (localHit != nil)
                         ? "本地已有该备份，直接用本地文件恢复…"
-                        : "本地无此备份，正在从云端下载…"
-                    let local = try await CloudBackupService.downloadBackup(name: cloudName, config: config)
+                        : "本地无此备份，正在从服务器下载…"
+                    let local = try await CloudBackupService.downloadBackup(name: cloudName)
                     let stats = try await BackupV5Manager.restore(
                         zipURL: local, mainContext: modelContext, houseContext: houseCtx,
                         phaseProgress: { p in Task { @MainActor in self.restoreProgress = p } },

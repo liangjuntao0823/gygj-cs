@@ -80,6 +80,19 @@ struct RemoteHouseStats: Codable {
     let pendingOutbox: Int
 }
 
+/// 服务器备份 zip 清单条目（替代旧 COS ListObjects 对象元数据）
+struct RemoteBackupRecord: Codable {
+    let name: String
+    let size: Int64?
+    let date: String?
+    let isAuto: Bool?
+}
+
+struct RemoteBackupList: Codable {
+    let ok: Bool
+    let backups: [RemoteBackupRecord]
+}
+
 struct HouseAPIError: LocalizedError {
     let message: String
     /// 服务器已识别令牌，但该用户未被授权访问房源库（403）；此类错误不应自动重试
@@ -261,6 +274,80 @@ final class HouseRemoteClient {
         let (_, http) = try await makeRequest(path, method: "DELETE")
         guard http.statusCode == 200 else {
             throw HouseAPIError(message: "媒体删除失败（服务器 \(http.statusCode)）")
+        }
+    }
+
+    // MARK: 备份 zip（服务器本地磁盘，替代旧 COS backups/ 目录）
+
+    /// 读取服务器备份清单
+    func listBackups() async throws -> [RemoteBackupRecord] {
+        let (data, http) = try await makeRequest("/api/house/backups", method: "GET")
+        guard http.statusCode == 200 else {
+            throw HouseAPIError(message: "读取备份清单失败（服务器 \(http.statusCode)）")
+        }
+        return try decode(RemoteBackupList.self, data: data).backups
+    }
+
+    /// 上传备份 zip 到服务器；isAuto 标记快速自动备份（云端保留策略据此裁剪）
+    func uploadBackup(name: String, data: Data, isAuto: Bool) async throws {
+        guard let base = URL(string: endpoint),
+              let url = URL(string: "/api/house/backups", relativeTo: base) else {
+            throw HouseAPIError(message: "服务器地址无效")
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 300
+        req.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        req.setValue(name, forHTTPHeaderField: "X-Backup-Name")
+        req.setValue(isAuto ? "1" : "0", forHTTPHeaderField: "X-Is-Auto")
+        if let t = token, !t.isEmpty {
+            req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization")
+        }
+        req.httpBody = data
+        let (_, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse else {
+            throw HouseAPIError(message: "备份上传失败（服务器响应无效）")
+        }
+        if http.statusCode == 403 {
+            throw HouseAPIError(message: "暂无房源访问权限，请联系管理员开通", forbidden: true)
+        }
+        guard http.statusCode == 200 else {
+            throw HouseAPIError(message: "备份上传失败（服务器 \(http.statusCode)）")
+        }
+    }
+
+    /// 从服务器下载备份 zip 二进制（落盘与 CRC 校验由调用方完成）
+    func downloadBackup(name: String) async throws -> Data {
+        let path = "/api/house/backups/\(encodedRoomKey(name))"
+        guard let base = URL(string: endpoint),
+              let url = URL(string: path, relativeTo: base) else {
+            throw HouseAPIError(message: "服务器地址无效")
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.timeoutInterval = 300
+        if let t = token, !t.isEmpty {
+            req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization")
+        }
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse else {
+            throw HouseAPIError(message: "备份下载失败（服务器响应无效）")
+        }
+        if http.statusCode == 403 {
+            throw HouseAPIError(message: "暂无房源访问权限，请联系管理员开通", forbidden: true)
+        }
+        guard http.statusCode == 200 else {
+            throw HouseAPIError(message: "备份下载失败（服务器 \(http.statusCode)）")
+        }
+        return data
+    }
+
+    /// 删除服务器上的备份 zip
+    func deleteBackup(name: String) async throws {
+        let path = "/api/house/backups/\(encodedRoomKey(name))"
+        let (_, http) = try await makeRequest(path, method: "DELETE")
+        guard http.statusCode == 200 else {
+            throw HouseAPIError(message: "备份删除失败（服务器 \(http.statusCode)）")
         }
     }
 
