@@ -129,7 +129,7 @@ enum HouseConnectionCheck: Equatable {
     var summary: String {
         switch self {
         case .connectedWithAuth: return "连接成功：服务器可达，账号已具备房源权限"
-        case .reachableNoToken: return "服务器可达，但本机尚未绑定账号令牌（账号在云端推送/电表接入页绑定）"
+        case .reachableNoToken: return "服务器可达，但本机尚未绑定账号令牌（在本页输入服务器授权码接入）"
         case .failed(let reason): return reason
         }
     }

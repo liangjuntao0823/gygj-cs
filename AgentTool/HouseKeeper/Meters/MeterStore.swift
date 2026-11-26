@@ -503,7 +503,7 @@ final class MeterCloudSync {
         }
         guard let token = token, !token.isEmpty else {
             defaults.set(true, forKey: MeterCloudConfig.dirtyKey)
-            store.cloudStatusText = "未保存云端令牌，请先填写接入码"
+            store.cloudStatusText = "未保存云端令牌，请先在云端配置填写服务器授权码"
             return false
         }
         store.cloudBusy = true
@@ -544,11 +544,11 @@ final class MeterCloudSync {
         }
     }
 
-    // MARK: 首次接入：接入码换长期令牌（成功后仅存本机钥匙串）
+    // MARK: 首次接入：授权码换长期令牌（成功后仅存本机钥匙串）
 
     func enroll(store: MeterStore, code: String) async throws -> String {
         let trimmedCode = code.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedCode.isEmpty else { throw MeterCloudError.server("请填写接入码") }
+        guard !trimmedCode.isEmpty else { throw MeterCloudError.server("请填写服务器授权码") }
         guard let endpoint = currentEndpoint(store: store),
               let url = URL(string: endpoint + "/api/meter/enroll") else { throw MeterCloudError.badEndpoint }
         var req = URLRequest(url: url)
@@ -565,7 +565,7 @@ final class MeterCloudSync {
         let httpCode = (resp as? HTTPURLResponse)?.statusCode ?? 0
         let obj = try? JSONDecoder().decode(MeterEnrollResponse.self, from: data)
         guard httpCode == 200, obj?.ok == true, let t = obj?.token, !t.isEmpty else {
-            if httpCode == 403 { throw MeterCloudError.server("接入码不正确") }
+            if httpCode == 403 { throw MeterCloudError.server("授权码不正确") }
             if httpCode == 429 { throw MeterCloudError.server("尝试过于频繁，请稍后再试") }
             throw MeterCloudError.server(obj?.error ?? "接入失败（服务器 \(httpCode)）")
         }
@@ -645,7 +645,7 @@ final class MeterCloudSync {
             }
             if code == 409 { return ack?.hint ?? "请先开启云端轮询并同步成功后，再点立即轮询" }
             if code == 429 { return "操作太频繁，请 \(ack?.retry_after ?? 10) 秒后再点" }
-            if code == 401 { return "云端令牌已失效，请重新填写电表接入码" }
+            if code == 401 { return "云端令牌已失效，请重新在云端配置填写服务器授权码" }
             let detail = ack?.error.map { "：\($0)" } ?? ""
             return "触发失败（服务器 \(code)）\(detail)"
         } catch {
@@ -704,7 +704,7 @@ final class MeterCloudSync {
 enum NotifyHubConfig {
     static let tokenKey = "notify.hub.userToken"            // Keychain：通知中心用户长期令牌
     static let usernameCacheKey = "notify.hub.username"    // UserDefaults：最近一次用户名（仅展示/预填，非凭据）
-    static let enrollCodeCacheKey = "notify.hub.enrollCode"// UserDefaults：测试期记住接入码方便回填
+    static let enrollCodeCacheKey = "notify.hub.enrollCode"// UserDefaults：测试期记住授权码方便回填
     static let lastSyncKey = "notify.hub.lastSyncAt"
     static let apiPrefix = "/api/notify"
 }
@@ -821,7 +821,7 @@ final class NotifyHub: ObservableObject {
 
     private func zhError(_ raw: String, httpCode: Int) -> String {
         switch raw {
-        case "invalid_code": return "接入码不正确（测试期固定 123456）"
+        case "invalid_code": return "授权码不正确（测试期固定 123456）"
         case "invalid_bark_key": return "识别不到 Bark Key，请粘贴 Bark App 首页的完整推送链接（形如 http://服务器/一串字符）"
         case "username_exists": return "该用户名已被占用；若是本人换机绑定，请换一个用户名（测试期暂不支持换机找回）"
         case "device_limit": return "该账号绑定设备数已达上限（10 台）"
@@ -915,7 +915,7 @@ final class NotifyHub: ObservableObject {
 
     /// 绑定成功后自动补一次电表全量配置，把通道 userToken 绑到电表租户；
     /// 修复“先开电表值守、后绑推送通道”时需手动再同步一次的顺序缺口。
-    /// - Returns: nil=本机还没接入电表云端（无电表令牌，跳过，之后开值守 buildPayload 会自动带 token）；true/false=补同步成败
+    /// - Returns: nil=本机还没接入服务器云端（无令牌，跳过，之后开值守 buildPayload 会自动带 token）；true/false=补同步成败
     private func syncMeterBindingAfterRegister() async -> Bool? {
         let sync = MeterCloudSync.shared
         guard sync.hasToken else { return nil }

@@ -196,6 +196,15 @@ struct CosConfigView: View {
     @State private var tipPositive = true
     @State private var busy = false
     @State private var savedTip: String?
+    // 服务器授权码：换取账号级长期令牌（房源台账 / 电表 / 通知推送共用），入口从电表页归位到本页
+    @State private var authCode = ""
+    @State private var authBusy = false
+    @State private var authTip: String?
+    @State private var authPositive = true
+    @State private var tokenVersion = 0
+
+    private var sync: MeterCloudSync { MeterCloudSync.shared }
+    private var bound: Bool { _ = tokenVersion; return sync.hasToken }
 
     init() {
         _username = State(initialValue: CloudUser.username)
@@ -253,10 +262,47 @@ struct CosConfigView: View {
                         .font(.footnote)
                         .foregroundColor(tipPositive ? .green : .red)
                 }
+
+                Divider()
+
+                if bound {
+                    HStack(spacing: 6) {
+                        Label("已绑定服务器授权令牌", systemImage: "checkmark.shield.fill")
+                            .font(.footnote)
+                            .foregroundColor(.green)
+                        Spacer()
+                        Button("清除", role: .destructive) { clearAuth() }
+                            .font(.footnote)
+                    }
+                } else {
+                    TextField("服务器授权码", text: $authCode)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.numberPad)
+                    Button {
+                        enrollAuth()
+                    } label: {
+                        HStack(spacing: 6) {
+                            if authBusy { ProgressView().controlSize(.small) }
+                            Label("验证并授权", systemImage: "key.fill")
+                        }
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(Color(red: 31/255, green: 58/255, blue: 95/255))
+                    .disabled(authBusy || authCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                if let authTip {
+                    Text(authTip)
+                        .font(.footnote)
+                        .foregroundColor(authPositive ? .green : .red)
+                }
             } header: {
                 Text("房源服务器（台账权威库）")
             } footer: {
-                Text("房源文字台账、状态与修订记录存到这台服务器；未接入服务器时回退本机数据。点「连接」验证地址与账号权限；「断开连接」只清空服务器地址，本机账号令牌保留。")
+                Text("房源文字台账、状态与修订记录存到这台服务器；未接入服务器时回退本机数据。点「连接」验证地址可达；在本页输入服务器授权码换取账号令牌，授权后房源台账、电表值守与通知推送共用同一账号。「断开连接」只清空服务器地址，本机账号令牌保留。")
             }
 
             Section {
@@ -319,6 +365,41 @@ struct CosConfigView: View {
         endpointInput = ""
         serverTip = "已断开：服务器地址已清空（账号令牌保留）"
         tipPositive = false
+    }
+
+    /// 用服务器授权码换取账号级长期令牌（房源 / 电表 / 通知共用）
+    private func enrollAuth() {
+        guard !authBusy else { return }
+        let code = authCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !code.isEmpty else {
+            authTip = "请填写服务器授权码"
+            authPositive = false
+            return
+        }
+        authBusy = true
+        authTip = nil
+        Task {
+            do {
+                _ = try await sync.enroll(store: MeterStore.shared, code: code)
+                authBusy = false
+                authCode = ""
+                tokenVersion += 1
+                authTip = "授权成功，已接入服务器"
+                authPositive = true
+            } catch {
+                authBusy = false
+                authTip = error.localizedDescription
+                authPositive = false
+            }
+        }
+    }
+
+    /// 清除本机授权令牌；服务器上已同步的配置仍保留
+    private func clearAuth() {
+        sync.clearToken()
+        tokenVersion += 1
+        authTip = "本机授权令牌已清除（服务器上已同步的配置仍保留）"
+        authPositive = false
     }
 
     private func saveUsername() {

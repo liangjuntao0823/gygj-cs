@@ -159,7 +159,6 @@ struct MeterSettingsDetailView: View {
 private struct MeterCloudWatchSection: View {
     @EnvironmentObject private var store: MeterStore
 
-    @State private var codeInput = ""
     @State private var tip: String?
     @State private var busy = false
     @State private var tokenSaved = false
@@ -169,9 +168,6 @@ private struct MeterCloudWatchSection: View {
 
     @MainActor
     private var sync: MeterCloudSync { MeterCloudSync.shared }
-    private var codeEmpty: Bool {
-        codeInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
     private var tipPositive: Bool {
         guard let t = tip else { return false }
         return t.contains("成功") || t.contains("已发送") || t.contains("已保存") || t.contains("已连接")
@@ -191,47 +187,25 @@ private struct MeterCloudWatchSection: View {
             pollIntervalBlock
 
             VStack(alignment: .leading, spacing: 10) {
-                    Text("电表云端接入")
+                    Text("服务器授权")
                         .font(.system(size: 12))
                         .foregroundColor(.themeText3)
-                    Text("服务器地址在「设置 → 云端配置」统一维护")
+                    Text("服务器地址与授权码在「设置 → 云端配置」统一维护")
                         .font(.system(size: 11))
                         .foregroundColor(.themeText3)
 
                     if tokenSaved {
                         HStack(spacing: 6) {
-                            Label("本机已保存电表云端令牌", systemImage: "checkmark.shield.fill")
+                            Label("本机已保存服务器令牌", systemImage: "checkmark.shield.fill")
                                 .font(.system(size: 12))
                                 .foregroundColor(.themeAccentDark)
                             Spacer()
-                            Button("清除", role: .destructive) { clearToken() }
-                                .font(.system(size: 12))
                         }
                     } else {
-                        VStack(alignment: .leading, spacing: 7) {
-                            TextField("首次使用填电表接入码（测试期 123456）", text: $codeInput)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled()
-                                .font(.system(size: 13))
-                                .padding(9)
-                                .background(Color.themeBorder.opacity(0.3))
-                                .clipShape(RoundedRectangle(cornerRadius: 9))
-                            Button {
-                                Task { await enrollOnly() }
-                            } label: {
-                                HStack(spacing: 8) {
-                                    if busy { ProgressView().controlSize(.small) }
-                                    Text("验证并保存接入码")
-                                        .font(.system(size: 13, weight: .bold))
-                                }
-                                .foregroundColor(.white)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 9)
-                                .background(codeEmpty ? Color.themeBorder : Color.themeAccentDark)
-                                .clipShape(RoundedRectangle(cornerRadius: 9))
-                            }
-                            .disabled(busy || codeEmpty)
-                        }
+                        Text("尚未接入服务器：请到「设置 → 云端配置」填写服务器授权码完成授权，房源台账、电表值守与通知推送共用同一账号。")
+                            .font(.system(size: 11))
+                            .foregroundColor(.themeText3)
+                            .lineLimit(3)
                     }
 
                     if !store.cloudStatusText.isEmpty {
@@ -296,7 +270,7 @@ private struct MeterCloudWatchSection: View {
         } header: {
             Text("云端轮询（测试）")
         } footer: {
-            Text("这个开关只决定服务器要不要按间隔替你查询电表（查询链接/openId、阈值、间隔与电表清单会自动同步；开启时进电表首页自动拉取云端快照，关闭后保持纯手动刷新）。查出来的告警要不要推送到手机，由「设置 → 云端推送 → 电表推送」开关控制（需先在下方接入电表云端，并在云端推送页绑定 Bark）。长期令牌只存本机（钥匙串优先、私有目录兜底），不上云、不进备份。")
+            Text("这个开关只决定服务器要不要按间隔替你查询电表（查询链接/openId、阈值、间隔与电表清单会自动同步；开启时进电表首页自动拉取云端快照，关闭后保持纯手动刷新）。查出来的告警要不要推送到手机，由「设置 → 云端推送 → 电表推送」开关控制（需先在「设置 → 云端配置」完成服务器授权，并在云端推送页绑定 Bark）。长期令牌只存本机（钥匙串优先、私有目录兜底），不上云、不进备份。")
         }
         .onAppear {
             appearCount += 1
@@ -353,15 +327,8 @@ private struct MeterCloudWatchSection: View {
         defer { busy = false }
         tip = nil
 
-        if !sync.hasToken {
-            let code = codeInput.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !code.isEmpty {
-                let ok = await performEnroll()
-                if !ok { return }
-            }
-        }
         guard sync.hasToken else {
-            tip = "请先在下方「电表云端接入」填写接入码并验证成功，再开启云端轮询"
+            tip = "尚未接入服务器：请到「设置 → 云端配置」填写服务器授权码完成授权，再开启云端轮询"
             return
         }
         UserDefaults.standard.set(true, forKey: MeterCloudConfig.wasEnabledKey)
@@ -369,42 +336,6 @@ private struct MeterCloudWatchSection: View {
         store.saveSettings() // 落盘开关并触发防抖全量同步
         tokenSaved = true
         _ = await sync.pushConfig(store: store, enabled: true) // 立即同步一次，不必等防抖
-    }
-
-    @discardableResult
-    @MainActor
-    private func performEnroll() async -> Bool {
-        if sync.hasToken {
-            // 已有令牌绝不重复接入，从源头杜绝重复 enroll 产生重复租户
-            tokenSaved = true
-            return true
-        }
-        do {
-            _ = try await sync.enroll(store: store, code: codeInput)
-            codeInput = ""
-            tokenSaved = true
-            tip = "接入码验证成功，已连接云端"
-            return true
-        } catch {
-            tip = error.localizedDescription
-            return false
-        }
-    }
-
-    @MainActor
-    private func enrollOnly() async {
-        busy = true
-        defer { busy = false }
-        if await performEnroll(), store.settings.cloudWatchEnabled {
-            _ = await sync.pushConfig(store: store, enabled: true)
-        }
-    }
-
-    @MainActor
-    private func clearToken() {
-        sync.clearToken()
-        tokenSaved = false
-        tip = "本机令牌已清除（服务器上已同步的配置仍保留）"
     }
 
     @MainActor
@@ -507,7 +438,7 @@ struct NotifyHubSettingsView: View {
                 .padding(8)
                 .background(Color.themeBorder.opacity(0.3))
                 .clipShape(RoundedRectangle(cornerRadius: 9))
-            TextField("接入码（测试期 123456）", text: $codeInput)
+            TextField("服务器授权码（测试期 123456）", text: $codeInput)
                 .textInputAutocapitalization(.never)
                 .keyboardType(.numberPad)
                 .font(.system(size: 14))
@@ -534,7 +465,7 @@ struct NotifyHubSettingsView: View {
         } header: {
             Text("首次绑定")
         } footer: {
-            Text("先在 iPhone 的 Bark App 首页复制推送链接（形如 http://服务器地址/一串字符），整段粘贴到上面，App 会自动识别 Key。因 iOS 沙盒限制，公寓管家无法直接读取 Bark 的 Key，只需粘贴这一次。用户名用于在服务器建立独立推送档案，电表等业务事件只投到该账号名下设备；接入码测试期固定 123456，正式版可改为动态码。")
+            Text("先在 iPhone 的 Bark App 首页复制推送链接（形如 http://服务器地址/一串字符），整段粘贴到上面，App 会自动识别 Key。因 iOS 沙盒限制，公寓管家无法直接读取 Bark 的 Key，只需粘贴这一次。用户名用于在服务器建立独立推送档案，电表等业务事件只投到该账号名下设备；授权码与「云端配置」的服务器授权码一致，测试期固定 123456，正式版可改为动态码。")
         }
     }
 
