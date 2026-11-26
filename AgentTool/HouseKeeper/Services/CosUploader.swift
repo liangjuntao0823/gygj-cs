@@ -6,7 +6,6 @@ import UIKit
 import AVFoundation
 import CoreImage
 import SwiftUI
-import WebKit
 
 /// 线程安全的取消标志：后台线程（DispatchQueue）里无法直接读 Task.isCancelled，
 /// 由 withTaskCancellationHandler 的 onCancel 置位，转码循环轮询它来中断。
@@ -2622,31 +2621,6 @@ enum WatermarkSettingsStore {
 }
 
 // MARK: - v1.36 云函数配置（H5 埋点统计 + 管理后台鉴权）
-
-// MARK: - v1.38 网页后台刷新（清缓存 + 版本戳）
-// App 内「管理后台」是原生界面（直接读云函数接口，天然最新）；safari 打开的网页后台靠版本参数绕缓存。
-// 网页后台每次改动（重新部署云函数 admin.html）后，点一次「刷新网页后台缓存」即可让浏览器下次强制取最新页，无需重新构建 App。
-
-enum WebCache {
-    private static let stampKey = "cloud.webCacheStamp"
-    /// 网页版本戳：每次「刷新网页后台」都更新，safari 打开后台 URL 带上它 → 浏览器缓存立即失效
-    static var stamp: String {
-        UserDefaults.standard.string(forKey: stampKey) ?? "20261023"
-    }
-    /// 清 App 内 WebView 缓存 + 更新版本戳
-    static func clear(completion: (() -> Void)? = nil) {
-        UserDefaults.standard.set("\(Int(Date().timeIntervalSince1970))", forKey: stampKey)
-        // v2.68：WKWebsiteDataStore 在 App Extension 不可用，扩展进程只更新版本戳
-        #if !APP_EXTENSION
-        WKWebsiteDataStore.default().removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(),
-                                                 modifiedSince: .distantPast) {
-            DispatchQueue.main.async { completion?() }
-        }
-        #else
-        DispatchQueue.main.async { completion?() }
-        #endif
-    }
-}
 
 enum CloudConfig {
     // v1.40：云函数地址不再内置默认值——新装 App 的地址栏为空，由用户自行填写保存。

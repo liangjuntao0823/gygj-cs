@@ -555,16 +555,7 @@ struct MainTabView: View {
                 TaskRetryPerformer.shared.bind(houseContext: houseModelContext)
             }
             SyncTaskCenter.shared.bootstrap()
-            // v2.45：历史日志一次性迁移到各房账本（幂等），随后合并上传待同步账本
-            // v2.46：把真实房源的房号集合传入，用于清理误建的畸形媒体目录
-            let validRoomKeys: Set<String> = {
-                guard let ctx = houseModelContext,
-                      let houses = try? ctx.fetch(FetchDescriptor<House>()) else { return [] }
-                return Set(houses.filter { !$0.isTrashed }.map { $0.mediaRoomKey })
-            }()
-            HouseLedgerMigrator.run(validRoomKeys: validRoomKeys)
-            // v2.47：清理历史账本里残留的笼统动作（如「媒体更新」），本地云端同清
-            HouseLedgerDeprecatedCleanup.run()
+            // 历史日志一次性迁移器 / 废弃动作清理器已随旧云链下线（#338）；类型定义保留，待旧类整组下线片移除。
             // b118（清单12：打开 App 轻量变更感知）：启动时轻量探测云端房源账本是否有变化
             // v2.62（A3）：同时记下「最近一次前台检测时间」，避免启动瞬间的 didBecomeActive 再补一次检测
             UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "cloudDetectLastForegroundAt")
