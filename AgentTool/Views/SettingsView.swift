@@ -1103,10 +1103,7 @@ struct SettingsView: View {
         if kind == .fast {
             if let url = BackupV5Manager.createFastBackup(mainContext: modelContext, houseContext: houseCtx) {
                 BackupLogStore.log(category: "备份", action: "快速备份", result: "成功", detail: url.lastPathComponent, checksum: BackupV5Manager.sha1OfFile(at: url) ?? "")
-                Task {
-                    await CloudBackupService.autoUploadFastBackup(zipURL: url, config: nil)
-                }
-                showMessage = RemoteConfig.tip("quickBackupOk", "快速备份成功：{file}\n已自动上传云端（若网络失败会在下次打开 App 时自动重试）").replacingOccurrences(of: "{file}", with: url.lastPathComponent)
+                showMessage = RemoteConfig.tip("quickBackupOk", "快速备份成功：{file}").replacingOccurrences(of: "{file}", with: url.lastPathComponent)
             } else {
                 showMessage = "快速备份失败，请检查存储空间"
             }
@@ -2810,10 +2807,7 @@ struct BackupSettingsPage: View {
         if kind == .fast {
             if let url = BackupV5Manager.createFastBackup(mainContext: modelContext, houseContext: houseCtx) {
                 BackupLogStore.log(category: "备份", action: "快速备份", result: "成功", detail: url.lastPathComponent, checksum: BackupV5Manager.sha1OfFile(at: url) ?? "")
-                Task {
-                    await CloudBackupService.autoUploadFastBackup(zipURL: url, config: nil)
-                }
-                showMessage = RemoteConfig.tip("quickBackupOk", "快速备份成功：{file}\n已自动上传云端（若网络失败会在下次打开 App 时自动重试）").replacingOccurrences(of: "{file}", with: url.lastPathComponent)
+                showMessage = RemoteConfig.tip("quickBackupOk", "快速备份成功：{file}").replacingOccurrences(of: "{file}", with: url.lastPathComponent)
             } else {
                 showMessage = "快速备份失败，请检查存储空间"
             }
