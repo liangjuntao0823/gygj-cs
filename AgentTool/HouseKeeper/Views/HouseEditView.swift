@@ -19,7 +19,7 @@ struct HouseEditView: View {
 
     /// 传入房源 = 编辑；nil = 新增
     let house: House?
-    /// v2.41：由快捷指令深链唤起时（gongyuguanjia-fwq://paste），进页面即自动解析剪贴板并弹确认卡
+    /// v2.41：由快捷指令深链唤起时（gongyuguanjia://paste），进页面即自动解析剪贴板并弹确认卡
     var autoImportClipboard: Bool = false
     @State private var autoImportHandled = false
 
@@ -559,11 +559,6 @@ struct HouseEditView: View {
             stashDraft(house: house, reason: "断网，改动未保存")
             return
         }
-        // 服务器模式：冲突校验走服务器权威库（HouseSyncEngine.pushHouse），不进旧云账本守卫链
-        if HouseServerMode.ready {
-            saveRaw()
-            return
-        }
         guard let config = CosConfig.load(), config.isValid else {
             // 没配云存储：无从校验，也谈不上覆盖别人，按原流程存本机
             saveRaw()
@@ -632,9 +627,7 @@ struct HouseEditView: View {
             let ok = await NetworkMonitor.shared.awaitReachable()
             if ok {
                 await MainActor.run {
-                    // 服务器模式：查重口径以服务器库为准，不再读旧 COS 桶做先探后写，直接落库
-                    guard !HouseServerMode.ready,
-                          let config = CosConfig.load(), config.isValid else {
+                    guard let config = CosConfig.load(), config.isValid else {
                         performSave()
                         return
                     }
@@ -972,74 +965,41 @@ struct HouseEditView: View {
             for old in removedMediaItems {
                 MediaStore.delete(fileName: old.fileName, roomKey: rk)
             }
-            if !removedMediaItems.isEmpty {
+            if let config = CosConfig.load(), config.isValid, !removedMediaItems.isEmpty {
                 let removed = removedMediaItems.map { (name: $0.fileName, kind: $0.kind) }
-                if HouseServerMode.ready {
-                    Task {
-                        var succeeded: [(name: String, kind: String)] = []
-                        var failed: [(name: String, kind: String, error: String)] = []
-                        for item in removed {
-                            do {
-                                try await HouseRemoteClient.shared.deleteMedia(roomKey: rk, fileName: item.name)
-                                succeeded.append(item)
-                            } catch {
-                                failed.append((name: item.name, kind: item.kind, error: error.localizedDescription))
-                            }
-                        }
-                        let successSplit = HouseLedgerFormat.split(succeeded)
-                        let failSplit = HouseLedgerFormat.split(failed.map { (name: $0.name, kind: $0.kind) })
-                        let summary = HouseLedgerFormat.mediaSummary(images: successSplit.images.count, videos: successSplit.videos.count)
-                        let failSummary = HouseLedgerFormat.mediaSummary(images: failSplit.images.count, videos: failSplit.videos.count)
-                        if failed.isEmpty {
-                            BackupLogStore.log(category: "房源", action: "删除媒体（本地→服务器）", result: "成功",
-                                               detail: "已删除\(summary)", room: rk, cloud: false)
-                        } else {
-                            let failedFiles = failed.map { $0.name }
-                            SyncTaskCenter.shared.reportFailure(
-                                kind: .mediaDelete,
-                                title: "删服务器媒体",
-                                roomKeys: [rk],
-                                failure: "\(rk) 有 \(failed.count) 个媒体没从服务器删掉；点重试",
-                                files: failedFiles)
-                            BackupLogStore.log(category: "房源", action: "删除媒体（本地→服务器）", result: "失败",
-                                               detail: "\(failSummary) 删除失败，已挂任务中心", room: rk, cloud: false)
+                Task {
+                    var succeeded: [(name: String, kind: String)] = []
+                    var failed: [(name: String, kind: String, error: String)] = []
+                    for item in removed {
+                        do {
+                            try await CosUploader.deleteRemoteMedia(fileName: item.name, kind: item.kind, roomKey: rk, config: config)
+                            succeeded.append(item)
+                        } catch {
+                            failed.append((name: item.name, kind: item.kind, error: error.localizedDescription))
                         }
                     }
-                } else if let config = CosConfig.load(), config.isValid {
-                    Task {
-                        var succeeded: [(name: String, kind: String)] = []
-                        var failed: [(name: String, kind: String, error: String)] = []
-                        for item in removed {
-                            do {
-                                try await CosUploader.deleteRemoteMedia(fileName: item.name, kind: item.kind, roomKey: rk, config: config)
-                                succeeded.append(item)
-                            } catch {
-                                failed.append((name: item.name, kind: item.kind, error: error.localizedDescription))
-                            }
-                        }
-                        let successSplit = HouseLedgerFormat.split(succeeded)
-                        let failSplit = HouseLedgerFormat.split(failed.map { (name: $0.name, kind: $0.kind) })
-                        let summary = HouseLedgerFormat.mediaSummary(images: successSplit.images.count, videos: successSplit.videos.count)
-                        let failSummary = HouseLedgerFormat.mediaSummary(images: failSplit.images.count, videos: failSplit.videos.count)
-                        if failed.isEmpty {
-                            BackupLogStore.log(category: "房源", action: "删除媒体（本地→云端）", result: "成功",
-                                               detail: "已删除\(summary)", room: rk, cloud: true)
-                        } else {
-                            let failedFiles = failed.map { $0.name }
-                            let failureDetail = summary.isEmpty
+                    let successSplit = HouseLedgerFormat.split(succeeded)
+                    let failSplit = HouseLedgerFormat.split(failed.map { (name: $0.name, kind: $0.kind) })
+                    let summary = HouseLedgerFormat.mediaSummary(images: successSplit.images.count, videos: successSplit.videos.count)
+                    let failSummary = HouseLedgerFormat.mediaSummary(images: failSplit.images.count, videos: failSplit.videos.count)
+                    if failed.isEmpty {
+                        BackupLogStore.log(category: "房源", action: "删除媒体（本地→云端）", result: "成功",
+                                           detail: "已删除\(summary)", room: rk, cloud: true)
+                    } else {
+                        let failedFiles = failed.map { $0.name }
+                        let failureDetail = summary.isEmpty
                             ? "\(failSummary) 删除失败，已挂任务中心"
                             : "已删除\(summary)；\(failSummary) 删除失败，已挂任务中心"
-                            // 断网/超时：本地已删、云端对象还在别人能看到的旧内容——
-                            // 挂任务中心待处理，联网后手动点重试补删；files 只供内部重试，日志不展示文件名。
-                            SyncTaskCenter.shared.reportFailure(
-                                kind: .mediaDelete,
-                                title: "删云端媒体",
-                                roomKeys: [rk],
-                                failure: "\(rk) 有 \(failed.count) 个媒体没从云端删掉；点重试",
-                                files: failedFiles)
-                            BackupLogStore.log(category: "房源", action: "删除媒体（本地→云端）", result: "失败",
-                                               detail: failureDetail, room: rk, cloud: true)
-                        }
+                        // 断网/超时：本地已删、云端对象还在别人能看到的旧内容——
+                        // 挂任务中心待处理，联网后手动点重试补删；files 只供内部重试，日志不展示文件名。
+                        SyncTaskCenter.shared.reportFailure(
+                            kind: .mediaDelete,
+                            title: "删云端媒体",
+                            roomKeys: [rk],
+                            failure: "\(rk) 有 \(failed.count) 个媒体没从云端删掉；点重试",
+                            files: failedFiles)
+                        BackupLogStore.log(category: "房源", action: "删除媒体（本地→云端）", result: "失败",
+                                           detail: failureDetail, room: rk, cloud: true)
                     }
                 }
             }
@@ -1077,8 +1037,7 @@ struct HouseEditView: View {
         // v1.54：保存后自动生成/更新该房源的脱敏版 H5（删旧生成新）——
         //        保证「新增了房源就自动有分享页」，选房链接里点卡片即可打开完整详情；
         //        编辑保存时旧 H5 立即失效、生成新 H5（内容与最新房源信息一致）
-        // 服务器模式：App 内分享不生成 H5 分享页，此自动重建跳过。
-        if !HouseServerMode.ready, let config = CosConfig.load(), config.isValid {
+        if let config = CosConfig.load(), config.isValid {
             let files = target.mediaItems.map { ShareMediaFile(name: $0.fileName, kind: $0.kind) }
             let profile = CosUploader.loadShareProfile()
             let info = ShareHouseInfo(
@@ -1181,13 +1140,6 @@ struct HouseEditView: View {
             added: addedRefs, removed: removedRefs, ledgerEventIds: ledgerEventIds)
         // 账本记录在主线程抽好（值类型），连同媒体小抄一起进后台协调推送
         let ledgerRecord = CloudHouseSync.record(from: target, username: CloudUser.username)
-        if HouseServerMode.ready {
-            launchServerPush(target: target, mediaSnapshots: mediaSnapshots,
-                             kind: cloudPushKind, oldRoomKey: oldRoomKeyForPurge)
-            NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
-            dismiss()
-            return
-        }
         launchCloudPush(mediaSnapshots: mediaSnapshots,
                         record: ledgerRecord,
                         removedMedia: removedMedia,
@@ -1218,65 +1170,6 @@ struct HouseEditView: View {
 
     /// performSave 落盘后唯一的云端推送入口：在主线程抽好小抄，再进一个后台 Task 按场景顺序执行。
     /// 后台全程只看值类型（小抄 + CloudHouseRecord），不读 SwiftData 模型对象。
-    /// 服务器模式推送：媒体文件经服务器 HTTP 落服务器磁盘，文本与媒体引用走服务器权威接口。
-    /// 本机沿用现有本地通知文案；服务器再向其他接入设备广播。
-    private func launchServerPush(target: House, mediaSnapshots: [MediaUploadSnapshot],
-                                  kind: CloudPushKind, oldRoomKey: String) {
-        let taskID = UUID()
-        if !mediaSnapshots.isEmpty {
-            Task { @MainActor in
-                SyncTaskCenter.shared.begin(
-                    id: taskID, kind: .media, title: "上传媒体",
-                    roomKeys: [target.mediaRoomKey], total: mediaSnapshots.count,
-                    note: "准备上传", files: mediaSnapshots.map { $0.fileName },
-                    isHouseUpload: true, rollback: nil)
-            }
-        }
-        let work = Task {
-            // 媒体实体落服务器磁盘：服务器模式下直传服务器 HTTP；
-            // 媒体失败不阻塞文本权威同步，未传成功的文件由媒体补传队列后续重试。
-            if !mediaSnapshots.isEmpty {
-                await MediaActivityGate.shared.beginUpload()
-                defer { Task { await MediaActivityGate.shared.endUpload() } }
-                _ = try? await uploadMedia(snapshots: mediaSnapshots,
-                                           writeSuccessLog: false, taskID: taskID)
-            }
-            do {
-                let remote = try await HouseSyncEngine.shared.pushHouse(target)
-                // 改名：清理服务器上旧房号的记录与磁盘媒体（后端级联删除；失败不阻断，留待对账清理）
-                if kind == .rename, !oldRoomKey.isEmpty, oldRoomKey != remote.roomKey {
-                    try? await HouseRemoteClient.shared.delete(oldRoomKey)
-                }
-                await MainActor.run {
-                    if !mediaSnapshots.isEmpty { SyncTaskCenter.shared.discard(id: taskID) }
-                    let roomKey = remote.roomKey
-                    switch kind {
-                    case .newHouse:
-                        HouseActionNotifier.shared.send(key: "new.\(roomKey)",
-                            title: "房源已保存", body: "\(roomKey) 台账已保存到服务器")
-                    case .rename:
-                        HouseActionNotifier.shared.send(key: "rename.\(roomKey)",
-                            title: "房号已迁移", body: "\(oldRoomKey) → \(roomKey)，已同步到服务器")
-                    case .plainEdit:
-                        HouseActionNotifier.shared.send(key: "edit.\(roomKey)",
-                            title: "修改已同步", body: "\(roomKey) 的改动已保存并同步到服务器")
-                    }
-                }
-            } catch {
-                await MainActor.run {
-                    if !mediaSnapshots.isEmpty { SyncTaskCenter.shared.discard(id: taskID) }
-                    // 标记待补传，联网后自动重试，不丢改动
-                    HousePendingUploader.shared.markPending(target.mediaRoomKey)
-                    HouseActionNotifier.shared.send(
-                        key: "fail.\(target.mediaRoomKey)",
-                        title: "已存本机",
-                        body: "服务器同步失败：\(error.localizedDescription)，联网后自动补传")
-                }
-            }
-        }
-        Task { @MainActor in UploadTaskRegistry.shared.register(taskID, task: work) }
-    }
-
     private func launchCloudPush(
         mediaSnapshots: [MediaUploadSnapshot],
         record: CloudHouseRecord,
@@ -1315,7 +1208,7 @@ struct HouseEditView: View {
                     // #23：先把媒体全部传完（成功或已入队），最后才传账本，别的设备不会在媒体没齐时拉到半成品。
                     // 仅适用于「新增房源且一并带了媒体」；没带媒体的新增 mediaSnapshots 为空，直接传账本。
                     // v2.58：新增房源的媒体成功日志并入「新增房源」一条，不再单独写「新增媒体」。
-                    let mediaResult = try await uploadMedia(snapshots: mediaSnapshots, writeSuccessLog: false, taskID: uploadTaskID, isNewHouse: true)
+                    let mediaResult = try await uploadMedia(snapshots: mediaSnapshots, config: config, writeSuccessLog: false, taskID: uploadTaskID, isNewHouse: true)
                     do {
                         // v2.57（P0-1）：没传上去的文件名不写入云端账本——否则另一台设备同步时会把
                         // 这些「账本有、桶里没有」的引用当成失效剔除，补传成功后反而成桶孤儿；
@@ -1333,7 +1226,7 @@ struct HouseEditView: View {
 
                 case .rename:
                     // #3：先建新名（媒体 → 账本），账本确认成功且媒体无失败，最后才删旧目录；任一步失败旧目录保留。
-                    let mediaResult = try await uploadMedia(snapshots: mediaSnapshots, taskID: uploadTaskID)
+                    let mediaResult = try await uploadMedia(snapshots: mediaSnapshots, config: config, taskID: uploadTaskID)
                     do {
                         // v2.57（P0-1）：改名场景同样不把没传上的文件名写进新房账本，补传成功后再补写
                         var recordToPush = record
@@ -1363,7 +1256,7 @@ struct HouseEditView: View {
 
                 case .plainEdit:
                     // 普通编辑：媒体（仅新增）与账本照旧推送
-                    let mediaResult = try await uploadMedia(snapshots: mediaSnapshots, taskID: uploadTaskID)
+                    let mediaResult = try await uploadMedia(snapshots: mediaSnapshots, config: config, taskID: uploadTaskID)
                     do {
                         // v2.57（P0-1）：没传上的文件名不写入云端账本，防止他端同步剔除造成跨设备丢媒体
                         var recordToPush = record
@@ -1443,7 +1336,7 @@ struct HouseEditView: View {
                 HouseActionNotifier.shared.send(
                     key: "save.\(roomKey)",
                     title: "房源已上传",
-                    body: "\(roomKey) 已同步到桶\(mediaSuffix)"
+                    body: "\(roomKey) 已同步到云端\(mediaSuffix)"
                 )
             }
         case .rename:
@@ -1458,7 +1351,7 @@ struct HouseEditView: View {
                 HouseActionNotifier.shared.send(
                     key: "rename.\(roomKey)",
                     title: "房号已迁移",
-                    body: "\(oldRoomKey) → \(roomKey)，桶内已同步"
+                    body: "\(oldRoomKey) → \(roomKey)，云端已同步"
                 )
             }
         case .plainEdit:
@@ -1473,7 +1366,7 @@ struct HouseEditView: View {
                 HouseActionNotifier.shared.send(
                     key: "save.\(roomKey)",
                     title: "修改已同步",
-                    body: "\(roomKey) 的改动已同步到桶\(mediaSuffix)"
+                    body: "\(roomKey) 的改动已同步到云端\(mediaSuffix)"
                 )
             }
         }
@@ -1488,8 +1381,9 @@ struct HouseEditView: View {
         return false
     }
 
-    private func uploadMedia(snapshots: [MediaUploadSnapshot], writeSuccessLog: Bool = true, taskID: UUID? = nil, isNewHouse: Bool = false) async throws -> (success: Int, failed: Int, failedFiles: [String], lastError: String) {
+    private func uploadMedia(snapshots: [MediaUploadSnapshot], config: CosConfig, writeSuccessLog: Bool = true, taskID: UUID? = nil, isNewHouse: Bool = false) async throws -> (success: Int, failed: Int, failedFiles: [String], lastError: String) {
         guard !snapshots.isEmpty else { return (0, 0, [], "") }
+        let compress = shareCompressionEnabled
         var success = 0, failed = 0, lastError = ""
         var failedFiles: [String] = []
         let total = snapshots.count
@@ -1511,12 +1405,50 @@ struct HouseEditView: View {
                 }
                 continue
             }
+            let base = Double(idx) / Double(total)
+            let span = 1.0 / Double(total)
             do {
-                let data = try Data(contentsOf: url)
-                HouseSyncProgress.shared.updateStage(roomKey: snap.roomKey, direction: .upload, label: "正在上传")
-                _ = try await HouseRemoteClient.shared.uploadMedia(
-                    roomKey: snap.roomKey, fileName: snap.fileName,
-                    kind: snap.kind, data: data)
+                try await CosUploader.uploadHouseMedia(
+                    fileName: snap.fileName, kind: snap.kind, roomKey: snap.roomKey,
+                    config: config, compress: compress,
+                    onStage: { stage in
+                        HouseSyncProgress.shared.updateStage(roomKey: snap.roomKey, direction: .upload, label: stage)
+                    },
+                    onTranscodeProgress: { p in
+                        let fraction = max(0, min(1, p.isFinite ? p : 0))
+                        HouseSyncProgress.shared.updateTranscodeProgress(
+                            roomKey: snap.roomKey,
+                            direction: .upload,
+                            progress: base + span * fraction,
+                            fraction: fraction
+                        )
+                        if let taskID {
+                            Task { @MainActor in
+                                SyncTaskCenter.shared.advanceWithinFile(id: taskID, fileIndex: idx,
+                                                                        fraction: fraction,
+                                                                        note: "正在转码 \(snap.fileName)")
+                            }
+                        }
+                    },
+                    onBytes: { p in
+                        HouseSyncProgress.shared.update(roomKey: snap.roomKey, direction: .upload,
+                                                       progress: base + span * p)
+                        if let taskID {
+                            Task { @MainActor in
+                                SyncTaskCenter.shared.advanceWithinFile(id: taskID, fileIndex: idx,
+                                                                        fraction: p,
+                                                                        note: "正在上传 \(snap.fileName)")
+                            }
+                        }
+                    },
+                    onSpeed: { bytesPerSecond in
+                        HouseSyncProgress.shared.updateSpeed(bytesPerSecond: bytesPerSecond)
+                        if let taskID {
+                            Task { @MainActor in
+                                SyncTaskCenter.shared.updateSpeed(id: taskID, bytesPerSecond: bytesPerSecond)
+                            }
+                        }
+                    })
                 HouseMediaUploadQueue.remove(roomKey: snap.roomKey, fileName: snap.fileName)
                 success += 1
             } catch {

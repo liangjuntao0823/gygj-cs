@@ -107,41 +107,5 @@ struct MeterSettings: Codable {
     var autoRefreshEnabled: Bool = false // 定时刷新开关，默认关
     var lowAlertEnabled: Bool = true  // 低电量本地通知提醒，默认开
 
-    // MARK: 云端值守（gygj-cs 试验功能）
-    // 必须用 Optional 存储属性：旧版 settings.json 缺这些键时，合成 Decodable 才不会因缺键解码失败（nil 即默认）。
-    var cloudEnabledRaw: Bool?    // 云端值守总开关（nil/false=关，保持纯手动刷新模式）
-    var cloudEndpointRaw: String? // 云端同步地址（nil/空白=回退 MeterCloudConfig.defaultEndpoint）
-    var cloudPollMinutesRaw: Int? // 云端值守服务器轮询间隔（分钟，nil=默认 60；读写统一用 cloudPollMinutes）
-
-    /// 云端值守开关（UI 与同步逻辑统一使用该便利属性）
-    var cloudWatchEnabled: Bool {
-        get { cloudEnabledRaw == true }
-        set { cloudEnabledRaw = newValue }
-    }
-
-    /// 实际生效的云端地址（去首尾空白，空值回退默认服务器）
-    var cloudEndpoint: String {
-        get {
-            let v = (cloudEndpointRaw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            return v.isEmpty ? MeterCloudConfig.defaultEndpoint : v
-        }
-        set { cloudEndpointRaw = newValue }
-    }
-
-    /// 云端值守服务器轮询间隔（分钟）：旧数据 nil 回退 60，统一夹到 60～720 分钟（1～12 小时）
-    var cloudPollMinutes: Int {
-        get { max(60, min(720, cloudPollMinutesRaw ?? 60)) }
-        set { cloudPollMinutesRaw = max(60, min(720, newValue)) }
-    }
-
     static let `default` = MeterSettings()
-}
-
-/// 电表云端值守常量（长期令牌只存 Keychain，不进 Codable settings、不进备份与 git）
-enum MeterCloudConfig {
-    static let defaultEndpoint = "http://114.132.93.85:8082"
-    static let tokenKey = "meter.cloud.token"             // KeychainStore account
-    static let wasEnabledKey = "meter.cloud.wasEnabled"   // UserDefaults：关开关时补发一次 enabled=false
-    static let dirtyKey = "meter.cloud.dirty"             // UserDefaults：上次同步失败、待补推
-    static let enterPullThrottle: TimeInterval = 3        // 仅合并同一次进入的重复 onAppear；用户每次进看板都自动拉取云端快照
 }

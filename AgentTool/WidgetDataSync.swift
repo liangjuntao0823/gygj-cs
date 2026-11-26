@@ -29,7 +29,7 @@ enum WidgetDataSync {
         "group.6f5a3ce5f64acb19.3",
         "group.6f5a3ce5f64acb19.4",
         "group.6f5a3ce5f64acb19.5",
-        "group.com.gj.tg2.shared"
+        "group.com.gj.tg.shared"
     ]
 
     /// 候选 App Group（去重保序）：embedded.mobileprovision 解析出的实际注入 group + 已知兜底列表。
