@@ -767,14 +767,6 @@ enum VideoShareError: LocalizedError {
 }
 
 enum VideoOnlyShare {
-    /// 分享用的转码 preset 顺序：先无损转封装，失败再逐级缩小重编码（都是 H.264/AAC 的 mp4）。
-    private static let exportPresets: [String] = [
-        AVAssetExportPresetPassthrough,
-        AVAssetExportPreset1920x1080,
-        AVAssetExportPreset1280x720,
-        AVAssetExportPreset960x540
-    ]
-
     /// 本地视频 → 可直接交给系统分享面板的文件地址。
     /// v2.35：不再转码。实测所有「点微信没反应」的都是 .mov，而同一个 .mov 存到相簿后从相簿
     /// 分享到微信完全正常（微信自己会转成 mp4 存回相簿），所以相簿给微信的就是**原文件本身**。
@@ -863,52 +855,6 @@ enum VideoOnlyShare {
         } catch {
             // 相册保存失败不影响主流程（分享），静默忽略
         }
-    }
-
-    // MARK: - 转码
-
-    /// 把任意本地视频转成经过校验的 mp4；preset 逐级兜底，全部失败抛错。
-    static func exportToMP4(_ url: URL) async throws -> URL {
-        var lastError: Error?
-        for preset in exportPresets {
-            do {
-                let output = try await runExport(source: url, preset: preset)
-                if try await validateVideo(output) {
-                    return output
-                }
-            } catch {
-                lastError = error
-            }
-        }
-        if let error = lastError {
-            BackupLogStore.log(category: "分享", action: "视频转码", result: "失败",
-                              detail: "\(url.lastPathComponent) \(error.localizedDescription)")
-        }
-        throw VideoShareError.allExportsFailed(url.lastPathComponent)
-    }
-
-    /// 单次 AVAssetExportSession 导出；preset 不适用或失败都抛错。
-    private static func runExport(source: URL, preset: String) async throws -> URL {
-        let asset = AVURLAsset(url: source)
-        guard await AVAssetExportSession.exportPresets(compatibleWith: asset).contains(preset) else {
-            throw VideoShareError.unreadable(source.lastPathComponent)
-        }
-        guard let session = AVAssetExportSession(asset: asset, presetName: preset) else {
-            throw VideoShareError.unreadable(source.lastPathComponent)
-        }
-        let output = FileManager.default.temporaryDirectory
-            .appendingPathComponent("share_video_\(UUID().uuidString).mp4")
-        session.outputURL = output
-        session.outputFileType = .mp4
-        // 微信扩展跨进程读取，网络优化标记让 moov 前置，扩展不用先拖完整文件
-        session.shouldOptimizeForNetworkUse = true
-
-        await session.export()
-        if session.status != .completed {
-            try? FileManager.default.removeItem(at: output)
-            throw session.error ?? VideoShareError.allExportsFailed(source.lastPathComponent)
-        }
-        return output
     }
 
     /// 回读校验：文件存在、非空、能加载、有视频轨、时长 > 0。
