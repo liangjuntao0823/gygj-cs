@@ -2918,52 +2918,6 @@ struct HouseListView: View {
                     }
                 }
             }
-        } else if let config = CosConfig.load(), config.isValid, !rentedHouses.isEmpty {
-            let toPush = rentedHouses
-            Task {
-                var okRooms: [String] = []
-                var failRooms: [String] = []
-                for house in toPush {
-                    let record = CloudHouseSync.record(from: house, username: CloudUser.username)
-                    LocalHouseLedger.save(house)
-                    let roomKey = house.mediaRoomKey
-                    let roomNo = house.displayRoomNo
-                    HouseSyncProgress.shared.begin(roomKey: roomKey, direction: .upload, progress: 0.2, label: "同步账本")
-                    do {
-                        // v2.36（#6）：批量已租改走 uploadGuarded 合并写，避免裸覆盖
-                        _ = try await CloudHouseSync.uploadGuarded(record: record, config: config)
-                        HouseSyncProgress.shared.end()
-                        await MainActor.run {
-                            house.cloudStatus = .both
-                            SyncFailStore.clear(roomKey)
-                            try? houseModelContext?.save()
-                        }
-                        okRooms.append(roomNo)
-                        BackupLogStore.log(category: "房源", action: "批量标记已租", result: "成功", detail: "状态：待租 → 已租", room: roomNo, cloud: true)
-                    } catch {
-                        HouseSyncProgress.shared.end()
-                        await MainActor.run { SyncFailStore.mark(roomKey) }
-                        failRooms.append(roomNo)
-                        BackupLogStore.log(category: "房源", action: "批量标记已租", result: "失败", detail: "云端更新失败：\(error.localizedDescription)", room: roomNo, cloud: true)
-                    }
-                }
-                await MainActor.run {
-                    if failRooms.isEmpty {
-                        HouseActionNotifier.shared.send(
-                            key: "batch.rented",
-                            title: "批量改已租完成",
-                            body: "\(okRooms.count) 套已改为已租，云端同步 \(okRooms.count)/\(okRooms.count)"
-                        )
-                    } else {
-                        HouseActionNotifier.shared.send(
-                            key: "batch.rented",
-                            title: "部分房源没传上",
-                            body: "\(okRooms.count) 套同步成功，\(failRooms.count) 套失败（\(failRooms.joined(separator: "、"))），联网后自动重试",
-                            silent: true
-                        )
-                    }
-                }
-            }
         }
         NotificationCenter.default.post(name: Self.houseStoreChanged, object: nil)
         let total = selectedHouseIDs.count
