@@ -629,86 +629,9 @@ struct HouseListView: View {
         showToast("云端检测失败：请检查网络或云配置后重试")
     }
 
-    /// v2.37（#15/#34）：变更感知改为「只拉 1 个总清单」做增量比对，请求数从约 128 降到 1。
-    /// - 本地还没有任何修订号基线（首次安装/刚升级），或云端总清单缺失：退回一次全量精确比对（fetchAll），
-    ///   顺手重建总清单、建立基线；之后就只拉总清单。
-    /// - 有基线：拉总清单，按「修订号是否变化 + 房号/座号/媒体数摘要」判断；本地有、清单没有或反之也算差异。
-    /// - 加 45 秒节流：短时间内反复进入页面直接复用上次结果，不重复发请求。
-    /// 探测失败（断网/超时/未配置云）→ .detectFailed，与「无变化」严格区分。
-    static func detectCloudLedgerChange(houseContext: ModelContext?) async -> CloudChangeState {
-        // 服务器模式：清单/账本权威在 8082，旧 COS 清单变更感知整体跳过，避免读旧桶、弹旧「云端有更新」横幅
-        if HouseServerMode.ready { return .noChange }
-        guard let config = CosConfig.load(), config.isValid else { return .detectFailed }
-        guard let ctx = houseContext else { return .detectFailed }
-
-        // v2.62（A2）：有房源上传任务正在跑时，整次检测直接跳过——不上传途中弹「云端有更新」，
-        // 也不写缓存（避免把这一刻的错误结论留到 45 秒后继续复用）。
-        if await MainActor.run(body: { Self.hasRunningHouseUpload() }) {
-            return .noChange
-        }
-
-        // v2.63：手动云端同步（左上角刷新/长按深度刷新）进行中时直接跳过检测——
-        // 两边都要拉云端清单，并发会重复请求，检测基于同步中途的中间态也不可信。
-        // 下拉刷新是纯本地媒体对账、不联网，不在此列，只靠 UI 让位（手动优先）。
-        if await MainActor.run(body: { CloudDetectActivity.shared.isManualSyncing }) {
-            return .noChange
-        }
-
-        // v2.63（b121 回归）：从这里开始算「正在检测」——房源页顶部显示细进度条 +「正在检测云端变更…」；
-        // 无论正常结束、无变化、失败还是提前返回，都由 defer 统一熄灭，且至少展示 0.6 秒。
-        await MainActor.run { CloudDetectActivity.shared.beginDetecting() }
-        defer { DispatchQueue.main.async { CloudDetectActivity.shared.endDetecting() } }
-
-        // 45 秒节流：只复用「无变化」（v2.62：hasUpdate 不再复用，避免旧结论反复弹横幅）
-        let now = Date().timeIntervalSince1970
-        let lastAt = UserDefaults.standard.double(forKey: "cloudDetectLastAt")
-        if now - lastAt < 45,
-           let cached = UserDefaults.standard.string(forKey: "cloudDetectLastState"),
-           let state = cloudChangeState(fromRaw: cached),
-           state == .noChange {
-            return state
-        }
-
-        // v2.62（A1）：本机正在上传/待重试的房号，不参与「本地 vs 云端」差异判定
-        let activeKeys = await MainActor.run(body: { Self.activeUploadRoomKeys() })
-
-        let state: CloudChangeState
-        // 没有任何基线（首次）→ 全量精确比对并建立基线
-        if CloudRevisionStore.all().isEmpty {
-            state = await compareWithFullFetch(config: config, ctx: ctx, activeKeys: activeKeys)
-        } else {
-            do {
-                if let manifest = try await CloudHouseSync.fetchManifest(config: config) {
-                    // v2.54：compareManifest 改为 async 精确口径（revision 不再一票否决）
-                    state = await compareManifest(manifest, config: config, ctx: ctx, activeKeys: activeKeys)
-                } else {
-                    // 云端总清单缺失：全量重建 + 精确比对
-                    state = await compareWithFullFetch(config: config, ctx: ctx, activeKeys: activeKeys)
-                }
-            } catch {
-                state = .detectFailed
-            }
-        }
-        UserDefaults.standard.set(now, forKey: "cloudDetectLastAt")
-        UserDefaults.standard.set(cloudChangeRawValue(state), forKey: "cloudDetectLastState")
-        return state
-    }
-
-    private static func cloudChangeRawValue(_ s: CloudChangeState) -> String {
-        switch s {
-        case .noChange: return "noChange"
-        case .hasUpdate: return "hasUpdate"
-        case .detectFailed: return "detectFailed"
-        }
-    }
-
-    private static func cloudChangeState(fromRaw raw: String) -> CloudChangeState? {
-        switch raw {
-        case "noChange": return .noChange
-        case "hasUpdate": return .hasUpdate
-        case "detectFailed": return .detectFailed
-        default: return nil
-        }
+    /// 旧 COS 清单变更感知已下线：服务器模式下权威库由 HouseSyncEngine.pull 增量对账，本方法恒返回无变化。
+    static func detectCloudLedgerChange(houseContext _: ModelContext?) async -> CloudChangeState {
+        .noChange
     }
 
     /// 全量精确比对（fetchAll 逐间对比），并把云端修订号记成本地基线、确保总清单存在
