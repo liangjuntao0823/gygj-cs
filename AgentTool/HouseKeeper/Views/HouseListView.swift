@@ -17,42 +17,15 @@ enum CloudChangeState: Equatable {
     case detectFailed    // 检测失败（断网/超时/未配置云），不再静默
 }
 
-/// v2.63（b121 回归）：自动云端变更检测的全局指示状态。
-/// 冷启动 / 回前台 / 进板块 30 分钟兜底三条路径最终都走 detectCloudLedgerChange，
-/// 在这里统一「点亮 → 至少展示 0.6 秒 → 熄灭」，让用户能看到「正在检测云端变更…」，
-/// 不再出现「无变化时一点反馈都没有」的静默感知。
+/// 手动云端同步的全局指示状态。
 /// 约定：本类所有方法只从主线程调用（异步入口用 MainActor.run 包一层）。
 final class CloudDetectActivity: ObservableObject {
     static let shared = CloudDetectActivity()
 
-    /// 自动检测进行中（房源页顶部胶囊进度条据此显示）
-    @Published private(set) var isDetecting = false
-    /// 手动云端同步进行中——自动检测直接跳过，避免两边同时拉清单、结论互相打架
+    /// 手动云端同步进行中——并发拉清单时跳过重复动作，避免两边结论互相打架
     @Published private(set) var isManualSyncing = false
 
-    private var detectDepth = 0
     private var manualDepth = 0
-    private var startedAt: Date?
-
-    func beginDetecting() {
-        detectDepth += 1
-        if startedAt == nil { startedAt = Date() }
-        isDetecting = true
-    }
-
-    /// 至少展示 minimumVisible 秒（沿用 b121 的 0.6 秒口径），避免检测太快、一闪而过感知不到。
-    /// 计数归零后才真正收尾；期间又来了新检测则继续显示。
-    func endDetecting(minimumVisible: TimeInterval = 0.6) {
-        detectDepth = max(0, detectDepth - 1)
-        guard detectDepth == 0 else { return }
-        let elapsed = Date().timeIntervalSince(startedAt ?? Date())
-        let delay = max(0, minimumVisible - elapsed)
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self, self.detectDepth == 0 else { return }
-            self.isDetecting = false
-            self.startedAt = nil
-        }
-    }
 
     func beginManualSync() {
         manualDepth += 1
@@ -124,8 +97,6 @@ struct HouseListView: View {
     @State private var infoToastIsError = false
     // v1.72（#1/#5）：刷新/同步进行中状态——点刷新立即反馈「正在刷新…」，比对完成才收起
     @State private var isSyncing = false
-    /// v2.63：自动检测指示状态（冷启动 / 回前台 / 进板块兜底三条路径共用同一个全局状态）
-    @StateObject private var detectActivity = CloudDetectActivity.shared
     /// v2.65：长按触发的深度核对与普通刷新分开提示（否则长按后只显示「正在刷新…」，看不出走的是哪条路）
     @State private var isDeepSyncing = false
     /// v2.50：云端有更新 → 顶栏常驻横幅，只有手动点 ✕ 才收起（此前 toast 不到 1 秒就消失，容易错过）
@@ -273,19 +244,6 @@ struct HouseListView: View {
                         HStack(spacing: 8) {
                             ProgressView().controlSize(.small)
                             Text(isDeepSyncing ? "正在深度核对…" : "正在刷新…")
-                                .font(.footnote.weight(.medium))
-                                .foregroundColor(.secondary)
-                        }
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 7)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                    } else if detectActivity.isDetecting {
-                        // v2.63（b121 回归）：自动检测期间的细进度条提示；
-                        // 手动刷新/同步优先（isSyncing 为真时上面那条占了位置），两者不会叠在一起。
-                        HStack(spacing: 8) {
-                            ProgressView().controlSize(.small)
-                            Text("正在检测云端变更…")
                                 .font(.footnote.weight(.medium))
                                 .foregroundColor(.secondary)
                         }
