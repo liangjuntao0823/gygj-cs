@@ -12,7 +12,6 @@ enum SyncTaskKind: String, Codable, CaseIterable {
     case media       // 搬媒体（上传/补传/下载）
     case cloudDelete // 删云端
     case retry       // 补漏与失败重试
-    case orphan      // 清理桶孤儿媒体
     case mediaDelete // 删云端媒体（本地已删，云端对象没删掉）
 
     var displayName: String {
@@ -22,7 +21,6 @@ enum SyncTaskKind: String, Codable, CaseIterable {
         case .media: return "搬媒体"
         case .cloudDelete: return "删云端"
         case .retry: return "补漏与失败重试"
-        case .orphan: return "清理桶孤儿媒体"
         case .mediaDelete: return "删云端媒体"
         }
     }
@@ -34,12 +32,11 @@ enum SyncTaskKind: String, Codable, CaseIterable {
         case .media: return "photo.on.rectangle.angled"
         case .cloudDelete: return "trash"
         case .retry: return "wrench.and.screwdriver"
-        case .orphan: return "trash.circle"
         case .mediaDelete: return "trash.slash"
         }
     }
 
-    /// 全部支持手动重试；孤儿扫描的「取消本次」是另一条路径，不走重试
+    /// 全部支持手动重试
     var isRetryable: Bool { true }
 }
 
@@ -333,7 +330,7 @@ func begin(id: UUID,
         return item.id
     }
 
-    /// 取消本次（如孤儿扫描）：停止、不删任何文件，进最近完成并写明「已取消」
+    /// 取消本次：停止、不删任何文件，进最近完成并写明「已取消」
     func cancel(id: UUID, note: String) {
         if let idx = running.firstIndex(where: { $0.id == id }) {
             var item = running.remove(at: idx)
@@ -454,11 +451,6 @@ func begin(id: UUID,
                 }
             }
             UploadTaskRegistry.shared.register(live.id, task: work)
-            return
-        }
-        if item.kind == .orphan {
-            removeFailed(id: id)
-            Task { await TaskRetryPerformer.shared.orphanScan?() }
             return
         }
         removeFailed(id: id)
@@ -680,8 +672,6 @@ final class TaskRetryPerformer {
     /// 由房源页注册：整次云端同步（cloudPull）的重试复用房源页同步流程；
     /// 入参是任务中心里的任务 id（页面确认/执行完成后用它结算真实结果）
     var cloudPull: ((UUID?) async -> CloudPullRunOutcome)?
-    /// 由设置页注册：孤儿扫描重试
-    var orphanScan: (() async -> Void)?
 
     private weak var houseContext: ModelContext?
 
@@ -703,12 +693,6 @@ final class TaskRetryPerformer {
             case .failed(let message):
                 completion(.failure(message: message))
             }
-        case .orphan:
-            guard let orphanScan else {
-                completion(.failure(message: "请先到设置页，再点重试")); return
-            }
-            await orphanScan()
-            completion(.success(note: "扫描完成"))
         case .cloudDelete:
             await retryCloudDelete(item, completion: completion)
         case .pushUp:
