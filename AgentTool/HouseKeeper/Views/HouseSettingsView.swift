@@ -363,11 +363,6 @@ struct CosConfigView: View {
                     }
                     .padding(.vertical, 4)
                 }
-                NavigationLink {
-                    InterconnectionInfoView()
-                } label: {
-                    Label("三端互通说明（App ↔ 云函数 ↔ 网页后台）", systemImage: "arrow.triangle.2.circlepath")
-                }
             }
 
             // v1.19：多用户——每台设备一个用户名，共享房源、其他数据按用户名隔离
