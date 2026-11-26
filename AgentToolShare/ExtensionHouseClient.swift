@@ -133,7 +133,7 @@ enum ExtensionHouseClient {
             throw ExtHouseError(message: "读取房源失败（服务器 \(http.statusCode)）")
         }
         let doc = try JSONDecoder().decode(ExtRemoteHouse.self, from: data)
-        return record(from: doc)
+        return makeRecord(from: doc)
     }
 
     /// 上传单个媒体二进制；返回服务器落盘文件名
@@ -228,12 +228,12 @@ enum ExtensionHouseClient {
         guard let house = item.house else {
             throw ExtHouseError(message: "服务器未回写房源数据")
         }
-        return record(from: house)
+        return makeRecord(from: house)
     }
 
     // MARK: - 服务器 doc ↔ 本地 CloudHouseRecord 映射
 
-    private static func record(from doc: ExtRemoteHouse) -> CloudHouseRecord {
+    private static func makeRecord(from doc: ExtRemoteHouse) -> CloudHouseRecord {
         CloudHouseRecord(
             roomKey: doc.roomKey,
             roomNo: doc.roomNo,
