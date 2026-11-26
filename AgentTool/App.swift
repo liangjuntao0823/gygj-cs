@@ -748,8 +748,6 @@ struct MainTabView: View {
         Task {
             // v2.9（P1-1）：仅「云端有更新」广播提示；检测失败/无变化不广播（失败态由房源列表页 onAppear 单独提示）
             let state = await HouseListView.detectCloudLedgerChange(houseContext: houseModelContext)
-            // v2.62（B3）：检测完顺手补写积压的清单改动（队列为空时直接返回，不发请求）
-            await CloudManifestUpdater.shared.flush()
             guard state == .hasUpdate else { return }
             UserDefaults.standard.set(true, forKey: "cloudLedgerPendingHint")
             NotificationCenter.default.post(name: HouseListView.cloudLedgerChangedLight, object: nil)
