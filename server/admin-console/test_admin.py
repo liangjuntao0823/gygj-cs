@@ -424,6 +424,29 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(doc["username"], "admin")
         self.assertTrue(doc["mustChange"])
 
+    def test_house_update_queues_outbox_without_direct_broadcast(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        auth = aauth.AdminAuth(tmp.name)
+        store = hs.HouseStore(Path(tmp.name) / "house.db")
+        self.addCleanup(store.close)
+        store.upsert_house({"roomKey": "1-2059", "roomNo": "2059", "tower": 1,
+                            "landlord": "康", "layout": "单间", "price": 1000,
+                            "status": "available"}, operator="t")
+        hub = FakeHub({})
+        admin = type("A", (), {"auth": auth, "sys": None, "meter": None,
+                               "house": ahou.HouseConsole(store), "hub": hub})()
+        login = FakeHandler("/admin/api/login", {"username": "admin", "password": "admin"})
+        aw.route_request(login, "POST", "/admin/api/login", admin)
+        cookie = f"admin_session={login.cookies['admin_session']}"
+        h = FakeHandler("/admin/api/house/houses/1-2059",
+                        {"fields": {"price": 1100}, "notifyScope": "all"}, cookie=cookie)
+        self.assertTrue(aw.route_request(h, "PUT", "/admin/api/house/houses/1-2059", admin))
+        self.assertEqual(h.status, 200)
+        self.assertEqual(hub.broadcast_calls, [])       # 后台不再直接广播
+        last = store.pending_outbox()[-1]
+        self.assertEqual(last["data"]["notifyScope"], "all")  # 只留一条待发事件
+
     def test_non_admin_path_returns_false(self) -> None:
         self.assertFalse(aw.route_request(FakeHandler("/api/meter/health"), "GET",
                                           "/api/meter/health", self._admin()))
