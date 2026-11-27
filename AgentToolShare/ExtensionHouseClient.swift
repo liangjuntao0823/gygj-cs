@@ -136,10 +136,10 @@ enum ExtensionHouseClient {
         return makeRecord(from: doc)
     }
 
-    /// 上传单个媒体二进制；返回服务器落盘文件名
+    /// 上传单个媒体二进制；返回服务器真实 objectKey 与落盘文件名，并写入本地名映射。
     @discardableResult
     static func uploadMedia(roomKey: String, fileName: String, kind: String,
-                            data: Data) async throws -> String {
+                            data: Data) async throws -> (objectKey: String, fileName: String) {
         guard let base = URL(string: endpoint),
               let url = URL(string: "/api/house/media/\(encoded(roomKey))", relativeTo: base) else {
             throw ExtHouseError(message: "服务器地址无效")
@@ -149,7 +149,12 @@ enum ExtensionHouseClient {
         req.httpMethod = "POST"
         req.timeoutInterval = 300
         req.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
-        req.setValue(uploadName, forHTTPHeaderField: "X-File-Name")
+        // HTTP 头只能 ASCII：中文文件名必须百分号编码，服务端 unquote 还原；
+        // 否则 URLSession 会把中文截断，落盘成半截名字。
+        let headerName = uploadName.addingPercentEncoding(
+            withAllowedCharacters: CharacterSet(charactersIn:
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")) ?? uploadName
+        req.setValue(headerName, forHTTPHeaderField: "X-File-Name")
         req.setValue(kind, forHTTPHeaderField: "X-Kind")
         if let t = token, !t.isEmpty {
             req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization")
@@ -167,12 +172,19 @@ enum ExtensionHouseClient {
         }
         let envelope = try JSONDecoder().decode(ExtMediaUpload.self, from: respData)
         guard envelope.ok else { throw ExtHouseError(message: "服务器未返回媒体引用") }
-        return envelope.fileName ?? fileName
+        let resolvedKey = envelope.objectKey ?? objectKey(roomKey: roomKey, fileName: fileName, kind: kind)
+        HouseMediaNameMap.set(roomKey: roomKey, objectKey: resolvedKey, localFileName: fileName)
+        return (resolvedKey, envelope.fileName ?? (resolvedKey as NSString).lastPathComponent)
     }
 
     static func deleteMedia(roomKey: String, fileName: String) async throws {
         let kind = kind(ofName: fileName)
-        let remoteName = MediaNaming.remoteName(fileName: fileName, kind: kind)
+        let remoteName: String
+        if let mapped = HouseMediaNameMap.objectKey(roomKey: roomKey, localFileName: fileName) {
+            remoteName = (mapped as NSString).lastPathComponent
+        } else {
+            remoteName = MediaNaming.remoteName(fileName: fileName, kind: kind)
+        }
         let req = try request("/api/house/media/\(encoded(roomKey))/\(encoded(remoteName))", method: "DELETE")
         let (_, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse else {
@@ -202,13 +214,14 @@ enum ExtensionHouseClient {
         return data
     }
 
-    /// 新增/编辑；expectedRevision 为编辑前修订号（乐观锁），新增传 nil；返回服务器回写的权威记录
-    static func upsert(_ record: CloudHouseRecord, expectedRevision: Int?) async throws -> CloudHouseRecord {
-        let media: [[String: Any]] = record.mediaNames.map { name in
-            let kind = kind(ofName: name)
-            let remoteName = MediaNaming.remoteName(fileName: name, kind: kind)
-            return ["objectKey": objectKey(roomKey: record.roomKey, fileName: name, kind: kind),
-                    "fileName": remoteName, "kind": kind]
+    /// 新增/编辑；expectedRevision 为编辑前修订号（乐观锁），新增传 nil；
+    /// baseRecord 为编辑前服务器快照（字段级合并用），removedMedia 为本次显式删除的本地文件名。
+    static func upsert(_ record: CloudHouseRecord, expectedRevision: Int?,
+                       createOnly: Bool = false,
+                       baseRecord: CloudHouseRecord? = nil,
+                       removedMedia: [String] = []) async throws -> CloudHouseRecord {
+        let media: [[String: Any]] = record.mediaNames.compactMap { name in
+            mediaEntry(roomKey: record.roomKey, localName: name)
         }
         var body: [String: Any] = [
             "roomKey": record.roomKey,
@@ -225,6 +238,25 @@ enum ExtensionHouseClient {
             "originDeviceId": originDeviceId
         ]
         if let expectedRevision { body["expectedRevision"] = expectedRevision }
+        if createOnly { body["createOnly"] = true }
+        if let baseRecord {
+            body["base"] = [
+                "roomNo": baseRecord.roomNo, "tower": baseRecord.tower,
+                "landlord": baseRecord.landlord, "layout": baseRecord.layout,
+                "price": baseRecord.price, "password": baseRecord.password,
+                "remark": baseRecord.remark, "status": baseRecord.status
+            ]
+            body["baseMedia"] = baseRecord.mediaNames.compactMap {
+                HouseMediaNameMap.objectKey(roomKey: record.roomKey, localFileName: $0)
+                    ?? objectKey(roomKey: record.roomKey, fileName: $0, kind: kind(ofName: $0))
+            }
+        }
+        if !removedMedia.isEmpty {
+            body["removedMedia"] = removedMedia.compactMap {
+                HouseMediaNameMap.objectKey(roomKey: record.roomKey, localFileName: $0)
+                    ?? objectKey(roomKey: record.roomKey, fileName: $0, kind: kind(ofName: $0))
+            }
+        }
         let req = try request("/api/house/houses", method: "POST", body: body)
         let (data, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse else {
@@ -252,6 +284,18 @@ enum ExtensionHouseClient {
         return makeRecord(from: house)
     }
 
+    /// 本地文件名 → media_refs 条目：优先用上传时记下的真实 objectKey，
+    /// 避免视频 .mov→.mp4、同名唯一化后服务器引用指错文件。
+    private static func mediaEntry(roomKey: String, localName: String) -> [String: Any]? {
+        guard !localName.isEmpty else { return nil }
+        let kindValue = kind(ofName: localName)
+        let key = HouseMediaNameMap.objectKey(roomKey: roomKey, localFileName: localName)
+            ?? objectKey(roomKey: roomKey, fileName: localName, kind: kindValue)
+        return ["objectKey": key,
+                "fileName": (key as NSString).lastPathComponent,
+                "kind": kindValue]
+    }
+
     // MARK: - 服务器 doc ↔ 本地 CloudHouseRecord 映射
 
     private static func makeRecord(from doc: ExtRemoteHouse) -> CloudHouseRecord {
@@ -267,7 +311,10 @@ enum ExtensionHouseClient {
             status: doc.status,
             updatedAt: doc.updatedAt.flatMap { dateFormatter.date(from: $0) } ?? Date(),
             updatedBy: doc.updatedBy ?? "",
-            mediaNames: doc.media?.map { $0.fileName } ?? [],
+            mediaNames: doc.media?.compactMap { m -> String? in
+                guard let key = m.objectKey, !key.isEmpty else { return m.fileName }
+                return HouseMediaNameMap.localName(roomKey: doc.roomKey, objectKey: key) ?? m.fileName
+            } ?? [],
             revision: doc.revision.map { Int64($0) })
     }
 }

@@ -88,8 +88,8 @@ enum KeychainKey {
     static let secretId = "cos.secretId"
     static let secretKey = "cos.secretKey"
     static let customDomain = "cos.customDomain"   // v1.19：自定义域名（可空），空 = 用 COS 默认域名
-    static let shareName = "share.name"            // v1.21：分享名片-姓名（可空，空 = 梁涛）
-    static let sharePhone = "share.phone"          // v1.21：分享名片-电话（可空，空 = 13288251132）
+    static let shareName = "share.name"            // v1.21：分享名片-姓名（只存本机，可空）
+    static let sharePhone = "share.phone"          // v1.21：分享名片-电话（只存本机，可空）
     static let adminPassword = "cloud.adminPassword"  // v1.40：后台口令改存钥匙串（重装 App 不丢，避免云端后台 401）
 }
 
@@ -625,8 +625,8 @@ enum CosUploader {
         let versionedURL = appendVersionParameter(shareURL, version: "\(Int(Date().timeIntervalSince1970))")
 
         // 名片姓名/电话：优先取设置页保存值（调用方已填入 info），缺失/旧版缓存时回退默认值
-        let name = (info.name ?? "").isEmpty ? "梁涛" : info.name!
-        let phone = (info.phone ?? "").isEmpty ? "13288251132" : info.phone!
+        let name = (info.name ?? "").isEmpty ? "房东" : info.name!
+        let phone = info.phone ?? ""
 
         let html: String
         switch mode {
@@ -885,13 +885,12 @@ enum CosUploader {
         return host(for: config)
     }
 
-    /// 读设置页保存的分享名片信息（姓名/电话）；未设置时用默认值
-    /// 默认：梁涛 / 13288251132（名片、微信卡片描述、拨打电话、复制按钮四处统一）
+    /// 读设置页保存的分享名片信息（姓名/电话）；只读本机钥匙串，不内置任何真实姓名/电话默认值。
     static func loadShareProfile() -> (name: String, phone: String) {
         let trimSet = CharacterSet.whitespacesAndNewlines
         let name = (KeychainStore.load(KeychainKey.shareName) ?? "").trimmingCharacters(in: trimSet)
         let phone = (KeychainStore.load(KeychainKey.sharePhone) ?? "").trimmingCharacters(in: trimSet)
-        return (name.isEmpty ? "梁涛" : name, phone.isEmpty ? "13288251132" : phone)
+        return (name, phone)
     }
 
     // MARK: - HTML 模板（v1.21 设计稿定稿：脱敏版）
@@ -1152,8 +1151,8 @@ enum CosUploader {
           <div class="top">
             <div class="avatar" id="avatar">梁</div>
             <div>
-              <div class="nm" id="nameText">梁涛</div>
-              <div class="ph-t" id="phoneText">13288251132</div>
+              <div class="nm" id="nameText">房东</div>
+              <div class="ph-t" id="phoneText"></div>
               <div style="font-size:12px;color:#8a919e;margin-top:2px;">微信同号 · 24小时可约看房</div>
             </div>
           </div>
@@ -1227,7 +1226,7 @@ enum CosUploader {
           fetch(FETCH_URL).then(function(r){ return r.json(); }).then(function(d){
             ROOMS = (d && d.rooms) || [];
             buildFilters(); render();
-            var name = (d && d.name) || "梁涛"; var phone = (d && d.phone) || "13288251132";
+            var name = (d && d.name) || "房东"; var phone = (d && d.phone) || "";
             document.getElementById("nameText").textContent = name;
             document.getElementById("phoneText").textContent = phone;
             var a = document.getElementById("avatar"); a.textContent = name.length ? name[0] : "梁";
@@ -2637,7 +2636,7 @@ struct WatermarkSettings: Codable, Equatable {
     var offsetX: Double
     var offsetY: Double
 
-    static let defaultText = "梁涛-13288251132"
+    static let defaultText = "米兰公馆房源"
     static let `default` = WatermarkSettings(enabled: true, text: defaultText, fontSize: 14, opacity: 0.5, position: .bottomRight, offsetX: 12, offsetY: 12)
 }
 

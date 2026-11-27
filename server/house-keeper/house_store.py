@@ -165,6 +165,16 @@ class DuplicateHouse(Exception):
         self.existing = existing
 
 
+class FieldConflict(Exception):
+    """字段级合并失败：同一字段客户端与服务器都基于同一 base 改成了不同值。"""
+
+    def __init__(self, room_key: str, conflicts: list[dict[str, Any]]):
+        super().__init__(f"field conflict {room_key}: "
+                         + ",".join(c["field"] for c in conflicts))
+        self.room_key = room_key
+        self.conflicts = conflicts
+
+
 def now_local() -> datetime:
     # 服务器为东八区，统一本地时间，便于人工排查
     return datetime.now(timezone(timedelta(hours=8)))
@@ -252,6 +262,26 @@ class HouseStore:
                 doc["media"] = self._media(self._conn, room_key)
             return doc
 
+    def _media_map(self, conn: sqlite3.Connection,
+                   room_keys: list[str]) -> dict[str, list[dict[str, Any]]]:
+        """一次批量查媒体引用，避免 list_houses / public_rooms 的 N+1。"""
+        out: dict[str, list[dict[str, Any]]] = {k: [] for k in room_keys}
+        if not room_keys:
+            return out
+        # SQLite 参数上限保守按 500 分批，200+ 套房源也不会退化回逐套查询。
+        for i in range(0, len(room_keys), 500):
+            chunk = room_keys[i:i + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                "SELECT room_key, object_key, file_name, kind, sort_order "
+                f"FROM media_refs WHERE room_key IN ({placeholders}) "
+                "ORDER BY sort_order, id", chunk).fetchall()
+            for r in rows:
+                out.setdefault(r["room_key"], []).append({
+                    "objectKey": r["object_key"], "fileName": r["file_name"],
+                    "kind": r["kind"], "sortOrder": r["sort_order"]})
+        return out
+
     def list_houses(self, since: int | None = None,
                     include_deleted: bool = False) -> dict[str, Any]:
         with self._lock:
@@ -267,10 +297,11 @@ class HouseStore:
                 sql += " WHERE " + " AND ".join(cond)
             sql += " ORDER BY tower, room_no"
             rows = self._conn.execute(sql, params).fetchall()
+            media_map = self._media_map(self._conn, [r["room_key"] for r in rows])
             houses = []
             for row in rows:
                 d = self._row_to_dict(row)
-                d["media"] = self._media(self._conn, row["room_key"])
+                d["media"] = media_map.get(row["room_key"], [])
                 houses.append(d)
             top = self._conn.execute(
                 "SELECT COALESCE(MAX(revision),0) AS m FROM houses").fetchone()["m"]
@@ -307,6 +338,9 @@ class HouseStore:
         event_id = str(event.get("id") or "").strip() or secrets.token_hex(8)
         with self._lock:
             conn = self._conn
+            if conn.execute("SELECT 1 FROM houses WHERE room_key=?",
+                            (room_key,)).fetchone() is None:
+                raise HouseNotFound(room_key)
             already = conn.execute(
                 "SELECT 1 FROM ledger_events WHERE id=?", (event_id,)).fetchone()
             if already:
@@ -339,7 +373,16 @@ class HouseStore:
                      notify_scope: str = "all",
                      notify_user_token: str = "",
                      create_only: bool = False) -> dict[str, Any]:
-        """新增或更新一套房源。payload 字段用客户端命名（roomNo/tower/...）。"""
+        """新增或更新一套房源。payload 字段用客户端命名（roomNo/tower/...）。
+
+        2026-11-27 字段级合并：
+        * 客户端可带 `base`（编辑前服务器快照字段）与 `baseMedia`（编辑前媒体 objectKey）。
+        * 服务器按三路比较：客户端改且服务器没改 → 接受；客户端没改 → 保留服务器；
+          两边都改同一字段且值不同 → 抛 FieldConflict（返回明细，不覆盖）。
+        * 媒体按「服务器现有 ∪ 本次新增 − 显式删除」合并，避免分享扩展/多设备
+          只带自己的媒体清单时把别人的照片合并掉。
+        * 不带 base 的旧客户端仍走 expectedRevision 全量 CAS，行为不变。
+        """
         room_key = str(payload.get("roomKey") or "").strip()
         if not room_key:
             raise ValueError("roomKey required")
@@ -353,7 +396,13 @@ class HouseStore:
             "remark": str(payload.get("remark") or ""),
             "status": str(payload.get("status") or "available"),
         }
+        self._validate_fields(room_key, fields)
         media = payload.get("media") or []
+        base = payload.get("base") if isinstance(payload.get("base"), dict) else None
+        base_media = payload.get("baseMedia") if isinstance(payload.get("baseMedia"), list) else None
+        removed_media = {
+            str(x) for x in (payload.get("removedMedia") or []) if str(x or "")
+        }
         with self._lock:
             conn = self._conn
             existing = conn.execute(
@@ -370,9 +419,108 @@ class HouseStore:
                     raise RevisionConflict(room_key, expected_revision, 0)
                 return self._insert(conn, room_key, fields, media, operator,
                                     origin_device_id, now, notify_scope, notify_user_token)
+            if base is not None:
+                fields = self._merge_fields(room_key, existing, fields, base)
+                merged_media = self._merge_media(
+                    conn, room_key, media, base_media, removed_media)
+                return self._update(conn, existing, room_key, fields, merged_media,
+                                    operator, origin_device_id, now, None,
+                                    notify_scope, notify_user_token)
+            if removed_media:
+                media = [m for m in media
+                         if str(m.get("objectKey") or "") not in removed_media]
             return self._update(conn, existing, room_key, fields, media, operator,
                                 origin_device_id, now, expected_revision,
                                 notify_scope, notify_user_token)
+
+    @staticmethod
+    def _validate_fields(room_key: str, fields: dict[str, Any]) -> None:
+        """入库前字段校验；越界/脏值直接拒绝，避免后台与 H5 展示脏数据。"""
+        room_no = str(fields.get("roomNo") or "").strip()
+        if not room_no:
+            raise ValueError("roomNo required")
+        if len(room_no) > 40:
+            raise ValueError("roomNo too long")
+        tower = int(fields.get("tower") or 0)
+        if tower not in (1, 2):
+            raise ValueError("tower must be 1 or 2")
+        # 房号前缀与座号一致性：2- 开头必须是 2 座，1- 开头必须是 1 座；
+        # 不带前缀的历史 key 保留原样，不强行改写。
+        if room_key.startswith("2-") and tower != 2:
+            raise ValueError("roomKey prefix 2- but tower != 2")
+        if room_key.startswith("1-") and tower != 1:
+            raise ValueError("roomKey prefix 1- but tower != 1")
+        price = int(fields.get("price") or 0)
+        if price < 0 or price > 200000:
+            raise ValueError("price out of range")
+        status = str(fields.get("status") or "")
+        if status not in ("available", "rented"):
+            raise ValueError("status must be available or rented")
+        for key in ("landlord", "layout", "password", "remark"):
+            if len(str(fields.get(key) or "")) > 500:
+                raise ValueError(f"{key} too long")
+
+    @staticmethod
+    def _merge_fields(room_key: str, existing: sqlite3.Row,
+                      client: dict[str, Any], base: dict[str, Any]) -> dict[str, Any]:
+        """三路字段级合并；同字段两边都改且不同时抛 FieldConflict。"""
+        merged: dict[str, Any] = {}
+        conflicts: list[dict[str, Any]] = []
+        for key, client_val in client.items():
+            server_val = existing[HouseStore._column(key)]
+            base_val = base.get(key, server_val)
+            # 客户端没改（新值等于 base）→ 保留服务器当前值，避免旧快照回滚
+            if client_val == base_val:
+                merged[key] = server_val
+            # 服务器没改（当前等于 base）→ 接受客户端新值
+            elif server_val == base_val or client_val == server_val:
+                merged[key] = client_val
+            else:
+                conflicts.append({
+                    "field": key, "label": FIELD_LABELS.get(key, key),
+                    "base": _display(key, base_val),
+                    "client": _display(key, client_val),
+                    "server": _display(key, server_val),
+                })
+                merged[key] = server_val
+        if conflicts:
+            raise FieldConflict(room_key, conflicts)
+        return merged
+
+    def _merge_media(self, conn, room_key: str, client_media: list[dict[str, Any]],
+                     base_media: list[str] | None,
+                     explicit_removed: set[str]) -> list[dict[str, Any]]:
+        """媒体并集合并：服务器现有 ∪ 本次清单 − 显式删除。
+
+        baseMedia 缺失时按「客户端清单就是全部」处理（旧行为，不误删服务器媒体）；
+        有 baseMedia 时，base 有、本次没有 = 客户端删除，即使没显式 removedMedia 也删。
+        """
+        current = self._media(conn, room_key)
+        desired = [m for m in client_media if isinstance(m, dict)]
+        base_keys = {str(x) for x in (base_media or []) if str(x or "")}
+        desired_keys = {str(m.get("objectKey") or "") for m in desired if m.get("objectKey")}
+        removed = set(explicit_removed)
+        if base_media is not None:
+            removed |= (base_keys - desired_keys)
+        merged: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        # 保留服务器顺序；客户端新增追加在后，避免两端顺序抖动导致 revision 空转
+        for m in current:
+            key = str(m.get("objectKey") or "")
+            if key and key not in removed and key not in seen:
+                merged.append({"objectKey": key, "fileName": m.get("fileName") or "",
+                               "kind": m.get("kind") or "image",
+                               "sortOrder": len(merged)})
+                seen.add(key)
+        for m in desired:
+            key = str(m.get("objectKey") or "")
+            if not key or key in removed or key in seen:
+                continue
+            merged.append({"objectKey": key, "fileName": str(m.get("fileName") or ""),
+                           "kind": str(m.get("kind") or "image"),
+                           "sortOrder": len(merged)})
+            seen.add(key)
+        return merged
 
     def import_house(self, payload: dict[str, Any],
                      ledger_events: list[dict[str, Any]] | None = None,
@@ -622,6 +770,15 @@ class HouseStore:
     # 媒体
     # ------------------------------------------------------------------
     def _replace_media(self, conn, room_key: str, media: list[dict[str, Any]]) -> None:
+        # 落库前校验新目录引用：houses/<roomKey>/<file> 必须真实存在。
+        # 历史迁移数据里的 h/ 前缀（旧 COS 对象键）不在此列，保留兼容。
+        prefix = f"houses/{ms.safe_room_key(room_key)}/"
+        for m in media:
+            key = str(m.get("objectKey") or "")
+            if key.startswith("houses/"):
+                if not key.startswith(prefix) or not self.media.read_house_media(
+                        room_key, key[len(prefix):]):
+                    raise ValueError(f"media file not found: {key}")
         conn.execute("DELETE FROM media_refs WHERE room_key=?", (room_key,))
         seen: set[str] = set()
         idx = 0
@@ -647,6 +804,64 @@ class HouseStore:
         added = [k for k in new_keys if k not in cur_keys]
         removed = [k for k in cur_keys if k not in new_keys]
         return {"added": len(added), "removed": len(removed)}
+
+    # ------------------------------------------------------------------
+    # 孤儿媒体扫描 / 清理（设置页「清理服务器孤儿媒体」）
+    # ------------------------------------------------------------------
+    def list_orphan_media(self, min_age_seconds: int = 3600) -> dict[str, Any]:
+        """列出 media_refs 未引用的 houses/ 文件。
+
+        - 只扫 houses/，不碰 profile/ share/ releases；
+        - 默认跳过 1 小时内新文件，避免刚上传、事务还没提交的媒体被误删；
+        - `.part` 临时文件不计入（上传中断残留由后续上传覆盖或单独清理）。
+        """
+        min_age = max(0, int(min_age_seconds))
+        with self._lock:
+            refs = {r["object_key"] for r in self._conn.execute(
+                "SELECT object_key FROM media_refs").fetchall()}
+            now = time.time()
+            files = []
+            total = 0
+            for rel, size, mtime in self.media.iter_house_files():
+                if rel in refs:
+                    continue
+                if min_age and (now - mtime) < min_age:
+                    continue
+                files.append({"objectKey": rel, "size": int(size),
+                              "modifiedAt": datetime.fromtimestamp(
+                                  mtime, timezone(timedelta(hours=8))
+                              ).strftime("%Y-%m-%dT%H:%M:%S+08:00")})
+                total += int(size)
+            files.sort(key=lambda x: x["modifiedAt"])
+        return {"files": files, "count": len(files), "totalBytes": total,
+                "minAgeSeconds": min_age}
+
+    def delete_orphan_media(self, object_keys: list[str],
+                            min_age_seconds: int = 3600) -> dict[str, Any]:
+        """删除指定孤儿文件；删除前二次核对 media_refs，已引用的文件一律跳过。"""
+        min_age = max(0, int(min_age_seconds))
+        keys = [str(k).strip() for k in (object_keys or []) if str(k).strip()]
+        deleted, skipped = [], []
+        with self._lock:
+            refs = {r["object_key"] for r in self._conn.execute(
+                "SELECT object_key FROM media_refs").fetchall()}
+            now = time.time()
+            for key in keys:
+                if key in refs or not key.startswith("houses/"):
+                    skipped.append({"objectKey": key, "reason": "referenced_or_invalid"})
+                    continue
+                path = self.media._resolve(key)
+                if path is None or not path.is_file():
+                    skipped.append({"objectKey": key, "reason": "not_found"})
+                    continue
+                if min_age and (now - path.stat().st_mtime) < min_age:
+                    skipped.append({"objectKey": key, "reason": "too_new"})
+                    continue
+                if self.media.delete_rel(key):
+                    deleted.append(key)
+                else:
+                    skipped.append({"objectKey": key, "reason": "delete_failed"})
+        return {"ok": True, "deleted": deleted, "skipped": skipped}
 
     # ------------------------------------------------------------------
     # 文案组装
@@ -844,9 +1059,10 @@ class HouseStore:
                 "SELECT room_key,room_no,tower,layout,price,status FROM houses "
                 "WHERE is_deleted=0 AND status='available' "
                 "ORDER BY tower, room_no").fetchall()
+            media_map = self._media_map(self._conn, [r["room_key"] for r in rows])
             out = []
             for r in rows:
-                media = self._media(self._conn, r["room_key"])
+                media = media_map.get(r["room_key"], [])
                 out.append({
                     "roomKey": r["room_key"], "roomNo": r["room_no"],
                     "tower": r["tower"], "layout": r["layout"],

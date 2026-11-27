@@ -40,10 +40,12 @@ struct HouseEditView: View {
     @State private var errorMessage = ""
     // v1.40 第10点：无网络保存确认
     @State private var showOfflineAlert = false
+    /// v2.72（#3）：断网编辑改为「本地先落库 + 挂 pending 待补传」。
+    /// 用户确认仅存本机后置 true，performSave 不再重复弹网络确认。
+    @State private var offlineSaveConfirmed = false
     // v1.42：保存后云端上传失败 → 提示「已存本机，待网络恢复自动补传」（此前静默入队，用户无感知）
     @State private var pendingUploadTip: String?
-    // v2.39：保存前强校验 / 落草稿 的提示
-    @State private var draftTip: String?
+    @State private var conflictTip: String?
 
     /// 用户是否手动改过座号（改过后不再被房号前缀自动覆盖）
     @State private var towerTouched = false
@@ -116,10 +118,13 @@ struct HouseEditView: View {
             }
             // v1.40 第10点：无网络时保存新增/编辑房源 → 先提示「仅存本机」，确认后才落盘（联网后可同步云端）
             .alert("当前无网络", isPresented: $showOfflineAlert) {
-                Button("仅存本机", role: .destructive) { performSave() }
+                Button("仅存本机", role: .destructive) {
+                    offlineSaveConfirmed = true
+                    performSave()
+                }
                 Button("取消", role: .cancel) {}
             } message: {
-                Text("检测不到网络连接，本次保存只会存在本机，不会同步到服务器。联网后可在房源列表点左上角刷新同步。")
+                Text("检测不到网络连接，本次保存会先存在本机并挂待补传；联网后自动同步到服务器。")
             }
             // v1.42：保存后上传云端失败 → 提示已存本机、待网络恢复自动补传（媒体已入队，账本恢复后刷新同步）
             .alert("已保存到本机", isPresented: Binding(
@@ -130,18 +135,19 @@ struct HouseEditView: View {
             } message: {
                 Text(pendingUploadTip ?? "")
             }
+            // 字段级合并：同字段两边都改，服务器拒绝覆盖并返回明细
+            .alert("有字段被其他设备改过", isPresented: Binding(
+                get: { conflictTip != nil },
+                set: { if !$0 { conflictTip = nil } }
+            )) {
+                Button("知道了", role: .cancel) {}
+            } message: {
+                Text(conflictTip ?? "")
+            }
     }
 
     private var contentWithSyncAlerts: some View {
         contentWithSaveAlerts
-            .alert("改动未保存", isPresented: Binding(
-                get: { draftTip != nil },
-                set: { if !$0 { draftTip = nil } }
-            )) {
-                Button("好", role: .cancel) { dismiss() }
-            } message: {
-                Text(draftTip ?? "")
-            }
     }
 
     private var contentWithSheet: some View {
@@ -517,57 +523,18 @@ struct HouseEditView: View {
         }
     }
 
-    /// v2.39 保存前拦截：本地旧值 vs 云端现值逐字段比对
-    /// - 字段被改过 → 拦下，不落任何正式数据，提示先返回详情页同步；
-    /// - 校验不了（断网/弱网/权限）→ 本次改动整体存草稿箱，正式数据一个字不动。
+    /// v2.39 保存前拦截：断网时不再只塞进没有出口的草稿箱。
+    /// v2.72（#3）：直接本地落库并挂 pending，联网后任务中心/自动补传会继续提交。
     @MainActor
     private func guardedSave(house: House) async {
         let reachable = await NetworkMonitor.shared.awaitReachable(timeout: 2.5)
         guard reachable else {
-            stashDraft(house: house, reason: "断网，改动未保存")
+            offlineSaveConfirmed = true
+            performSave()
             return
         }
-        // 冲突校验由服务器 pushHouse 乐观锁承接；旧云账本守卫链已下线，未接入直接存本机
+        // 冲突校验由服务器字段级合并承接；旧云账本守卫链已下线，未接入直接存本机
         saveRaw()
-    }
-
-    /// 把本次改动整体存进草稿箱（不写 SwiftData、不传云端、不删任何文件）
-    private func stashDraft(house: House, reason: String) {
-        let price = Int(priceText.trimmingCharacters(in: .whitespacesAndNewlines)) ?? house.price
-        let base = HouseDraftFields(roomNo: house.roomNo, tower: house.tower,
-                                    landlord: house.landlord, layout: house.layout,
-                                    price: house.price, password: house.password,
-                                    remark: house.remark, statusRaw: house.statusRaw)
-        let fields = HouseDraftFields(roomNo: cleanRoomNoText(), tower: tower,
-                                      landlord: landlord, layout: layout,
-                                      price: price, password: password,
-                                      remark: remark, statusRaw: status.rawValue)
-        // 新增媒体 = 本次新导入、还没挂到房源上的（house == nil），文件已在 currentRoomKey 目录里
-        let added = mediaItems.filter { $0.house == nil }
-            .map { HouseDraftMedia(fileName: $0.fileName, kind: $0.kind) }
-        // 删除媒体 = 编辑前有、现在被移出编辑列表的
-        let currentNames = Set(mediaItems.map { $0.fileName })
-        let removed = house.mediaItems.map { $0.fileName }.filter { !currentNames.contains($0) }
-
-        let draft = HouseDraft(
-            id: UUID().uuidString,
-            houseID: house.id.uuidString,
-            roomKey: computeNewRoomKey(),
-            sourceRoomKey: currentRoomKey,
-            fields: fields,
-            base: base,
-            addedMedia: added,
-            removedMedia: removed,
-            baseRevision: CloudRevisionStore.seen(house.mediaRoomKey),
-            reason: reason,
-            createdAt: Date()
-        )
-        HouseDraftStore.shared.add(draft)
-        draftTip = "因网络问题，本次改动失败，已存进「同步任务中心（\(draft.changeSummary)）」。\n"
-            + "正式数据没有被改动。网络恢复后，在房源页顶部的任务条里点重试即可提交。"
-        BackupLogStore.log(category: "房源", action: "存草稿", result: "成功",
-                          detail: "\(draft.displayRoomNo)：\(reason)",
-                          room: house.mediaRoomKey, cloud: false)
     }
 
     /// 落库入口：联网直接保存，断网提示仅存本机；旧桶先探后写三选一已下线
@@ -577,8 +544,16 @@ struct HouseEditView: View {
         // 此前「有网络但保存提示没网络、取消再保存就好了」即瞬态误报
         Task {
             let ok = await NetworkMonitor.shared.awaitReachable()
-            guard ok else {
+            if !ok && !offlineSaveConfirmed {
                 await MainActor.run { showOfflineAlert = true }
+                return
+            }
+            if !ok {
+                // 用户已确认「仅存本机」：跳过服务器探重，直接落本地并挂 pending
+                await MainActor.run {
+                    offlineSaveConfirmed = false
+                    performSave()
+                }
                 return
             }
             // 新增房源先查服务器：本机没有、但别的设备已收录同一座同一房号时，
@@ -1009,7 +984,12 @@ struct HouseEditView: View {
             dismiss()
             return
         }
-        // 未接入服务器：旧桶上行编排已下线，本地落库已在上文完成，仅刷新收尾
+        // 未接入服务器：本地落库已在上文完成，挂待补传；绑定令牌后自动补传
+        HousePendingUploader.shared.markPending(target.mediaRoomKey)
+        if !opAction.isEmpty {
+            BackupLogStore.log(category: "房源", action: opAction, result: "待同步",
+                               detail: "仅存本机（未绑定服务器账号），绑定后自动补传", room: target.mediaRoomKey, cloud: false)
+        }
         NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
         dismiss()
     }
@@ -1093,12 +1073,13 @@ struct HouseEditView: View {
                 // 动作名直接用「新增房源 / 修改备注 / 修改租金…」，失败不再先留一条假成功。
                 let mediaFailed = uploadResult?.failed ?? 0
                 if !opAction.isEmpty {
-                    if kind == .newHouse && mediaFailed > 0 {
-                        // 媒体失败已由 uploadMedia 写「新增房源 + 失败原因」，这里不再重复
-                    } else {
-                        BackupLogStore.log(category: "房源", action: opAction, result: "成功",
-                                           detail: opDetail, room: remote.roomKey, cloud: true)
-                    }
+                    // 一次动作只写一条最终结果：媒体没传全记“部分失败”，不再先写假成功
+                    let result = mediaFailed > 0 ? "部分失败" : "成功"
+                    let detail = mediaFailed > 0
+                        ? opDetail + "；\(mediaFailed) 个媒体待补传（已挂同步任务中心）"
+                        : opDetail
+                    BackupLogStore.log(category: "房源", action: opAction, result: result,
+                                       detail: detail, room: remote.roomKey, cloud: true)
                 }
                 if kind == .rename && !oldRoomKey.isEmpty && oldRoomKey != remote.roomKey {
                     if let renamePurgeError {
@@ -1127,19 +1108,33 @@ struct HouseEditView: View {
                     }
                 }
             } catch {
+                let isFieldConflict = (error as? HouseAPIError)?.fieldConflict == true
                 BackupLogStore.log(category: "房源",
                                    action: opAction.isEmpty ? "房源同步" : opAction,
-                                   result: "失败",
-                                   detail: "服务器更新失败：\(error.localizedDescription)",
+                                   result: isFieldConflict ? "冲突" : "待同步",
+                                   detail: isFieldConflict
+                                       ? "同字段冲突，本次未上传，本机内容保留：\(error.localizedDescription)"
+                                       : "已存本机，待补传：\(error.localizedDescription)",
                                    room: logRoomKey, cloud: true)
                 await MainActor.run {
                     if !mediaSnapshots.isEmpty { SyncTaskCenter.shared.discard(id: taskID) }
-                    // 标记待补传，联网后自动重试，不丢改动
-                    HousePendingUploader.shared.markPending(logRoomKey)
-                    HouseActionNotifier.shared.send(
-                        key: "fail.\(target.mediaRoomKey)",
-                        title: "已存本机",
-                        body: "服务器同步失败：\(error.localizedDescription)，联网后自动补传")
+                    if let api = error as? HouseAPIError, api.fieldConflict {
+                        // 同字段冲突不挂自动补传（否则每轮都撞同一冲突），只保留本机改动并给明细
+                        let lines = api.fieldConflicts.map { c in
+                            "\(c["label"] ?? c["field"] ?? "字段")：服务器「\(c["server"] ?? "")」/ 本机「\(c["client"] ?? "")」"
+                        }.joined(separator: "\n")
+                        conflictTip = lines.isEmpty
+                            ? "服务器已有另一版改动，本次未上传；本机内容已保留。"
+                            : "本次未上传，本机内容已保留。冲突字段：\n\(lines)\n\n请按服务器现值决定是否重填，再保存。"
+                        HousePendingUploader.shared.clearPending(logRoomKey)
+                    } else {
+                        // 标记待补传，联网后自动重试，不丢改动
+                        HousePendingUploader.shared.markPending(logRoomKey)
+                        HouseActionNotifier.shared.send(
+                            key: "fail.\(target.mediaRoomKey)",
+                            title: "已存本机",
+                            body: "服务器同步失败：\(error.localizedDescription)，联网后自动补传")
+                    }
                 }
             }
         }
@@ -1187,20 +1182,11 @@ struct HouseEditView: View {
                 let result = try await HouseRemoteClient.shared.uploadMedia(
                     roomKey: snap.roomKey, fileName: snap.fileName,
                     kind: snap.kind, data: data)
-                // 服务器实际落盘名与本地名不一致（同名文件被唯一化）时，立即把本地文件改名，
-                // 保证本地记录、磁盘文件和服务器 media_refs 三者同名。
-                let expectedRemote = MediaNaming.remoteName(fileName: snap.fileName, kind: snap.kind)
-                if result.fileName != expectedRemote {
-                    let actualURL = MediaStore.houseDirectory(roomKey: snap.roomKey)
-                        .appendingPathComponent(result.fileName)
-                    if !FileManager.default.fileExists(atPath: actualURL.path),
-                       FileManager.default.fileExists(atPath: url.path) {
-                        try? FileManager.default.moveItem(at: url, to: actualURL)
-                    }
-                    uploaded.append((old: snap.fileName, new: result.fileName))
-                } else {
-                    uploaded.append((old: snap.fileName, new: snap.fileName))
-                }
+                // 本地文件名/后缀保持不动（原名原后缀），服务器唯一化/转码后的真实名
+                // 已由 HouseRemoteClient 写入 HouseMediaNameMap；media_refs 照映射取。
+                // 这里不再改本地文件或模型文件名，避免磁盘与账本对不上。
+                _ = result
+                uploaded.append((old: snap.fileName, new: snap.fileName))
                 HouseMediaUploadQueue.remove(roomKey: snap.roomKey, fileName: snap.fileName)
                 success += 1
             } catch {
@@ -1226,34 +1212,6 @@ struct HouseEditView: View {
             }
         }
         HouseSyncProgress.shared.end()
-        let upSplit = HouseLedgerFormat.split(snapshots.map { (name: $0.fileName, kind: $0.kind) })
-        // v2.60：新增房源保存只留一条日志——媒体有失败时，这里写「新增房源 + 失败原因」，
-        // 成功日志由 writeSuccessLog 抑制；重试成功再由任务中心写最终成功日志。
-        // v2.62：日志只记数量，不再拼文件名（用户口径：文件只分别记数量）
-        let upParts = HouseLedgerFormat.mediaParts(images: upSplit.images, videos: upSplit.videos, includeNames: false)
-        if failed > 0 {
-            let upAction = isNewHouse ? "新增房源" : "新增媒体（本地→服务器）"
-            let upResult = isNewHouse && failed >= total ? "失败" : "部分失败"
-            let upDetail = isNewHouse
-                ? HouseMediaLogFormat.failureDetail(images: upSplit.images.count, videos: upSplit.videos.count, error: lastError)
-                : upParts.joined(separator: "；") + "；成功 \(success) 失败 \(failed)（已入队自动补传）" + (lastError.isEmpty ? "" : "；错误：\(lastError)")
-            BackupLogStore.log(category: "房源", action: upAction, result: upResult,
-                              detail: upDetail, room: roomKey, cloud: true)
-            await MainActor.run {
-                if pendingUploadTip == nil {
-                    pendingUploadTip = "房源已保存到本机；媒体上传服务器失败（共 \(failed) 个），已挂到「同步任务中心」，联网后在任务条里点重试。"
-                }
-            }
-        } else if success > 0 && writeSuccessLog {
-            // 单一类型时动作名直接写「新增图片/新增视频」，混合时写「新增媒体」
-            let upAction: String
-            if upSplit.videos.isEmpty { upAction = "新增图片（本地→服务器）" }
-            else if upSplit.images.isEmpty { upAction = "新增视频（本地→服务器）" }
-            else { upAction = "新增媒体（本地→服务器）" }
-            // 旧正式版：媒体真正传完才写成功日志，本机与云端同一条（cloud:true）。
-            BackupLogStore.log(category: "房源", action: upAction, result: "成功",
-                              detail: upParts.joined(separator: "；"), room: roomKey, cloud: true)
-        }
         return (success, failed, failedFiles, uploaded, lastError)
     }
 

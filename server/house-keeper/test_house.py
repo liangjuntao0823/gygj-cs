@@ -87,6 +87,82 @@ class HouseStoreTests(unittest.TestCase):
             self.store.upsert_house(make_house(price=999), operator="涛(iPhone)",
                                    expected_revision=99)
 
+    def test_field_level_merge_non_overlap(self):
+        """两边改不同字段：自动合并；只改一边的字段不被旧快照回滚。"""
+        first = self.store.upsert_house(make_house(price=1100), operator="A(iPhone)")
+        base = {"roomNo": first["roomNo"], "tower": first["tower"],
+                "landlord": first["landlord"], "layout": first["layout"],
+                "price": first["price"], "password": first["password"],
+                "remark": first["remark"], "status": first["status"]}
+        # 服务器另一台设备改了备注
+        server = make_house(price=1100, landlord="康")
+        server["remark"] = "服务器备注"
+        self.store.upsert_house(server, operator="B(iPhone)",
+                                expected_revision=first["revision"])
+        # 本机基于旧快照改租金
+        client = make_house(price=1250, landlord="康")
+        client["base"] = base
+        doc = self.store.upsert_house(client, operator="A(iPhone)")
+        self.assertEqual(doc["price"], 1250)
+        self.assertEqual(doc["remark"], "服务器备注")
+
+    def test_field_level_conflict_same_field(self):
+        """同字段两边都改：拒绝覆盖并返回明细。"""
+        first = self.store.upsert_house(make_house(price=1100), operator="A(iPhone)")
+        base = {"roomNo": first["roomNo"], "tower": first["tower"],
+                "landlord": first["landlord"], "layout": first["layout"],
+                "price": first["price"], "password": first["password"],
+                "remark": first["remark"], "status": first["status"]}
+        self.store.upsert_house(make_house(price=1300), operator="B(iPhone)",
+                                expected_revision=first["revision"])
+        client = make_house(price=1200)
+        client["base"] = base
+        with self.assertRaises(hs_mod.FieldConflict) as ctx:
+            self.store.upsert_house(client, operator="A(iPhone)")
+        self.assertEqual(ctx.exception.conflicts[0]["field"], "price")
+        self.assertEqual(self.store.get_house("1-2059")["price"], 1300)
+
+    def test_media_union_keeps_server_media(self):
+        """只带本次新媒体：服务器原有媒体不能被覆盖掉。"""
+        a = {"objectKey": "h/1-2059/a.jpg", "fileName": "a.jpg", "kind": "image"}
+        b = {"objectKey": "houses/1-2059/b.jpg", "fileName": "b.jpg", "kind": "image"}
+        first = self.store.upsert_house(make_house(media=[a]), operator="A(iPhone)")
+        # b 必须真实存在磁盘（houses/ 前缀会做存在性校验）
+        self.store.media.house_path("1-2059", "b.jpg").parent.mkdir(parents=True, exist_ok=True)
+        self.store.media.house_path("1-2059", "b.jpg").write_bytes(b"x")
+        payload = make_house(media=[a, b])
+        payload["baseMedia"] = [a["objectKey"]]
+        doc = self.store.upsert_house(payload, operator="B(iPhone)",
+                                      expected_revision=first["revision"])
+        keys = [m["objectKey"] for m in doc["media"]]
+        self.assertIn(a["objectKey"], keys)
+        self.assertIn(b["objectKey"], keys)
+
+    def test_validation_rejects_bad_values(self):
+        for bad in (make_house(price=-100), make_house(status="whatever"),
+                    make_house(tower=99)):
+            with self.assertRaises(ValueError):
+                self.store.upsert_house(bad, operator="A(iPhone)")
+
+    def test_orphan_scan_and_delete_skips_referenced(self):
+        a = {"objectKey": "houses/1-2059/a.jpg", "fileName": "a.jpg", "kind": "image"}
+        ref = self.store.media.house_path("1-2059", "a.jpg")
+        ref.parent.mkdir(parents=True, exist_ok=True)
+        ref.write_bytes(b"ref")
+        self.store.upsert_house(make_house(media=[a]), operator="A(iPhone)")
+        orphan = self.store.media.house_path("1-2059", "orphan.jpg")
+        orphan.write_bytes(b"orphan")
+        res = self.store.list_orphan_media(min_age_seconds=0)
+        keys = [f["objectKey"] for f in res["files"]]
+        self.assertIn("houses/1-2059/orphan.jpg", keys)
+        deleted = self.store.delete_orphan_media(
+            ["houses/1-2059/orphan.jpg", "houses/1-2059/a.jpg"], min_age_seconds=0)
+        self.assertIn("houses/1-2059/orphan.jpg", deleted["deleted"])
+        # 被 media_refs 引用的 a.jpg 必须跳过
+        skipped = [x["objectKey"] for x in deleted["skipped"]]
+        self.assertIn("houses/1-2059/a.jpg", skipped)
+        self.assertTrue(ref.exists())
+
     def test_soft_delete_and_restore(self):
         self.store.upsert_house(make_house(), operator="涛(iPhone)")
         d = self.store.set_deleted("1-2059", True, "涛(iPhone)")
@@ -203,6 +279,8 @@ class HouseStoreTests(unittest.TestCase):
         self.assertEqual(len(doc["media"]), 1)
 
     def test_append_ledger_event_writes_and_dedupes(self):
+        self.store.upsert_house(make_house(), operator="涛(iPhone)")
+        before_outbox = len(self.store.pending_outbox())
         ev = {"id": "LED-1", "ts": "2026-11-26T12:00:00+08:00",
               "action": "编辑保存", "detail": "租金调整",
               "fieldChanges": [{"field": "price", "oldValue": "1000",
@@ -210,7 +288,7 @@ class HouseStoreTests(unittest.TestCase):
         res = self.store.append_ledger_event("1-2059", ev, operator="涛(iPhone)")
         self.assertFalse(res["deduplicated"])
         led = self.store.ledger("1-2059")
-        self.assertEqual(len(led), 1)
+        self.assertEqual(len(led), 2)
         self.assertFalse(led[0]["migrated"])
         self.assertEqual(led[0]["action"], "编辑保存")
         self.assertEqual(led[0]["operator"], "涛(iPhone)")
@@ -218,15 +296,16 @@ class HouseStoreTests(unittest.TestCase):
         # 同 id 重复追加：幂等去重，不进 outbox
         again = self.store.append_ledger_event("1-2059", ev, operator="涛(iPhone)")
         self.assertTrue(again["deduplicated"])
-        self.assertEqual(len(self.store.ledger("1-2059")), 1)
-        self.assertEqual(len(self.store.pending_outbox()), 0)
+        self.assertEqual(len(self.store.ledger("1-2059")), 2)
+        self.assertEqual(len(self.store.pending_outbox()), before_outbox)
 
     def test_append_ledger_event_auto_id(self):
+        self.store.upsert_house(make_house(), operator="涛(iPhone)")
         res = self.store.append_ledger_event("1-2059", {"action": "补齐媒体"},
                                              operator="明")
         self.assertTrue(res["id"])
         led = self.store.ledger("1-2059")
-        self.assertEqual(len(led), 1)
+        self.assertEqual(len(led), 2)
         self.assertEqual(led[0]["detail"], "")
 
 

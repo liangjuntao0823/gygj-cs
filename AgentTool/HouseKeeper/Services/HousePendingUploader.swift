@@ -104,8 +104,13 @@ final class HousePendingUploader {
                 }
                 // 媒体-only 补传也要计入本次完成数，任务中心才不会显示 0。
                 done += 1
+            } catch let error as HouseAPIError where error.fieldConflict {
+                // 同字段冲突：服务器已有另一版，本机内容保留但不无限重试；
+                // 冲突明细由 HouseSyncEngine 写入日志并发通知，用户按明细处理。
+                clearPending(key)
+                continue
             } catch {
-                // 仍失败（断网/冲突），保留待下轮，不影响其余房源
+                // 断网/其他临时失败：保留待下轮，不影响其余房源
                 continue
             }
         }
@@ -119,9 +124,6 @@ final class HousePendingUploader {
         let items = HouseMediaUploadQueue.pendingItems()
         guard !items.isEmpty else { return [] }
         var uploadedRooms = Set<String>()
-        let houses = (try? context.fetch(FetchDescriptor<House>())) ?? []
-        let byKey = Dictionary(houses.map { ($0.mediaRoomKey, $0) },
-                               uniquingKeysWith: { a, _ in a })
         for item in items {
             let localURL = MediaStore.url(for: item.fileName, roomKey: item.roomKey)
             guard FileManager.default.fileExists(atPath: localURL.path),
@@ -132,22 +134,10 @@ final class HousePendingUploader {
             do {
                 let result = try await HouseRemoteClient.shared.uploadMedia(
                     roomKey: item.roomKey, fileName: item.fileName, kind: item.kind, data: data)
-                // 服务器可能因为同名/无后缀而唯一化落盘名；必须把本地记录改到真实落盘名，
-                // 否则下一次 pushHouse 仍然引用旧名，服务器就留下 404 幽灵引用。
-                let expectedRemote = MediaNaming.remoteName(fileName: item.fileName, kind: item.kind)
-                if result.fileName != expectedRemote {
-                    let actualURL = MediaStore.houseDirectory(roomKey: item.roomKey)
-                        .appendingPathComponent(result.fileName)
-                    if !FileManager.default.fileExists(atPath: actualURL.path),
-                       FileManager.default.fileExists(atPath: localURL.path) {
-                        try? FileManager.default.moveItem(at: localURL, to: actualURL)
-                    }
-                    if let h = byKey[item.roomKey] {
-                        for media in h.mediaItems where media.fileName == item.fileName {
-                            media.fileName = result.fileName
-                        }
-                    }
-                }
+                // 服务器可能唯一化文件名 / 视频转 .mp4。本地文件与文件名保持原样不动，
+                // 由 objectKey ↔ 本地名映射承接；media_refs 取映射里的真实服务器名。
+                HouseMediaNameMap.set(roomKey: item.roomKey, objectKey: result.objectKey,
+                                      localFileName: item.fileName)
                 HouseMediaUploadQueue.remove(roomKey: item.roomKey, fileName: item.fileName)
                 uploadedRooms.insert(item.roomKey)
             } catch {

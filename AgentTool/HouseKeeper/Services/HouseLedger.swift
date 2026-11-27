@@ -320,26 +320,15 @@ enum HouseLedgerStore {
         try? FileManager.default.removeItem(at: sharedPending)
     }
 
-    /// v2.52：有云配置就后台合并上传；无配置/无效配置也标记待同步，配置好后启动自动补
+    /// 账本权威源在 8082 服务器库：待确认事件逐条 POST 服务器上行；
+    /// 成功并入本地正式账本，失败/未绑定令牌时保留 pending 并记 dirty，启动后自动补传。
+    /// 旧 COS 直连兜底已下线，不再读 CosConfig。
     static func scheduleSync(roomKey: String) {
-        // 服务器模式：账本权威源在 8082 服务器库，待确认事件逐条 POST 服务器上行；
-        // 成功并入本地正式账本，失败保留 pending 并入 dirty 名单待下次补传。
-        // 分享扩展不含服务器模式判定，条件编译剔除该分支，保持旧链路兜底。
+        markDirty(roomKey)
         #if !APP_EXTENSION
-        if HouseServerMode.ready {
-            markDirty(roomKey)
-            Task { await syncPending(roomKey: roomKey) }
-            return
-        }
+        guard HouseServerMode.ready else { return }
+        Task { await syncPending(roomKey: roomKey) }
         #endif
-        guard let config = CosConfig.load(), config.isValid else {
-            markDirty(roomKey)
-            return
-        }
-        Task {
-            do { try await sync(roomKey: roomKey, config: config) }
-            catch { markDirty(roomKey) }
-        }
     }
 
     #if !APP_EXTENSION

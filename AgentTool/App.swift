@@ -22,7 +22,6 @@ struct AgentToolApp: App {
     private let houseContainer: ModelContainer
     private let storageWarning: String?
     // v1.44：外部传入配置备份 json（文件 App「用其他 App 打开」）识别后的提示
-    @State private var configImportTip: String?
     @StateObject private var tabRouter = TabRouter()
     // v2.51：电梯码全屏展示（gongyuguanjia-fwq://elevator 与设置页预览共用）
     @StateObject private var elevatorCodeCenter = ElevatorCodeCenter.shared
@@ -192,17 +191,7 @@ struct AgentToolApp: App {
                 } message: {
                     Text(storageWarning ?? "")
                 }
-                // v1.44：识别到外部传入的配置备份 json → 提示已导入，可去「云端配置 → 从备份文件恢复配置」还原
-                .alert("识别到配置备份", isPresented: Binding(
-                    get: { configImportTip != nil },
-                    set: { if !$0 { configImportTip = nil } }
-                )) {
-                    Button("去还原", role: .cancel) { }
-                } message: {
-                    Text(configImportTip ?? "")
-                }
                 // v1.13 需求17：其他 App 用「用其他 App 打开」把备份 zip 发过来时，复制进本地备份目录并提示去恢复
-                // v1.44：同时识别「备份配置到文件」生成的 json 配置备份——复制进 备份/CosConfig 并提示可还原
                 // v2.29：启动即拉一次云端配置（公告/更新记录/提示文案），不必等用户去同步房源
                 .task { _ = await RemoteConfig.refresh() }
                 .onOpenURL { url in
@@ -219,12 +208,8 @@ struct AgentToolApp: App {
                         HouseImportIntent.shared.request()
                         return
                     }
-                    if url.pathExtension.lowercased() == "json",
-                       let tip = BackupImportHandler.handleIncomingConfigJSON(url) {
-                        configImportTip = tip
-                    } else {
-                        BackupImportHandler.handleIncomingZip(url)
-                    }
+                    // 旧 COS 配置备份导入已下线：只接受备份 zip，不再识别 bucket/secretId json
+                    BackupImportHandler.handleIncomingZip(url)
                 }
                 // v2.51：电梯码全屏页（URL Scheme / 设置页预览触发）
                 .fullScreenCover(isPresented: $elevatorCodeCenter.isPresenting) {
@@ -326,48 +311,7 @@ enum BackupImportHandler {
         }
     }
 
-    /// v1.44：外部传入「备份配置到文件」生成的 json 配置备份（文件 App → 用其他 App 打开 → 公寓管家）。
-    /// 识别：内容含 bucket / secretId 等配置字段 → 复制进 备份/CosConfig/ 目录 → 返回提示文本（App 弹窗）；
-    /// 非配置 json 返回 nil（忽略，不打断用户）。
-    static func handleIncomingConfigJSON(_ url: URL) -> String? {
-        let isScoped = url.startAccessingSecurityScopedResource()
-        defer { if isScoped { url.stopAccessingSecurityScopedResource() } }
 
-        guard url.pathExtension.lowercased() == "json" else { return nil }
-        guard let data = try? Data(contentsOf: url),
-              let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            print("配置导入跳过：无法解析 json \(url.lastPathComponent)")
-            return nil
-        }
-        let hasConfigFields = !(parsed["bucket"] as? String ?? "").isEmpty
-            && !(parsed["secretId"] as? String ?? "").isEmpty
-        guard hasConfigFields else {
-            print("配置导入跳过：不是配置备份 \(url.lastPathComponent)")
-            return nil
-        }
-        let fm = FileManager.default
-        let destDir = CosConfigStore.directory()
-        try? fm.createDirectory(at: destDir, withIntermediateDirectories: true)
-        var destName = url.lastPathComponent
-        var candidate = destDir.appendingPathComponent(destName)
-        var n = 2
-        while fm.fileExists(atPath: candidate.path) {
-            let stem = url.deletingPathExtension().lastPathComponent
-            destName = "\(stem)-\(n).json"
-            candidate = destDir.appendingPathComponent(destName)
-            n += 1
-        }
-        do {
-            try data.write(to: candidate, options: .atomic)
-            BackupLogStore.log(category: "配置", action: "导入配置备份", result: "成功", detail: destName)
-            return "已识别到配置备份文件并导入：\(destName)\n\n请到「设置 → 云端配置 → 从备份文件恢复配置」选择它即可一键还原存储桶 / 地域 / 密钥 / 云函数地址。"
-        } catch {
-            print("配置导入失败：写入目录出错 \(error.localizedDescription)")
-            BackupLogStore.log(category: "配置", action: "导入配置备份", result: "失败", detail: error.localizedDescription)
-            return nil
-        }
-    }
-}
 
 // 房源板块专用 ModelContext（独立 HouseStore 容器）。
 // 主 App 页面继续用主容器的 @Environment(\.modelContext)；房源页面用 houseModelContext。

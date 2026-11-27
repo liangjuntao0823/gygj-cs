@@ -69,8 +69,8 @@ enum KeychainFix {
 }
 
 /// 设置页（v1.22 重构：归拢成两个入口——远程配置 / 名片信息）
-/// 远程配置：腾讯云 COS 存储桶、密钥、自定义域名（用于分享房源卡片链接）
-/// 名片信息：分享 H5 页面与微信卡片上显示的姓名/电话（默认：梁涛 / 13288251132）
+/// 服务器配置：房源服务器地址与账号授权（旧 COS 桶/密钥配置已下线）
+/// 名片信息：姓名/电话只存本机钥匙串，分享链接按参数携带，不上传服务器
 ///
 /// v1.6（公寓管家）：独立设置页取消——房源分享相关设置合并进主 App「设置 → 房源分享」分组，
 /// 本文件保留远程配置（CosConfigView）、名片信息（ShareProfileView）、恢复列表（ConfigRestoreListView）、
@@ -224,9 +224,6 @@ struct CosConfigView: View {
                             .font(.footnote)
                     }
                 }
-                Toggle("启用服务器同步", isOn: Binding(
-                    get: { HouseServerMode.enabled },
-                    set: { HouseServerMode.enabled = $0 }))
                 TextField("服务器地址", text: $endpointInput)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
@@ -321,7 +318,7 @@ struct CosConfigView: View {
                 Text("操作日志 / 分享 / 统计都会带上这个名字。")
             }
         }
-        .navigationTitle("云端配置")
+        .navigationTitle("服务器配置")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
             username = CloudUser.username
@@ -553,8 +550,8 @@ struct ShareProfileView: View {
     @State private var qrPickerItem: PhotosPickerItem?
 
     init() {
-        let n = KeychainStore.load(KeychainKey.shareName) ?? "梁涛"
-        let p = KeychainStore.load(KeychainKey.sharePhone) ?? "13288251132"
+        let n = KeychainStore.load(KeychainKey.shareName) ?? ""
+        let p = KeychainStore.load(KeychainKey.sharePhone) ?? ""
         _shareName = State(initialValue: n)
         _sharePhone = State(initialValue: p)
         if let data = QrcodeStore.loadData() {
@@ -565,14 +562,14 @@ struct ShareProfileView: View {
     /// 预览用的姓名/电话：输入为空时显示默认值（与分享时行为一致）
     private var previewName: String {
         let n = shareName.trimmingCharacters(in: .whitespacesAndNewlines)
-        return n.isEmpty ? "梁涛" : n
+        return n.isEmpty ? "未设置姓名" : n
     }
     private var previewPhone: String {
         let p = sharePhone.trimmingCharacters(in: .whitespacesAndNewlines)
-        return p.isEmpty ? "13288251132" : p
+        return p.isEmpty ? "未设置电话" : p
     }
 
-    /// 旧桶二维码上行已下线：二维码只存本机 QrcodeStore；服务器名片/二维码上行通道待阶段 B 接入。
+    /// 二维码只存本机 QrcodeStore，不上传服务器。
     private func syncQRToCloud(clear: Bool) {}
 
     var body: some View {
@@ -634,11 +631,11 @@ struct ShareProfileView: View {
                 .padding(.top, 4)
             }
 
-            Section(header: Text("名片信息"), footer: Text("姓名和电话会应用到所有出现它们的地方：分享 H5 页面的名片区（含合集列表与详情页）、微信卡片的描述、页面底栏的联系电话、以及「拨打电话/复制电话」按钮。修改并保存后，下次分享会自动按新名片重新生成链接；之前已发出的链接保持原样。")) {
-                TextField("姓名（默认：梁涛）", text: $shareName)
+            Section(header: Text("名片信息"), footer: Text("姓名、电话只保存在本机钥匙串，不上传服务器。分享链接会把这两项放进链接参数，访客打开时由页面直接显示；服务器不保存姓名和电话。修改并保存后，重新复制/分享链接才会带上新名片，旧链接保持原样。")) {
+                TextField("姓名（只存本机）", text: $shareName)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
-                TextField("电话（默认：13288251132）", text: $sharePhone)
+                TextField("电话（只存本机）", text: $sharePhone)
                     .keyboardType(.phonePad)
                 Button {
                     saveShareProfile()
@@ -649,8 +646,8 @@ struct ShareProfileView: View {
                 .disabled(shareName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
 
-            // v1.27：微信二维码——相册选择保存；分享时自动上传，显示在所有 H5 名片板块左侧
-            Section(header: Text("微信二维码"), footer: Text("二维码会显示在所有分享 H5 页面的名片板块左侧（拨打电话/复制电话上方），访客长按二维码即可弹出微信「识别图中二维码」菜单。更换后无需重新分享——已发出的链接也会自动显示新二维码。")) {
+            // 微信二维码只保存在本机，不上传服务器；服务器 H5 不展示二维码。
+            Section(header: Text("微信二维码"), footer: Text("二维码只保存在本机，不上传服务器。服务器分享页不展示二维码；需要发二维码时，请在微信里直接发送这张图片。")) {
                 PhotosPicker(selection: $qrPickerItem, matching: .images) {
                     Label(qrImage == nil ? "选择二维码图片" : "更换二维码图片", systemImage: "qrcode")
                 }
@@ -665,7 +662,7 @@ struct ShareProfileView: View {
                             // v1.42：保存后立即同步云端桶 users/<用户名>/qrcode.jpg——
                             //        已发出的 H5 链接动态引用桶 URL，无需重新分享即显示新二维码（此前只写本地，要等下次分享才上传）
                             syncQRToCloud(clear: false)
-                            savedTip = ok ? "微信二维码已更新 ✅\n已发出的分享链接也会立即显示新二维码" : "保存二维码失败，请重试"
+                            savedTip = ok ? "微信二维码已保存到本机 ✅" : "保存二维码失败，请重试"
                         } else {
                             savedTip = "无法读取所选图片，请换一张清晰的二维码图片"
                         }
@@ -676,9 +673,8 @@ struct ShareProfileView: View {
                     Button("清除二维码", role: .destructive) {
                         QrcodeStore.clear()
                         qrImage = nil
-                        // v1.42：清除后立即删除云端桶二维码，已发出链接不再显示（此前只清本地）
                         syncQRToCloud(clear: true)
-                        savedTip = "二维码已清除，已发出的分享链接不再显示二维码"
+                        savedTip = "二维码已从本机清除"
                     }
                 }
             }
@@ -703,7 +699,7 @@ struct ShareProfileView: View {
         }
     }
 
-    /// 旧桶名片上行已下线：姓名/电话只存本机钥匙串；服务器名片上行通道待阶段 B 接入。
+    /// 姓名/电话只存本机钥匙串，不上传服务器。
     private func syncProfileToCloud(name: String, phone: String) {}
 
     /// 保存分享名片信息（姓名/电话）到钥匙串
@@ -718,7 +714,7 @@ struct ShareProfileView: View {
         ok = KeychainFix.saveVerified(phone, for: KeychainKey.sharePhone) && ok
         // v1.47：保存后同步云端名片（公开选房页实时生效）
         syncProfileToCloud(name: name, phone: phone)
-        savedTip = ok ? "名片信息已保存 ✅\n姓名：\(name)\n电话：\(phone.isEmpty ? "（未填，分享时用默认号）" : phone)\n公开选房链接刷新后同步更新" : "写入本机钥匙串失败，请重新保存一次"
+        savedTip = ok ? "名片信息已保存 ✅\n姓名：\(name)\n电话：\(phone.isEmpty ? "（未填，分享页不显示电话）" : phone)\n重新复制/分享链接即带上新名片" : "写入本机钥匙串失败，请重新保存一次"
     }
 }
 

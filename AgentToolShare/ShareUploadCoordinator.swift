@@ -173,11 +173,14 @@ final class ShareUploadCoordinator: ObservableObject {
         var failedDeletes: [String] = []
         var ledgerSynced = false
         var cloudOK = false
+        // 预登记：扩展进程若在媒体上传/合并中途被系统杀掉，App 打开即可先建出本机房、
+        // 再把共享队列里的媒体补传，不会出现“照片传了、房源没进本机”。同 id 覆盖写。
+        let inboxID = UUID().uuidString
 
         // v2.71：本地待写账——所有退出路径（含取消/云端失败）都写，App 打开即收养进本地库
         func stashInbox() {
             ShareLocalInbox.write(ShareLocalInboxEntry(
-                id: UUID().uuidString,
+                id: inboxID,
                 roomKey: roomKey,
                 isNewHouse: isNewHouse,
                 formRecord: localRecord,
@@ -199,6 +202,9 @@ final class ShareUploadCoordinator: ObservableObject {
             }
         }
 
+        // 2.5) 预登记本地待写账：此时媒体已入库并进上传队列，云端尚未写
+        stashInbox()
+
         // 3) 逐文件直传服务器（本地入库已完成压缩/转码，上传原样二进制；失败不自动重试，留在共享队列）
         let total = saved.count
         var successNames: [String] = []
@@ -211,6 +217,8 @@ final class ShareUploadCoordinator: ObservableObject {
                       let data = try? Data(contentsOf: localURL) else {
                     throw ExtHouseError(message: "本地媒体文件读取失败")
                 }
+                // 服务器可能把同名文件唯一化/视频统一 .mp4；返回值已写入本地名映射，
+                // 后续 upsert 用真实 objectKey，本地文件名保持不动。
                 _ = try await ExtensionHouseClient.uploadMedia(
                     roomKey: roomKey, fileName: file.fileName, kind: file.kind, data: data)
                 HouseMediaUploadQueue.remove(roomKey: roomKey, fileName: file.fileName)
@@ -232,26 +240,6 @@ final class ShareUploadCoordinator: ObservableObject {
             }
         }
 
-        // 4) 媒体阶段日志（与 uploadMedia 逐字同口径；v2.71 可靠上云）
-        let upSplit = HouseLedgerFormat.split(saved.map { (name: $0.fileName, kind: $0.kind) })
-        let upParts = HouseLedgerFormat.mediaParts(images: upSplit.images, videos: upSplit.videos, includeNames: false)
-        if out.failed > 0 {
-            let upAction = isNewHouse ? "新增房源" : "新增媒体（本地→云端）"
-            let upResult = isNewHouse && out.failed >= total ? "失败" : "部分失败"
-            let upDetail = isNewHouse
-                ? HouseMediaLogFormat.failureDetail(images: upSplit.images.count, videos: upSplit.videos.count, error: out.lastError)
-                : upParts.joined(separator: "；") + "；成功 \(out.success) 失败 \(out.failed)（已入队自动补传）" + (out.lastError.isEmpty ? "" : "；错误：\(out.lastError)")
-            await BackupLogStore.logAwait(category: "房源", action: upAction, result: upResult,
-                                          detail: upDetail, room: roomKey, cloud: true)
-        } else if out.success > 0 && !isNewHouse {
-            let upAction: String
-            if upSplit.videos.isEmpty { upAction = "新增图片（本地→云端）" }
-            else if upSplit.images.isEmpty { upAction = "新增视频（本地→云端）" }
-            else { upAction = "新增媒体（本地→云端）" }
-            await BackupLogStore.logAwait(category: "房源", action: upAction, result: "成功",
-                                          detail: upParts.joined(separator: "；"), room: roomKey, cloud: true)
-        }
-
         // 5) 账本事件 + 记录推送（新增：先媒体后账本；失败文件名不进 mediaNames）
         phaseText = "同步账本"
         let successSplit = HouseLedgerFormat.split(saved.filter { successNames.contains($0.fileName) }.map { (name: $0.fileName, kind: $0.kind) })
@@ -264,7 +252,8 @@ final class ShareUploadCoordinator: ObservableObject {
             changeText = "新建房源，" + (initial.isEmpty ? "无媒体" : initial)
             record = form.record(mediaNames: successNames)
             if out.success > 0 || total == 0 {
-                HouseLedgerStore.append(roomKey: roomKey, action: action, detail: changeText)
+                HouseLedgerStore.append(roomKey: roomKey, action: action, detail: changeText,
+                                        cloudLog: false, writeOpLog: false)
             }
         } else {
             var base = existing!
@@ -279,32 +268,31 @@ final class ShareUploadCoordinator: ObservableObject {
             base.updatedBy = CloudUser.signedUsername
             record = base
             if !addedParts.isEmpty {
-                HouseLedgerStore.append(roomKey: roomKey, action: action, detail: changeText)
+                HouseLedgerStore.append(roomKey: roomKey, action: action, detail: changeText,
+                                        cloudLog: false, writeOpLog: false)
             }
         }
 
         do {
             let merged = try await ExtensionHouseClient.upsert(
-                record, expectedRevision: existing?.revision.map { Int($0) })
+                record,
+                expectedRevision: existing?.revision.map { Int($0) },
+                createOnly: isNewHouse,
+                baseRecord: isNewHouse ? nil : existing,
+                removedMedia: removedNames)
             cloudRecord = merged
             cloudOK = true
             // 合并注记与旧链同口径（集合差判定）
             let hadExisting = !isNewHouse
             let cloudOnly = Set(merged.mediaNames).subtracting(Set(record.mediaNames))
-            let mergeNote = (hadExisting && !cloudOnly.isEmpty)
-                ? "；已合并云端原有 \(cloudOnly.count) 个媒体"
-                : ""
-            let mainLogged = isNewHouse ? out.failed == 0 : true
-            if mainLogged && (isNewHouse || !changeText.isEmpty) {
-                await BackupLogStore.logAwait(category: "房源", action: action, result: "成功",
-                                              detail: changeText + mergeNote, room: roomKey, cloud: true)
-            } else if !mergeNote.isEmpty {
-                await BackupLogStore.logAwait(category: "同步", action: "合并云端更新", result: "成功",
-                                              detail: "云端有别人的更新，已合并：媒体 \(record.mediaNames.count) 个 → \(merged.mediaNames.count) 个", room: roomKey, cloud: true)
+            var mergeNote = ""
+            if hadExisting && !cloudOnly.isEmpty {
+                mergeNote = "；已合并云端原有 \(cloudOnly.count) 个媒体"
             }
             out.ledgerOK = true
 
-            // 5.5) v2.71 清旧换新：删云端旧对象 + 清共享区旧文件 + 账本删除事件（与 App 编辑删媒体同口径）
+            // 5.5) v2.71 清旧换新：删云端旧对象 + 清共享区旧文件 + 账本删除事件
+            var deleteNote = ""
             if mode == .replace && !removedNames.isEmpty {
                 for name in removedNames {
                     do {
@@ -318,13 +306,31 @@ final class ShareUploadCoordinator: ObservableObject {
                 let rmAction = rmSplit.videos.isEmpty ? "删除图片"
                     : (rmSplit.images.isEmpty ? "删除视频" : "删除媒体")
                 let rmSummary = HouseLedgerFormat.mediaSummary(images: rmSplit.images.count, videos: rmSplit.videos.count)
-                HouseLedgerStore.append(roomKey: roomKey, action: rmAction, detail: "删除" + rmSummary)
-                await BackupLogStore.logAwait(
-                    category: "房源", action: "删除媒体（本地→云端）",
-                    result: failedDeletes.isEmpty ? "成功" : "部分失败",
-                    detail: rmSummary + (failedDeletes.isEmpty ? "" : "；\(failedDeletes.count) 个云端删除失败已挂任务中心"),
-                    room: roomKey, cloud: true)
+                HouseLedgerStore.append(roomKey: roomKey, action: rmAction, detail: "删除" + rmSummary,
+                                        cloudLog: false, writeOpLog: false)
+                deleteNote = "；删除旧媒体 \(removedNames.count) 个"
+                    + (failedDeletes.isEmpty ? "" : "（\(failedDeletes.count) 个云端删除失败，已挂补传）")
             }
+
+            // 最终结果只写一条日志：媒体部分失败也如实记“部分失败”，不再先写假成功
+            let finalAction = (!isNewHouse && successNames.isEmpty && !removedNames.isEmpty)
+                ? "删除媒体" : action
+            let finalResult: String
+            if out.failed == 0 && failedDeletes.isEmpty {
+                finalResult = "成功"
+            } else if out.success == 0 && total > 0 {
+                finalResult = "部分失败"
+            } else {
+                finalResult = "部分失败"
+            }
+            var finalDetail = changeText
+            if finalDetail.isEmpty { finalDetail = "媒体 \(successNames.count) 个" }
+            finalDetail += deleteNote + mergeNote
+            if out.failed > 0 {
+                finalDetail += "；\(out.failed) 个媒体待补传"
+            }
+            await BackupLogStore.logAwait(category: "房源", action: finalAction, result: finalResult,
+                                          detail: finalDetail, room: roomKey, cloud: true)
 
             // 6) 账本上行归阶段 B 编排收口；扩展内仅落本地 dirty 标记，主 App 启动接手补上行
             HouseLedgerStore.markDirty(roomKey)

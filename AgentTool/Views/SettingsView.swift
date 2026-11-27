@@ -143,8 +143,8 @@ struct SettingsView: View {
             } label: {
                 Label {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("云端配置")
-                        Text("服务器地址 / 用户名")
+                        Text("服务器配置")
+                        Text("服务器地址 / 授权 / 用户名")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -155,13 +155,13 @@ struct SettingsView: View {
         } header: {
             Text("账号与云端")
         } footer: {
-            Text("云端配置决定房源图片/视频传到哪个桶、分享卡片用哪个域名；配好后可导出部署包给别的房东自建后台。")
+            Text("服务器配置决定房源台账、图片/视频存到哪台服务器；旧存储桶/密钥/域名配置已下线。")
         }
     }
 
     // MARK: - 组 2：分享与展示
 
-    private static let shareSectionFooter = "这一组只决定「分享出去的东西长什么样、有效期多久、要不要水印和压缩」。桶、密钥、域名在上一组「账号与云端」里。"
+    private static let shareSectionFooter = "这一组只决定「分享出去的东西长什么样、有效期多久、要不要水印和压缩」。服务器地址与授权在上一组「账号与云端」里。"
     private var shareSection: some View {
         Section {
             NavigationLink {
@@ -870,7 +870,7 @@ struct SettingsView: View {
                                     ? "\(notifyHub.username.isEmpty ? "已绑定" : notifyHub.username) · \(notifyHub.devices.count) 台设备 · 电表通知\(notifyHub.channelEnabled && notifyHub.meterModuleEnabled ? "开" : "关")"
                                     : "未绑定 · 电表告警 / 将来到期收租通知") { CloudPushSettingsView() }
                     settingsRow("存储与清理", icon: "internaldrive",
-                                subtitle: "数据文件夹 · AI 产物 · 下载的安装包 · 桶孤儿媒体") { StorageSettingsPage() }
+                                subtitle: "数据文件夹 · AI 产物 · 下载的安装包 · 服务器孤儿媒体") { StorageSettingsPage() }
                     // v2.51：电梯码（全屏展示 + 更换 + 一键打开方式）
                     settingsRow("电梯码", icon: "qrcode",
                                 subtitle: "全屏展示 · 更换二维码 · 一键打开方式") { ElevatorCodeSettingsPage() }
@@ -1971,8 +1971,8 @@ struct AccountSettingsPage: View {
                 } label: {
                     Label {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("云端配置")
-                            Text("服务器地址 / 用户名")
+                            Text("服务器配置")
+                            Text("服务器地址 / 授权 / 用户名")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
@@ -1983,7 +1983,7 @@ struct AccountSettingsPage: View {
             } header: {
                 Text("账号与云端")
             } footer: {
-                Text("云端配置决定房源图片/视频传到哪个桶、分享卡片用哪个域名；配好后可导出部署包给别的房东自建后台。")
+                Text("服务器配置决定房源台账、图片/视频存到哪台服务器；旧存储桶/密钥/域名配置已下线。")
             }
         }
         .navigationTitle("账号与云端")
@@ -2704,6 +2704,20 @@ struct StorageSettingsPage: View {
                         Spacer()
                         Text(downloadedPackagesText())
                             .foregroundColor(.secondary)
+                    }
+                }
+                NavigationLink {
+                    HouseOrphanMediaView()
+                } label: {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("清理服务器孤儿媒体")
+                            Text("扫描 media_v2/houses 下没有房源引用的文件；先列名单，确认后才删")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: "server.rack")
                     }
                 }
                 Button {

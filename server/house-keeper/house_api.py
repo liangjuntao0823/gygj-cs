@@ -276,6 +276,32 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
                 return send(200, {"ok": True})
             return send(405, {"ok": False, "error": "method_not_allowed"})
 
+        # ---- 孤儿媒体（设置页「清理服务器孤儿媒体」；只扫 media_v2/houses）----
+        if path == f"{PREFIX}/media-orphans" and method == "GET":
+            if not auth_house():
+                return True
+            q = _q(handler)
+            try:
+                min_age = int(q.get("minAge") or 3600)
+            except ValueError:
+                min_age = 3600
+            return send(200, {"ok": True, **store.list_orphan_media(min_age)})
+
+        if path == f"{PREFIX}/media-orphans" and method == "DELETE":
+            if not auth_house():
+                return True
+            body = handler._read_json()
+            if not isinstance(body, dict):
+                return send(400, {"ok": False, "error": "bad_json"})
+            try:
+                min_age = int(body.get("minAge") or 3600)
+            except (TypeError, ValueError):
+                min_age = 3600
+            keys = body.get("objectKeys") or []
+            if not isinstance(keys, list):
+                return send(400, {"ok": False, "error": "objectKeys must be array"})
+            return send(200, store.delete_orphan_media(keys, min_age))
+
         # ---- 房源媒体（服务器磁盘；二进制直传/直出）----
         if path.startswith(f"{PREFIX}/media/"):
             if not auth_house():
@@ -400,11 +426,19 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
                 return send(400, {"ok": False, "error": "bad_json"})
             operator = str(body.get("operator") or "未知用户")
             origin = str(body.get("originDeviceId") or "")
-            expected = body.get("expectedRevision")
-            expected = int(expected) if isinstance(expected, int) else None
+            top_expected = body.get("expectedRevision")
+            top_expected = int(top_expected) if isinstance(top_expected, int) else None
             items = body.get("houses") if path.endswith(":batch") else [body]
             results = []
             for it in items:
+                if not isinstance(it, dict):
+                    results.append({"ok": False, "error": "bad_request",
+                                    "detail": "item must be object"})
+                    continue
+                # 批量条目自己的 expectedRevision 优先；顶层仅作兼容旧客户端的兜底。
+                item_expected = it.get("expectedRevision")
+                expected = (int(item_expected) if isinstance(item_expected, int)
+                            else top_expected)
                 try:
                     doc = store.upsert_house(
                         it, operator=operator, origin_device_id=origin,
@@ -419,6 +453,12 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
                     if "DuplicateHouse" in name:
                         code = "duplicate_room"
                         detail = f"房号 {it.get('roomKey') or ''} 已存在，同一座同一房号不能重复添加"
+                    elif "FieldConflict" in name:
+                        code = "field_conflict"
+                        detail = "同一字段已被其他设备修改"
+                        results.append({"ok": False, "error": code, "detail": detail,
+                                        "conflicts": getattr(e, "conflicts", [])})
+                        continue
                     elif "RevisionConflict" in name:
                         code = "revision_conflict"
                         detail = str(e)[:200]

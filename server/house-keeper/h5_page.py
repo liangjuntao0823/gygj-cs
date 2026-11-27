@@ -60,17 +60,22 @@ body{background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSys
 function qs(k){var p=new URLSearchParams(location.search);return p.get(k)||""}
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
 function mediaUrl(rel){return "/api/public/media/"+encodeURIComponent(rel)}
+function withProfile(href){var n=qs("n"),p=qs("p");if(!n&&!p){return href}return href+(href.indexOf("?")>=0?"&":"?")+"n="+encodeURIComponent(n)+"&p="+encodeURIComponent(p)}
 function mediaTag(m){
   var url=mediaUrl(m.objectKey||m.fileName||"");
   if(m.kind==="video"){return '<video src="'+url+'" preload="none" controls playsinline></video>'}
   return '<img src="'+url+'" alt="" loading="lazy">';
 }
+function localProfile(){
+  // 姓名/电话只随分享链接参数传入，服务器不保存；二维码不上服务器，页面不展示
+  return {name:qs("n"), phone:qs("p")};
+}
 function profileHTML(p){
   p=p||{};
-  var qr=p.qrPath?'<img class="qr" src="'+mediaUrl(p.qrPath)+'" alt="二维码">':"";
-  var phone=p.phone?'<a class="btn copy" href="tel:'+esc(p.phone)+'">拨打电话</a>':"";
-  return '<div class="card"><div class="profile">'+qr+'<div class="who"><div class="name">'+esc(p.name||"房东")+'</div><div class="phone">'+esc(p.phone||"")+'</div></div></div>'+
-    '<div class="actions"><a class="btn call" href="tel:'+esc(p.phone||"")+'">联系房东</a>'+phone+'</div></div>';
+  if(!p.name && !p.phone){return ""}
+  var who='<div class="who"><div class="name">'+esc(p.name||"房东")+'</div>'+(p.phone?'<div class="phone">'+esc(p.phone)+'</div>':"")+'</div>';
+  var call=p.phone?'<a class="btn call" href="tel:'+esc(p.phone)+'">拨打电话</a>':"";
+  return '<div class="card"><div class="profile">'+who+'</div>'+(call?'<div class="actions">'+call+'</div>':"")+'</div>';
 }
 async function getJSON(u){var r=await fetch(u);if(!r.ok)throw new Error("http "+r.status);return r.json()}
 
@@ -79,13 +84,13 @@ async function renderSingle(key){
   document.getElementById("title").textContent="房源详情";
   var app=document.getElementById("app");
   try{
-    var [d,p]=await Promise.all([getJSON("/api/public/rooms/"+encodeURIComponent(key)),getJSON("/api/public/profile").catch(function(){return {}})]);
+    var d=await getJSON("/api/public/rooms/"+encodeURIComponent(key));
     if(!d.ok){app.innerHTML='<div class="empty">该房源暂不可见</div>';return}
     var h='<div class="card"><div class="meta-row"><span class="layout">'+esc(d.layout||"户型")+'</span>'+
       '<span class="tower">'+esc((d.tower||"")+" "+(d.roomNo||""))+'</span>'+
       '<span class="price">¥'+esc(d.price||"")+'<small> /月</small></span></div>';
     if(d.media&&d.media.length){h+='<div class="media-grid">'+d.media.map(function(m){return "<figure>"+mediaTag(m)+"</figure>"}).join("")+"</div>"}
-    h+="</div>"+profileHTML(p.profile||p);
+    h+="</div>"+profileHTML(localProfile());
     app.innerHTML=h;
   }catch(e){app.innerHTML='<div class="empty">加载失败，请稍后再试</div>'}
 }
@@ -95,16 +100,16 @@ async function renderList(){
   document.getElementById("title").textContent="在租房源";
   var app=document.getElementById("app");
   try{
-    var [d,p]=await Promise.all([getJSON("/api/public/rooms"),getJSON("/api/public/profile").catch(function(){return {}})]);
+    var d=await getJSON("/api/public/rooms");
     var rooms=d.rooms||[];
     if(!rooms.length){app.innerHTML='<div class="empty">暂无可看房源</div>';return}
     var h=rooms.map(function(r){
       var thumb=r.media&&r.media.length?'<img class="thumb" src="'+mediaUrl((r.media.find(function(m){return m.kind!=="video"})||r.media[0]).objectKey)+'">':"";
-      return '<a class="room-item" href="/api/public/h5?roomKey='+encodeURIComponent(r.roomKey)+'">'+thumb+
+      return '<a class="room-item" href="'+esc(withProfile("/api/public/h5?roomKey="+encodeURIComponent(r.roomKey)))+'">'+thumb+
         '<div class="info"><div class="t">'+esc(r.layout||"户型")+'</div><div class="s">'+esc((r.tower||"")+" "+(r.roomNo||""))+'</div></div>'+
         '<div class="p">¥'+esc(r.price||"")+'</div></a>';
     }).join("");
-    app.innerHTML=h+profileHTML(p.profile||p);
+    app.innerHTML=h+profileHTML(localProfile());
   }catch(e){app.innerHTML='<div class="empty">加载失败，请稍后再试</div>'}
 }
 

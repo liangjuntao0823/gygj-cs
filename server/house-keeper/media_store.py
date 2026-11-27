@@ -197,6 +197,36 @@ class MediaStore:
         if target.is_dir():
             shutil.rmtree(target, ignore_errors=True)
 
+    def iter_house_files(self) -> list[tuple[str, int, float]]:
+        """列出 houses/ 下全部文件（相对路径、字节数、mtime），供孤儿媒体扫描。"""
+        root = self.root / "houses"
+        if not root.is_dir():
+            return []
+        out: list[tuple[str, int, float]] = []
+        for p in root.rglob("*"):
+            if not p.is_file() or p.name.endswith(".part"):
+                continue
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            out.append((p.relative_to(self.root).as_posix(), st.st_size, st.st_mtime))
+        return out
+
+    def delete_rel(self, rel_path: str) -> bool:
+        """按相对路径删除文件；只允许 houses/ 下，防路径穿越。"""
+        rel = str(rel_path or "").replace("\\", "/")
+        if not rel.startswith("houses/"):
+            return False
+        path = self._resolve(rel)
+        if path is None or not path.is_file():
+            return False
+        try:
+            path.unlink()
+            return True
+        except OSError:
+            return False
+
     # ---- 名片二维码 ----
     def save_qrcode(self, file_name: str, data: bytes) -> str:
         fn = safe_file_name(file_name)

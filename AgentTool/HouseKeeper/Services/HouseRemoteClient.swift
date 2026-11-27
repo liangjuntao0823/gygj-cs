@@ -104,6 +104,32 @@ struct RemoteBackupList: Codable {
     let backups: [RemoteBackupRecord]
 }
 
+struct RemoteOrphanMedia: Codable, Identifiable, Hashable {
+    let objectKey: String
+    let size: Int
+    let modifiedAt: String
+    var id: String { objectKey }
+}
+
+struct RemoteOrphanList: Codable {
+    let ok: Bool
+    let files: [RemoteOrphanMedia]
+    let count: Int
+    let totalBytes: Int
+    let minAgeSeconds: Int
+}
+
+struct RemoteOrphanDeleteResult: Codable {
+    let ok: Bool
+    let deleted: [String]
+    let skipped: [RemoteOrphanSkip]
+}
+
+struct RemoteOrphanSkip: Codable, Hashable {
+    let objectKey: String
+    let reason: String
+}
+
 struct HouseAPIError: LocalizedError {
     let message: String
     /// 服务器已识别令牌，但该用户未被授权访问房源库（403）；此类错误不应自动重试
@@ -112,13 +138,19 @@ struct HouseAPIError: LocalizedError {
     let revisionConflict: Bool
     /// 新增房源时服务器已有同座同房号（房号重复）
     let duplicateRoom: Bool
+    /// 字段级合并冲突：服务器同一字段也被其他设备改成了不同值
+    let fieldConflict: Bool
+    let fieldConflicts: [[String: String]]
 
     init(message: String, forbidden: Bool = false, revisionConflict: Bool = false,
-         duplicateRoom: Bool = false) {
+         duplicateRoom: Bool = false, fieldConflict: Bool = false,
+         fieldConflicts: [[String: String]] = []) {
         self.message = message
         self.forbidden = forbidden
         self.revisionConflict = revisionConflict
         self.duplicateRoom = duplicateRoom
+        self.fieldConflict = fieldConflict
+        self.fieldConflicts = fieldConflicts
     }
 
     var errorDescription: String? { message }
@@ -381,12 +413,25 @@ final class HouseRemoteClient {
         guard envelope.ok, let objectKey = envelope.objectKey else {
             throw HouseAPIError(message: "服务器未返回媒体引用")
         }
-        return (objectKey, envelope.fileName ?? uploadName)
+        let actualName = envelope.fileName ?? uploadName
+        // 本地保留原文件名/后缀，服务器可能唯一化或把视频转成 .mp4；
+        // 这里把 objectKey ↔ 本地名写进共享映射，后续 media_refs / 播放 / 删除都用真实对。
+        HouseMediaNameMap.set(roomKey: roomKey, objectKey: objectKey,
+                              localFileName: fileName)
+        return (objectKey, actualName)
     }
 
     /// 从服务器下载媒体二进制
     func downloadMedia(roomKey: String, fileName: String) async throws -> Data {
-        let path = "/api/house/media/\(encodedRoomKey(roomKey))/\(encodedRoomKey(fileName))"
+        // 服务器可能已把本地名唯一化/转成 .mp4：优先按映射取真实落盘名
+        let remoteName: String
+        if let objectKey = HouseMediaNameMap.objectKey(roomKey: roomKey, localFileName: fileName) {
+            remoteName = (objectKey as NSString).lastPathComponent
+        } else {
+            let kind = ["mov", "m4v", "mp4", "avi"].contains((fileName as NSString).pathExtension.lowercased()) ? "video" : "image"
+            remoteName = MediaNaming.remoteName(fileName: fileName, kind: kind)
+        }
+        let path = "/api/house/media/\(encodedRoomKey(roomKey))/\(encodedRoomKey(remoteName))"
         guard let base = URL(string: endpoint),
               let url = URL(string: path, relativeTo: base) else {
             throw HouseAPIError(message: "服务器地址无效")
@@ -412,11 +457,16 @@ final class HouseRemoteClient {
 
     /// 删除服务器上的单个媒体文件
     func deleteMedia(roomKey: String, fileName: String) async throws {
-        // 本地视频名可能是 .mov，服务器统一存 .mp4；删除时按同一口径换算。
-        let remoteName = MediaNaming.remoteName(
-            fileName: fileName,
-            kind: ["mov", "m4v", "mp4", "avi"].contains((fileName as NSString).pathExtension.lowercased())
-                ? "video" : "image")
+        // 优先用上传时记下的 objectKey ↔ 本地名映射；没有映射再按旧口径把 .mov 换算成 .mp4。
+        let remoteName: String
+        if let objectKey = HouseMediaNameMap.objectKey(roomKey: roomKey,
+                                                       localFileName: fileName) {
+            remoteName = (objectKey as NSString).lastPathComponent
+        } else {
+            let kind = ["mov", "m4v", "mp4", "avi"].contains((fileName as NSString).pathExtension.lowercased())
+                ? "video" : "image"
+            remoteName = MediaNaming.remoteName(fileName: fileName, kind: kind)
+        }
         let path = "/api/house/media/\(encodedRoomKey(roomKey))/\(encodedRoomKey(remoteName))"
         let (_, http) = try await makeRequest(path, method: "DELETE")
         guard http.statusCode == 200 else {
@@ -627,6 +677,18 @@ final class HouseRemoteClient {
                 throw HouseAPIError(message: "该房源刚被其他人修改，请刷新后再编辑",
                                    revisionConflict: true)
             }
+            if r.error == "field_conflict" {
+                let conflicts = (r.conflicts ?? []).compactMap { c -> [String: String]? in
+                    guard let field = c["field"] else { return nil }
+                    return ["field": field, "label": c["label"] ?? field,
+                            "base": c["base"] ?? "", "client": c["client"] ?? "",
+                            "server": c["server"] ?? ""]
+                }
+                let text = conflicts.map { "\($0["label"] ?? ""): 你填 \($0["client"] ?? "")，服务器已改为 \($0["server"] ?? "")" }
+                    .joined(separator: "；")
+                throw HouseAPIError(message: text.isEmpty ? "同一字段已被其他设备修改，请刷新后重试" : text,
+                                   fieldConflict: true, fieldConflicts: conflicts)
+            }
             if r.error == "duplicate_room" {
                 throw HouseAPIError(message: r.detail ?? "该房号已在服务器收录，不能重复添加",
                                    duplicateRoom: true)
@@ -661,15 +723,41 @@ final class HouseRemoteClient {
         return try decode(RemoteHouse.self, data: data)
     }
 
-    /// 公开分享 H5 链接（服务器本地托管静态壳；roomKey 为空时为公开选房列表）
+    /// 扫描服务器 houses/ 下未被 media_refs 引用的孤儿媒体（设置页清理用）
+    func listOrphanMedia(minAge: Int = 3600) async throws -> RemoteOrphanList {
+        let (data, http) = try await makeRequest(
+            "/api/house/media-orphans?minAge=\(max(0, minAge))", method: "GET")
+        guard http.statusCode == 200 else {
+            throw HouseAPIError(message: "扫描服务器孤儿媒体失败（服务器 \(http.statusCode)）")
+        }
+        return try decode(RemoteOrphanList.self, data: data)
+    }
+
+    /// 删除确认后的服务器孤儿媒体；服务器会二次核对 media_refs，已引用的跳过
+    func deleteOrphanMedia(objectKeys: [String], minAge: Int = 3600) async throws -> RemoteOrphanDeleteResult {
+        let body: [String: Any] = ["objectKeys": objectKeys, "minAge": max(0, minAge)]
+        let (data, http) = try await makeRequest("/api/house/media-orphans", method: "DELETE", body: body)
+        guard http.statusCode == 200 else {
+            throw HouseAPIError(message: "清理服务器孤儿媒体失败（服务器 \(http.statusCode)）")
+        }
+        return try decode(RemoteOrphanDeleteResult.self, data: data)
+    }
+
+    /// 公开分享 H5 链接（服务器本地托管静态壳；roomKey 为空时为公开选房列表）。
+    /// 姓名/电话只在本机，随链接参数传给页面，服务器不落库；二维码不上服务器、H5 不展示。
     static func h5URL(roomKey: String? = nil) -> URL? {
         guard var comps = URLComponents(string: NotifyHub.shared.endpoint) else { return nil }
         comps.path = "/api/public/h5"
+        var items: [URLQueryItem] = []
         if let key = roomKey, !key.isEmpty {
-            comps.queryItems = [URLQueryItem(name: "roomKey", value: key)]
-        } else {
-            comps.queryItems = nil
+            items.append(URLQueryItem(name: "roomKey", value: key))
         }
+        let profile = CosUploader.loadShareProfile()
+        let name = profile.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let phone = profile.phone.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !name.isEmpty { items.append(URLQueryItem(name: "n", value: name)) }
+        if !phone.isEmpty { items.append(URLQueryItem(name: "p", value: phone)) }
+        comps.queryItems = items.isEmpty ? nil : items
         return comps.url
     }
 }
@@ -684,6 +772,7 @@ private struct WriteItem: Codable {
     let error: String?
     let detail: String?
     let house: RemoteHouse?
+    let conflicts: [[String: String]]?
 }
 
 private struct RemoteMediaUpload: Codable {
@@ -705,11 +794,21 @@ struct HouseSyncPayload {
     let remark: String
     let status: String
     let media: [[String: Any]]
+    /// 编辑前的服务器快照字段；新增/无快照时为 nil（服务器走全量 CAS）
+    var base: [String: Any]? = nil
+    /// 编辑前的服务器媒体 objectKey 清单；与 base 一起用于「媒体并集 − 显式删除」
+    var baseMedia: [String]? = nil
+    /// 本次显式删除的服务器媒体 objectKey（本地已移除的旧媒体）
+    var removedMedia: [String]? = nil
 
     var json: [String: Any] {
-        ["roomKey": roomKey, "roomNo": roomNo, "tower": tower,
-         "landlord": landlord, "layout": layout, "price": price,
-         "password": password, "remark": remark, "status": status,
-         "media": media]
+        var d: [String: Any] = ["roomKey": roomKey, "roomNo": roomNo, "tower": tower,
+                                "landlord": landlord, "layout": layout, "price": price,
+                                "password": password, "remark": remark, "status": status,
+                                "media": media]
+        if let base { d["base"] = base }
+        if let baseMedia { d["baseMedia"] = baseMedia }
+        if let removedMedia, !removedMedia.isEmpty { d["removedMedia"] = removedMedia }
+        return d
     }
 }

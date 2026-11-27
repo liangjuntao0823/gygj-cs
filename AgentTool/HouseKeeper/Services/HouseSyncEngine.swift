@@ -58,12 +58,26 @@ final class HouseSyncEngine: ObservableObject {
     }
 
     /// 服务器媒体 objectKey -> 本地 MediaItem.fileName
-    static func localFileName(objectKey: String, kind: String) -> String {
-        let name = (objectKey as NSString).lastPathComponent
-        if kind == "video" {
-            return ((name as NSString).deletingPathExtension) + ".mov"
+    /// 优先查上传时记录的映射；没有映射时按服务器真实文件名落盘（不再无条件把视频改成 .mov，
+    /// 否则「本地 .mp4、服务器 .mp4」会被当成 .mov 重复登记）。历史本地 .mov 仍能通过映射/存在性命中。
+    static func localFileName(objectKey: String, kind: String, roomKey: String? = nil) -> String {
+        let serverName = (objectKey as NSString).lastPathComponent
+        if let roomKey, let mapped = HouseMediaNameMap.localName(roomKey: roomKey, objectKey: objectKey) {
+            return mapped
         }
-        return name
+        if let roomKey {
+            // 没有映射时，先看服务器名对应的本地文件是否存在；视频再看同名 .mov（历史分享入库）
+            let direct = MediaStore.url(for: serverName, roomKey: roomKey)
+            if FileManager.default.fileExists(atPath: direct.path) { return serverName }
+            if kind == "video" {
+                let mov = MediaStore.url(for: ((serverName as NSString).deletingPathExtension) + ".mov",
+                                         roomKey: roomKey)
+                if FileManager.default.fileExists(atPath: mov.path) {
+                    return (serverName as NSString).deletingPathExtension + ".mov"
+                }
+            }
+        }
+        return serverName
     }
 
     // MARK: - 拉取（服务器 → 本地）
@@ -144,6 +158,8 @@ final class HouseSyncEngine: ObservableObject {
             reconcileMedia(target, remote: r, context: context)
             if snapshot(target) != before { changed += 1 }
             setServerRevision(r.revision, forKey: r.roomKey)
+            // 保存一份服务器快照：下次编辑提交时作为字段级合并的 base
+            HouseBaseSnapshotStore.save(r)
         }
         // 服务器已硬删的本地孤儿：曾同步过（revMap 有记录）但全量清单已不含 → 物理删除本地记录；
         // 从未同步过的纯本地房保留，并明确标为“本地”，避免沿用旧的“双端”。
@@ -164,6 +180,8 @@ final class HouseSyncEngine: ObservableObject {
             if revMap[key] != nil {
                 context.delete(h)
                 removeServerRevision(forKey: key)
+                HouseBaseSnapshotStore.remove(key)
+                HouseMediaNameMap.removeRoom(key)
                 changed += 1
             } else if h.cloudStatus != .local {
                 h.cloudStatus = .local
@@ -177,7 +195,8 @@ final class HouseSyncEngine: ObservableObject {
     private func reconcileMedia(_ house: House, remote: RemoteHouse, context: ModelContext) {
         let remoteMedia = remote.media ?? []
         let wantedNames = Set(remoteMedia.map {
-            Self.localFileName(objectKey: $0.objectKey, kind: $0.kind)
+            Self.localFileName(objectKey: $0.objectKey, kind: $0.kind,
+                               roomKey: house.mediaRoomKey)
         })
         // 本地已登记、但还没传成功的媒体不能因为服务器清单暂时没有就删掉：
         // 它们还在待上传队列里，删了本地记录会让后补传的图片/视频“人间蒸发”。
@@ -191,7 +210,8 @@ final class HouseSyncEngine: ObservableObject {
         }
         let existing = Set(house.mediaItems.map { $0.fileName })
         for m in remoteMedia {
-            let localName = Self.localFileName(objectKey: m.objectKey, kind: m.kind)
+            let localName = Self.localFileName(objectKey: m.objectKey, kind: m.kind,
+                                               roomKey: house.mediaRoomKey)
             guard !existing.contains(localName) else { continue }
             let item = MediaItem(fileName: localName, kind: m.kind)
             item.house = house
@@ -217,12 +237,17 @@ final class HouseSyncEngine: ObservableObject {
             guard !pendingNames.isEmpty else { return nil }
             return Set(house.mediaItems.map { $0.fileName }).subtracting(pendingNames)
         }()
+        let mediaPayload = mediaArray(house, roomKey: roomKey, onlyNames: effectiveNames)
+        let base = HouseBaseSnapshotStore.load(roomKey)
+        let currentKeys = Set(mediaPayload.compactMap { $0["objectKey"] as? String })
+        let removedKeys = (base?.mediaKeys ?? []).filter { !currentKeys.contains($0) }
         let payload = HouseSyncPayload(
             roomKey: roomKey, roomNo: house.roomNo, tower: house.tower,
             landlord: house.landlord, layout: house.layout, price: house.price,
             password: house.password, remark: house.remark,
-            status: house.statusRaw, media: mediaArray(house, roomKey: roomKey,
-                                                       onlyNames: effectiveNames))
+            status: house.statusRaw, media: mediaPayload,
+            base: base?.fields, baseMedia: base?.mediaKeys,
+            removedMedia: removedKeys)
         let expected = revMap[roomKey]
         // 新增/本机从未拿到服务器修订号：按“创建”提交，服务器已同房号时直接拒绝，
         // 不能把别人的房源当成本机旧版本覆盖掉。
@@ -231,26 +256,50 @@ final class HouseSyncEngine: ObservableObject {
         do {
             remote = try await HouseRemoteClient.shared.upsert(
                 payload, expectedRevision: expected, createOnly: createOnly)
+        } catch let error as HouseAPIError where error.fieldConflict {
+            // 同字段两边都改：服务器拒绝覆盖并返回明细。本机改动保留，但不再自动重试，
+            // 避免每轮补传都撞同一冲突；提示用户按明细决定保留哪边。
+            let lines = error.fieldConflicts.map { c in
+                "\(c["label"] ?? c["field"] ?? "字段")：服务器「\(c["server"] ?? "")」/ 本机「\(c["client"] ?? "")」"
+            }.joined(separator: "；")
+            BackupLogStore.log(category: "房源", action: "字段冲突", result: "冲突",
+                               detail: lines.isEmpty ? error.message : lines,
+                               room: roomKey, cloud: true)
+            HouseActionNotifier.shared.send(
+                key: "fieldconflict.\(roomKey)",
+                title: "有字段被其他设备改过",
+                body: "\(roomKey) 本次未上传：\(lines.isEmpty ? "同字段冲突" : lines)",
+                silent: true)
+            throw error
         } catch let error as HouseAPIError where error.revisionConflict {
-            // 冲突后不能一直拿旧 revision 重试（会永久卡在待补传）。
-            // 先拉一次服务器当前 revision，更新本地基线；本次仍抛给调用方提示/保留本机改动，
-            // 下一轮补传按“最后写入者胜”提交本机版本，避免死循环。
-            if let fresh = try? await HouseRemoteClient.shared.getHouse(roomKey) {
-                setServerRevision(fresh.revision, forKey: roomKey)
-                setTop(max(topRevision, fresh.revision))
-                BackupLogStore.log(category: "房源", action: "同步冲突", result: "冲突",
-                                   detail: "服务器已更新到修订 \(fresh.revision)；本机改动保留，下一轮补传按本机版本覆盖",
-                                   room: roomKey, cloud: true)
-            } else {
-                HouseServerMissingStore.mark(roomKey)
-                BackupLogStore.log(category: "房源", action: "同步冲突", result: "冲突",
-                                   detail: "服务器已无此房源（可能被其他设备删除）；本机改动保留，可在详情页彻底删除本机",
+            // 冲突后先拉一次服务器当前 revision 更新本地基线；本次仍抛给调用方提示/保留本机改动。
+            // 不能用 try? 把「404 = 服务器确实已删」和「网络错误 = 不知道」混成 nil，
+            // 否则一次弱网抖动就会被 UI 当成服务器已删，诱导用户彻底删本机房源。
+            do {
+                if let fresh = try await HouseRemoteClient.shared.getHouse(roomKey) {
+                    setServerRevision(fresh.revision, forKey: roomKey)
+                    setTop(max(topRevision, fresh.revision))
+                    HouseBaseSnapshotStore.save(fresh)
+                    BackupLogStore.log(category: "房源", action: "同步冲突", result: "冲突",
+                                       detail: "服务器已更新到修订 \(fresh.revision)；本机改动保留，下一次提交按字段合并",
+                                       room: roomKey, cloud: true)
+                } else {
+                    HouseServerMissingStore.mark(roomKey)
+                    BackupLogStore.log(category: "房源", action: "同步冲突", result: "冲突",
+                                       detail: "服务器已无此房源（可能被其他设备删除）；本机改动保留，可在详情页彻底删除本机",
+                                       room: roomKey, cloud: true)
+                }
+            } catch {
+                // 网络/鉴权失败：状态未知，不标记服务器删除，交给下一轮补传
+                BackupLogStore.log(category: "房源", action: "同步冲突", result: "待重试",
+                                   detail: "冲突后无法确认服务器状态（\(error.localizedDescription)），本机改动保留，稍后自动重试",
                                    room: roomKey, cloud: true)
             }
             throw error
         }
         setServerRevision(remote.revision, forKey: roomKey)
         setTop(max(topRevision, remote.revision))
+        HouseBaseSnapshotStore.save(remote)
         HouseServerMissingStore.remove(roomKey)
         return remote
     }
@@ -271,6 +320,8 @@ final class HouseSyncEngine: ObservableObject {
             HouseMediaUploadQueue.removeRoom(key)
             HouseLocalDeletionStore.remove(key)
             HouseServerMissingStore.remove(key)
+            HouseBaseSnapshotStore.remove(key)
+            HouseMediaNameMap.removeRoom(key)
             UnreadCloudHouseStore.clear(key)
             context.delete(house)
             deleted += 1
@@ -304,9 +355,13 @@ final class HouseSyncEngine: ObservableObject {
                             onlyNames: Set<String>? = nil) -> [[String: Any]] {
         house.mediaItems.compactMap { item in
             if let onlyNames, !onlyNames.contains(item.fileName) { return nil }
-            let remoteName = MediaNaming.remoteName(fileName: item.fileName, kind: item.kind)
-            let key = Self.objectKey(roomKey: roomKey, fileName: item.fileName,
-                                    kind: item.kind)
+            // 上传时可能被服务器唯一化/转码；优先用映射里的真实 objectKey，
+            // 没有映射才按本地名推导。fileName 用服务器落盘名，账本才能和磁盘对上。
+            let key = HouseMediaNameMap.objectKey(roomKey: roomKey,
+                                                 localFileName: item.fileName)
+                ?? Self.objectKey(roomKey: roomKey, fileName: item.fileName,
+                                  kind: item.kind)
+            let remoteName = (key as NSString).lastPathComponent
             return ["objectKey": key, "fileName": remoteName,
                     "kind": item.kind]
         }
