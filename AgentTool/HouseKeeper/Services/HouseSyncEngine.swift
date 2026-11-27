@@ -307,10 +307,25 @@ final class HouseSyncEngine: ObservableObject {
 /// “仅删本地”墓碑：记录用户明确从本机删除、但服务器仍保留的房源。
 /// 作用：自动同步/手动同步不再把它们静默带回；只有用户在总刷新确认框里点“恢复”才清除。
 enum HouseLocalDeletionStore {
-    private static let key = "house.localDeletion.roomKeys.v1"
+    private static let legacyKey = "house.localDeletion.roomKeys.v1"
+    /// 同一台手机可能切换账号；墓碑必须按账号隔离，否则 A 账号仅删本地的房
+    /// 会让 B 账号登录后也看不到这套房。
+    private static var key: String {
+        legacyKey + "." + CloudUser.safeName
+    }
 
     static func keys() -> Set<String> {
-        Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+        migrateLegacyIfNeeded()
+        return Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+    }
+
+    private static func migrateLegacyIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: key) == nil,
+              let legacy = defaults.stringArray(forKey: legacyKey),
+              !legacy.isEmpty else { return }
+        defaults.set(legacy, forKey: key)
+        defaults.removeObject(forKey: legacyKey)
     }
 
     static func count() -> Int { keys().count }
