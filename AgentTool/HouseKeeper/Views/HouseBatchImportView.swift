@@ -942,19 +942,40 @@ struct HouseBatchImportView: View {
                 done += 1
                 syncCenter.advance(id: importID, done: done)
             }
-            do {
-                try await HouseSyncEngine.shared.pushHouse(house)
-                house.cloudStatus = .both
-                SyncFailStore.clear(roomKey)
-                summary.cloudLedger += 1
-            } catch {
+            done += 1
+            syncCenter.advance(id: importID, done: done)
+        }
+        // 文本统一走一次 /houses:batch；单套失败只影响该套，不再逐套发请求。
+        var batchFailures: [String: Error] = [:]
+        do {
+            batchFailures = try await HouseSyncEngine.shared.pushHousesBatch(houses)
+        } catch {
+            for house in houses {
+                HousePendingUploader.shared.markPending(house.mediaRoomKey)
+                SyncFailStore.mark(house.mediaRoomKey)
+                if !failedLedgerRooms.contains(house.mediaRoomKey) {
+                    failedLedgerRooms.append(house.mediaRoomKey)
+                }
+                summary.cloudFailed += 1
+            }
+            try? houseModelContext?.save()
+            let failedRooms = Array(Set(failedMediaRooms + failedLedgerRooms))
+            syncCenter.finish(id: importID, success: false,
+                              failure: "批量提交失败：\(error.localizedDescription)")
+            return failedRooms
+        }
+        for house in houses {
+            let roomKey = house.mediaRoomKey
+            if batchFailures[roomKey] != nil {
                 HousePendingUploader.shared.markPending(roomKey)
                 SyncFailStore.mark(roomKey)
                 if !failedLedgerRooms.contains(roomKey) { failedLedgerRooms.append(roomKey) }
                 summary.cloudFailed += 1
+            } else {
+                house.cloudStatus = .both
+                SyncFailStore.clear(roomKey)
+                summary.cloudLedger += 1
             }
-            done += 1
-            syncCenter.advance(id: importID, done: done)
         }
         try? houseModelContext?.save()
         let failedRooms = Array(Set(failedMediaRooms + failedLedgerRooms))

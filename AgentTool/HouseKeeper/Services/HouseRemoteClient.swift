@@ -104,6 +104,13 @@ struct RemoteBackupList: Codable {
     let backups: [RemoteBackupRecord]
 }
 
+/// 批量写入单套结果：成功带服务器权威房源，失败带结构化错误。
+struct HouseBatchWriteOutcome {
+    let roomKey: String
+    let house: RemoteHouse?
+    let error: HouseAPIError?
+}
+
 struct RemoteOrphanMedia: Codable, Identifiable, Hashable {
     let objectKey: String
     let size: Int
@@ -699,6 +706,64 @@ final class HouseRemoteClient {
             throw HouseAPIError(message: "服务器未回写房源数据")
         }
         return house
+    }
+
+    /// 批量写入（一次 HTTP 提交多套）；返回每套的结果，单套失败不拖垮整批。
+    func upsertBatch(_ payloads: [HouseSyncPayload],
+                     expectedRevisions: [Int?],
+                     createOnly: [Bool]) async throws -> [HouseBatchWriteOutcome] {
+        var houses: [[String: Any]] = []
+        for (i, payload) in payloads.enumerated() {
+            var body = payload.json
+            body["operator"] = operatorName
+            body["originDeviceId"] = originDeviceId
+            if i < expectedRevisions.count, let expected = expectedRevisions[i] {
+                body["expectedRevision"] = expected
+            }
+            if i < createOnly.count, createOnly[i] { body["createOnly"] = true }
+            houses.append(body)
+        }
+        let body: [String: Any] = ["operator": operatorName,
+                                   "originDeviceId": originDeviceId,
+                                   "houses": houses]
+        let (data, http) = try await makeRequest("/api/house/houses:batch", method: "POST",
+                                                 body: body)
+        if http.statusCode == 401 {
+            throw HouseAPIError(message: "登录已失效，请重新接入服务器")
+        }
+        let result = try decode(HouseWriteResult.self, data: data)
+        guard let items = result.results else {
+            throw HouseAPIError(message: "服务器批量返回格式异常")
+        }
+        var outcomes: [HouseBatchWriteOutcome] = []
+        for (i, item) in items.enumerated() {
+            let key = i < payloads.count ? payloads[i].roomKey : ""
+            if item.ok == true, let house = item.house {
+                outcomes.append(HouseBatchWriteOutcome(roomKey: key, house: house, error: nil))
+            } else {
+                let text = item.detail ?? "保存失败"
+                let err: HouseAPIError
+                if item.error == "field_conflict" {
+                    let conflicts = (item.conflicts ?? []).compactMap { c -> [String: String]? in
+                        guard let field = c["field"] else { return nil }
+                        return ["field": field, "label": c["label"] ?? field,
+                                "base": c["base"] ?? "", "client": c["client"] ?? "",
+                                "server": c["server"] ?? ""]
+                    }
+                    err = HouseAPIError(message: text, fieldConflict: true,
+                                        fieldConflicts: conflicts)
+                } else if item.error == "revision_conflict" {
+                    err = HouseAPIError(message: "该房源刚被其他人修改，请刷新后再编辑",
+                                        revisionConflict: true)
+                } else if item.error == "duplicate_room" {
+                    err = HouseAPIError(message: text, duplicateRoom: true)
+                } else {
+                    err = HouseAPIError(message: text)
+                }
+                outcomes.append(HouseBatchWriteOutcome(roomKey: key, house: nil, error: err))
+            }
+        }
+        return outcomes
     }
 
     /// 硬删房源（服务器库物理移除，不进回收站）；成功只校验状态码，不再解码房源体

@@ -304,6 +304,54 @@ final class HouseSyncEngine: ObservableObject {
         return remote
     }
 
+    /// 批量导入专用：新收录房源一次 `:batch` 提交，返回失败房号→错误。
+    /// 已有服务器 revision 的房源不走批量（回单条 pushHouse，保留 base 字段合并语义）。
+    func pushHousesBatch(_ houses: [House]) async throws -> [String: Error] {
+        let fresh = houses.filter { revMap[$0.mediaRoomKey] == nil }
+        guard !fresh.isEmpty else { return [:] }
+        var payloads: [HouseSyncPayload] = []
+        for house in fresh {
+            let roomKey = house.mediaRoomKey
+            let pendingNames = Set(HouseMediaUploadQueue.pendingItems()
+                .filter { $0.roomKey == roomKey }
+                .map { $0.fileName })
+            let allowed: Set<String>? = pendingNames.isEmpty
+                ? nil
+                : Set(house.mediaItems.map { $0.fileName }).subtracting(pendingNames)
+            let mediaPayload = mediaArray(house, roomKey: roomKey, onlyNames: allowed)
+            payloads.append(HouseSyncPayload(
+                roomKey: roomKey, roomNo: house.roomNo, tower: house.tower,
+                landlord: house.landlord, layout: house.layout, price: house.price,
+                password: house.password, remark: house.remark,
+                status: house.statusRaw, media: mediaPayload,
+                base: nil, baseMedia: nil, removedMedia: nil))
+        }
+        let outcomes = try await HouseRemoteClient.shared.upsertBatch(
+            payloads,
+            expectedRevisions: Array(repeating: nil, count: payloads.count),
+            createOnly: Array(repeating: true, count: payloads.count))
+        var failures: [String: Error] = [:]
+        for outcome in outcomes {
+            if let remote = outcome.house {
+                setServerRevision(remote.revision, forKey: outcome.roomKey)
+                setTop(max(topRevision, remote.revision))
+                HouseBaseSnapshotStore.save(remote)
+                HouseServerMissingStore.remove(outcome.roomKey)
+            } else if let error = outcome.error {
+                failures[outcome.roomKey] = error
+            }
+        }
+        // 已有 revision 的房源保留单条字段合并；批量导入通常是新房，不常走这里。
+        for house in houses where revMap[house.mediaRoomKey] != nil {
+            do {
+                try await pushHouse(house)
+            } catch {
+                failures[house.mediaRoomKey] = error
+            }
+        }
+        return failures
+    }
+
     /// 服务器已硬删、本机仍残留待补传时，按“服务器为准”彻底清掉本机房源。
     /// 只动本地，不再请求服务器（避免已删除房源被二次操作）；返回实际清理套数。
     @discardableResult
