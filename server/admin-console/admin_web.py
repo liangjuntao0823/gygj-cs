@@ -12,13 +12,15 @@
   * self：推给对应绑定用户（电表账户操作用），需 notifyUser（hub userToken 或脱敏串）；
   * all：广播给所有参与该模块管理的用户（房源删除/改数据等）；
   * none：不推送。
-- 模块归属：电表改动 module="meter"，房源改动 module="house"。
+- 模块归属：电表改动 module="meter"。
+- 房源改动只写 outbox，由 house_api.deliver_pending 统一投递；后台不再二次直推。
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import threading
 import urllib.parse
 from pathlib import Path
 from typing import Any
@@ -129,6 +131,17 @@ def _resolve_user_token(admin: Any, hint: str) -> str:
 # ---------------------------------------------------------------------------
 # 路由
 # ---------------------------------------------------------------------------
+
+def _spawn_house_delivery(admin: Any, notify_scope: str) -> None:
+    """后台房源写完后只触发 outbox 投递，不直接调用 hub 广播。"""
+    if notify_scope == "none":
+        return
+    house = getattr(admin, "house", None)
+    if house is None:
+        return
+    t = threading.Thread(target=house.deliver_pending, daemon=True)
+    t.start()
+
 
 def route_request(handler: Any, method: str, path: str, admin: Any) -> bool:
     """返回 True 表示已处理；False 表示路径不属于后台，交给上层 404。"""
@@ -308,24 +321,34 @@ def route_request(handler: Any, method: str, path: str, admin: Any) -> bool:
         return True
     if len(segs) == 1 and method == "PUT":
         body = _read_body(handler)
-        res = admin.house.update(segs[0], body.get("fields") or {})
+        scope = str(body.get("notifyScope") or "all").lower()
+        notify_user_token = ""
+        if scope == "self":
+            notify_user_token = _resolve_user_token(admin, body.get("notifyUser", ""))
+            if not notify_user_token:
+                scope = "none"
+        res = admin.house.update(
+            segs[0], body.get("fields") or {},
+            notify_scope=scope, notify_user_token=notify_user_token)
         if res.get("ok"):
-            notify = _notify(admin, body.get("notifyScope", "all"), "house",
-                             "房源信息已更新", f"{segs[0]} 的资料由后台修改",
-                             body.get("notifyUser", ""), {"action": "update"})
-            res["notify"] = notify
+            _spawn_house_delivery(admin, scope)
+            res["notify"] = {"queued": scope != "none", "scope": scope}
         _send_json(handler, 200 if res.get("ok") else 400, res)
         return True
     if len(segs) == 2 and segs[1] in ("delete", "restore") and method == "POST":
         body = _read_body(handler)
         deleted = segs[1] == "delete"
-        res = admin.house.set_deleted(segs[0], deleted)
+        scope = str(body.get("notifyScope") or "all").lower()
+        notify_user_token = ""
+        if scope == "self":
+            notify_user_token = _resolve_user_token(admin, body.get("notifyUser", ""))
+            if not notify_user_token:
+                scope = "none"
+        res = admin.house.set_deleted(
+            segs[0], deleted, notify_scope=scope, notify_user_token=notify_user_token)
         if res.get("ok"):
-            notify = _notify(admin, body.get("notifyScope", "all"), "house",
-                             "房源已删除" if deleted else "房源已恢复",
-                             f"{segs[0]} 由后台{'删除' if deleted else '恢复'}",
-                             body.get("notifyUser", ""), {"action": segs[1]})
-            res["notify"] = notify
+            _spawn_house_delivery(admin, scope)
+            res["notify"] = {"queued": scope != "none", "scope": scope}
         _send_json(handler, 200 if res.get("ok") else 400, res)
         return True
     if len(segs) == 2 and segs[1] == "ledger" and method == "GET":

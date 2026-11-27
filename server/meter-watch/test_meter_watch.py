@@ -127,9 +127,11 @@ class TestEvaluator(unittest.TestCase):
         self.store = mw.Store(self.tmp.name)
         self.fake = FakePusher()
         self.engine = mw.Engine(self.store, pusher=self.fake)  # type: ignore[arg-type]
+        self.hub = _FakeHub({"ok": True, "sent": 1, "total": 1})
+        self.engine.hub = self.hub
         self.svc = dict(self.store.svc)
         self.svc.update({"low_remind_hours": 24, "off_remind_hours": 24, "notify_recovery": True})
-        self.tenant = {"bark_keys": ["k-iphone"]}
+        self.tenant = {"bark_keys": ["k-iphone"], "notify_user_token": "nt_test"}
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -144,8 +146,8 @@ class TestEvaluator(unittest.TestCase):
         titles = self.engine.evaluate_meter(self.svc, self.tenant, "u1", m, 30.0, now, period_seconds=period)
         self.assertEqual(len(titles), 1)
         self.assertIn("低电量", titles[0])
-        self.assertIn("1-2334上", self.fake.calls[-1][2])
-        self.assertIn("20 度", self.fake.calls[-1][2])
+        self.assertIn("1-2334上", self.hub.calls[-1]["body"])
+        self.assertIn("20 度", self.hub.calls[-1]["body"])
         self.assertTrue(m["low_active"])
         self.assertEqual(m["last_low_push"], now)
 
@@ -215,6 +217,8 @@ class TestFailureRound(unittest.TestCase):
         self.store = mw.Store(self.tmp.name)
         self.fake = FakePusher()
         self.engine = mw.Engine(self.store, pusher=self.fake)  # type: ignore[arg-type]
+        self.hub = _FakeHub({"ok": True, "sent": 1, "total": 1})
+        self.engine.hub = self.hub
         self.platform = _FakePlatform()
         self.engine.make_client = lambda svc: self.platform  # type: ignore[method-assign]
         self.store.svc["failure_alert_rounds"] = 3
@@ -223,6 +227,7 @@ class TestFailureRound(unittest.TestCase):
             "settings": {"openId": "ox", "lowThreshold": 30.0, "lowAlertEnabled": True},
             "meters": [{"uid": "u1", "room": "1-2423"}],
             "bark_keys": ["k1"],
+            "notify_user_token": "nt_test",
         }
 
     def tearDown(self):
@@ -232,15 +237,15 @@ class TestFailureRound(unittest.TestCase):
         ts = mw._new_tenant_state()
         for _ in range(2):
             self.engine.run_tenant("tok", self.store.svc, self.tenant, ts, False)
-        self.assertFalse(any("监控异常" in t for t in self.fake.titles()))
+        self.assertFalse(any("监控异常" in t for t in self.hub.titles()))
         self.engine.run_tenant("tok", self.store.svc, self.tenant, ts, False)
-        self.assertTrue(any("监控异常" in t for t in self.fake.titles()))
+        self.assertTrue(any("监控异常" in t for t in self.hub.titles()))
         self.assertEqual(ts["consecutive_failures"], 3)
 
         self.platform.fail = False
         self.engine.run_tenant("tok", self.store.svc, self.tenant, ts, False)
         self.assertEqual(ts["consecutive_failures"], 0)
-        self.assertTrue(any("监控恢复" in t for t in self.fake.titles()))
+        self.assertTrue(any("监控恢复" in t for t in self.hub.titles()))
 
 
 class TestStore(unittest.TestCase):
@@ -542,6 +547,9 @@ class _FakeHub:
                            "title": title, "body": body, "data": data, "subtitle": subtitle})
         return self.result
 
+    def titles(self):
+        return [c["title"] for c in self.calls]
+
 
 class TestNotifyHubIntegration(unittest.TestCase):
     def setUp(self):
@@ -577,13 +585,21 @@ class TestNotifyHubIntegration(unittest.TestCase):
         self.assertEqual(hub.calls[0]["type"], "low")
         self.assertEqual(self.fake.calls, [])      # hub 已受理，不再直推，避免重复
 
-    def test_push_fallback_when_hub_has_no_device(self):
+    def test_push_no_device_does_not_fallback(self):
         hub = _FakeHub({"ok": False, "sent": 0, "total": 0, "reason": "no_device"})
         self.engine.hub = hub
         tenant = {"notify_user_token": "nt_2", "bark_keys": ["k-legacy"]}
         sent = self.engine._push_tenant(self.svc, tenant, "T", "B", keys=["k-legacy"])
-        self.assertEqual(sent, 1)                  # FakePusher.push_many 返回 (1,1)
-        self.assertEqual(len(self.fake.calls), 1)  # 无设备可投时平滑降级旧直推
+        self.assertEqual(sent, 0)
+        self.assertEqual(self.fake.calls, [])      # 不再降级旧直推
+
+    def test_push_unbound_does_not_send(self):
+        hub = _FakeHub({"ok": True, "sent": 1, "total": 1})
+        self.engine.hub = hub
+        sent = self.engine._push_tenant(self.svc, {"bark_keys": ["k-legacy"]}, "T", "B")
+        self.assertEqual(sent, 0)
+        self.assertEqual(hub.calls, [])
+        self.assertEqual(self.fake.calls, [])
 
     def test_push_user_disabled_does_not_fallback(self):
         hub = _FakeHub({"ok": False, "sent": 0, "total": 0, "reason": "user_disabled"})
@@ -593,11 +609,11 @@ class TestNotifyHubIntegration(unittest.TestCase):
         self.assertEqual(sent, 0)
         self.assertEqual(self.fake.calls, [])      # 用户主动关通道，禁止全局 key 再打扰
 
-    def test_push_without_hub_keeps_legacy_path(self):
+    def test_push_without_hub_does_not_send(self):
         tenant = {"bark_keys": ["k-legacy"]}
         sent = self.engine._push_tenant(self.svc, tenant, "T", "B", keys=["k-legacy"])
-        self.assertEqual(sent, 1)
-        self.assertEqual(len(self.fake.calls), 1)
+        self.assertEqual(sent, 0)
+        self.assertEqual(self.fake.calls, [])
 
 
 class TestPeriodDedupAndEnrollIdempotent(unittest.TestCase):
@@ -606,6 +622,8 @@ class TestPeriodDedupAndEnrollIdempotent(unittest.TestCase):
         self.store = mw.Store(self.tmp.name)
         self.fake = FakePusher()
         self.engine = mw.Engine(self.store, pusher=self.fake)  # type: ignore[arg-type]
+        self.hub = _FakeHub({"ok": True, "sent": 1, "total": 1})
+        self.engine.hub = self.hub
         self.store.svc["enroll_code"] = "123456"
 
     def tearDown(self):
@@ -622,7 +640,7 @@ class TestPeriodDedupAndEnrollIdempotent(unittest.TestCase):
         return {"shengyu": 10, "zhuangtai": "合闸"}
 
     def test_low_alert_only_once_within_period(self):
-        svc, tenant = {}, {"bark_keys": ["k1"]}
+        svc, tenant = {}, {"bark_keys": ["k1"], "notify_user_token": "nt_test"}
         m = self._low_meter()
         first = self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 1000, period_seconds=3600)
         self.assertEqual(len(first), 1)
@@ -631,67 +649,67 @@ class TestPeriodDedupAndEnrollIdempotent(unittest.TestCase):
         m["low_active"] = False
         second = self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 1500, period_seconds=3600)
         self.assertEqual(second, [])
-        self.assertEqual(len(self.fake.calls), 1)
+        self.assertEqual(len(self.hub.calls), 1)
 
     def test_low_alert_again_after_period(self):
-        svc, tenant = {}, {"bark_keys": ["k1"]}
+        svc, tenant = {}, {"bark_keys": ["k1"], "notify_user_token": "nt_test"}
         m = self._low_meter()
         self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 1000, period_seconds=3600)
         m["low_active"] = False
         again = self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 5000, period_seconds=3600)
         self.assertEqual(len(again), 1)
-        self.assertEqual(len(self.fake.calls), 2)
+        self.assertEqual(len(self.hub.calls), 2)
 
     def test_low_alert_disabled_setting_suppresses_alert_and_recovery(self):
         svc = {"notify_recovery": True}
-        tenant = {"bark_keys": ["k1"], "settings": {"lowAlertEnabled": False}}
+        tenant = {"bark_keys": ["k1"], "notify_user_token": "nt_test", "settings": {"lowAlertEnabled": False}}
         m = self._low_meter()
         # 开关关闭：低电量不推告警
         sent = self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 1000, period_seconds=3600)
         self.assertEqual(sent, [])
-        self.assertEqual(self.fake.calls, [])
+        self.assertEqual(self.hub.calls, [])
         # 开关关闭：已记账低电量回升也不发恢复通知
         m["low_active"] = True
         m["shengyu"] = 40
         sent2 = self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 2000, period_seconds=3600)
         self.assertEqual(sent2, [])
-        self.assertEqual(self.fake.calls, [])
+        self.assertEqual(self.hub.calls, [])
         self.assertFalse(m["low_active"])  # 状态仍正常翻转，只是不打扰
 
     def test_low_alert_enabled_by_default(self):
-        svc, tenant = {}, {"bark_keys": ["k1"]}
+        svc, tenant = {}, {"bark_keys": ["k1"], "notify_user_token": "nt_test"}
         m = self._low_meter()
         sent = self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 1000, period_seconds=3600)
         self.assertEqual(len(sent), 1)
-        self.assertEqual(len(self.fake.calls), 1)
+        self.assertEqual(len(self.hub.calls), 1)
 
     def test_low_active_state_repeats_each_period(self):
         # 持续低电量（low_active 保持 True）：同一轮询期内抑制，超过一个轮询期复提醒一次
-        svc, tenant = {}, {"bark_keys": ["k1"]}
+        svc, tenant = {}, {"bark_keys": ["k1"], "notify_user_token": "nt_test"}
         m = self._low_meter()
         self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 1000, period_seconds=3600)
         self.assertTrue(m["low_active"])
         # 未超期：抑制
         self.assertEqual(self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 2000, period_seconds=3600), [])
-        self.assertEqual(len(self.fake.calls), 1)
+        self.assertEqual(len(self.hub.calls), 1)
         # 超期：复推
         again = self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 5000, period_seconds=3600)
         self.assertEqual(len(again), 1)
-        self.assertEqual(len(self.fake.calls), 2)
+        self.assertEqual(len(self.hub.calls), 2)
 
     def test_off_active_state_repeats_each_period(self):
         # 持续拉闸（off_active 保持 True）：同一轮询期内抑制，超过一个轮询期复提醒一次（与低电量口径一致）
-        svc, tenant = {}, {"bark_keys": ["k1"]}
+        svc, tenant = {}, {"bark_keys": ["k1"], "notify_user_token": "nt_test"}
         m = {"shengyu": 10, "zhuangtai": "拉闸"}
         self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 1000, period_seconds=3600)
         self.assertTrue(m["off_active"])
         # 未超期：抑制
         self.assertEqual(self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 2000, period_seconds=3600), [])
-        self.assertEqual(len(self.fake.calls), 1)
+        self.assertEqual(len(self.hub.calls), 1)
         # 超期：复推
         again = self.engine.evaluate_meter(svc, tenant, "0123", m, 30, 5000, period_seconds=3600)
         self.assertEqual(len(again), 1)
-        self.assertEqual(len(self.fake.calls), 2)
+        self.assertEqual(len(self.hub.calls), 2)
 
     def test_enroll_idempotent_same_user_and_device(self):
         t1 = self.store.enroll("123456", "iphone", user_token="nt_x")

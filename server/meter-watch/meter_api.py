@@ -350,34 +350,34 @@ class CloudHandler(BaseHTTPRequestHandler):
             if not auth:
                 return
             _, tenant = auth
-            svc = self.ctx.store.svc
             user_token = str(tenant.get("notify_user_token") or "")
-            # 已绑定统一推送用户：测试事件也走通知中心，顺带验证框架投递与设备隔离
-            if user_token and getattr(self.ctx, "hub", None) is not None:
-                try:
-                    res = self.ctx.hub.dispatch(
-                        user_token, "meter", "test",
-                        "公寓管家云端值守测试", "收到此条说明统一推送通道（电表告警）链路正常。")
-                    total = int(res.get("total") or 0)
-                    if total > 0:
-                        self._send({"ok": int(res.get("sent") or 0) > 0,
-                                    "sent": int(res.get("sent") or 0), "total": total,
-                                    "via": "notify-hub"})
-                        return
-                    if res.get("reason") in ("user_disabled", "module_disabled"):
-                        self._send({"ok": False, "sent": 0, "total": 0,
-                                    "error": "notify_disabled", "reason": res.get("reason")}, 409)
-                        return
-                except Exception:
-                    log.exception("test-push 通知中心异常，降级 Bark 直推")
-            keys = mw.Engine.tenant_keys(svc, tenant)
-            if not keys:
+            if not user_token:
                 self._send({"ok": False, "sent": 0, "total": 0,
-                            "error": "no_bark_device"})
+                            "error": "notify_user_unbound",
+                            "note": "请先在 App 的推送通道里登记并绑定 Bark 设备"}, 409)
                 return
-            ok, total = self.ctx.engine.pusher(svc).push_many(
-                keys, "公寓管家云端值守测试", "收到此条说明云端电表告警推送链路正常。")
-            self._send({"ok": ok > 0, "sent": ok, "total": total, "via": "legacy"})
+            if getattr(self.ctx, "hub", None) is None:
+                self._send({"ok": False, "sent": 0, "total": 0,
+                            "error": "notify_hub_unavailable"}, 503)
+                return
+            try:
+                res = self.ctx.hub.dispatch(
+                    user_token, "meter", "test",
+                    "公寓管家云端值守测试", "收到此条说明统一推送通道（电表告警）链路正常。")
+                total = int(res.get("total") or 0)
+                if total > 0:
+                    self._send({"ok": int(res.get("sent") or 0) > 0,
+                                "sent": int(res.get("sent") or 0), "total": total,
+                                "via": "notify-hub"})
+                    return
+                self._send({"ok": False, "sent": 0, "total": 0,
+                            "error": "notify_disabled" if res.get("reason") in
+                            ("user_disabled", "module_disabled") else "no_device",
+                            "reason": res.get("reason")}, 409)
+            except Exception:
+                log.exception("test-push 通知中心异常")
+                self._send({"ok": False, "sent": 0, "total": 0,
+                            "error": "notify_hub_error"}, 502)
             return
         self._send({"ok": False, "error": "not_found"}, 404)
 
@@ -479,7 +479,7 @@ def serve(store: mw.Store, engine: mw.Engine) -> int:
     admin_auth = aauth.AdminAuth(store.home)
     admin_sys = asym.SystemBoard()
     admin_meter = amet.MeterConsole(store, hub)
-    admin_house = ahou.HouseConsole(house_store)
+    admin_house = ahou.HouseConsole(house_store, hub)
     admin_push = apush.PushConsole(hub, admin_meter)
     admin_ctx = types.SimpleNamespace(auth=admin_auth, sys=admin_sys,
                                        meter=admin_meter, house=admin_house,

@@ -316,7 +316,9 @@ class HouseStore:
     # ------------------------------------------------------------------
     def upsert_house(self, payload: dict[str, Any], operator: str,
                      origin_device_id: str = "",
-                     expected_revision: int | None = None) -> dict[str, Any]:
+                     expected_revision: int | None = None,
+                     notify_scope: str = "all",
+                     notify_user_token: str = "") -> dict[str, Any]:
         """新增或更新一套房源。payload 字段用客户端命名（roomNo/tower/...）。"""
         room_key = str(payload.get("roomKey") or "").strip()
         if not room_key:
@@ -339,9 +341,10 @@ class HouseStore:
             now = now_local()
             if existing is None:
                 return self._insert(conn, room_key, fields, media, operator,
-                                    origin_device_id, now)
+                                    origin_device_id, now, notify_scope, notify_user_token)
             return self._update(conn, existing, room_key, fields, media, operator,
-                                origin_device_id, now, expected_revision)
+                                origin_device_id, now, expected_revision,
+                                notify_scope, notify_user_token)
 
     def import_house(self, payload: dict[str, Any],
                      ledger_events: list[dict[str, Any]] | None = None,
@@ -424,7 +427,8 @@ class HouseStore:
             return self.get_house(room_key)  # type: ignore[return-value]
 
     def _insert(self, conn, room_key, fields, media, operator,
-                origin_device_id, now) -> dict[str, Any]:
+                origin_device_id, now, notify_scope="all",
+                notify_user_token="") -> dict[str, Any]:
         event_id = "ev_" + secrets.token_hex(10)
         # revision 为全局单调递增版本号（增量同步基准），新增取当前最大 +1
         top = conn.execute("SELECT COALESCE(MAX(revision),0) AS m FROM houses").fetchone()["m"]
@@ -443,12 +447,16 @@ class HouseStore:
             (event_id, room_key, iso(now), operator, "新增房源", ""))
         title, body = self._compose_new(room_key, fields, operator, now)
         self._write_outbox(conn, event_id, room_key, "新增房源", operator,
-                           title, body, {"fields": fields}, origin_device_id, now)
+                           title, body, {"fields": fields,
+                                         "notifyScope": notify_scope,
+                                         "notifyUserToken": notify_user_token},
+                           origin_device_id, now)
         conn.commit()
         return self.get_house(room_key)  # type: ignore[return-value]
 
     def _update(self, conn, existing, room_key, fields, media, operator,
-                origin_device_id, now, expected_revision) -> dict[str, Any]:
+                origin_device_id, now, expected_revision, notify_scope="all",
+                notify_user_token="") -> dict[str, Any]:
         old_rev = int(existing["revision"])
         if expected_revision is not None and expected_revision != old_rev:
             raise RevisionConflict(room_key, expected_revision, old_rev)
@@ -487,7 +495,9 @@ class HouseStore:
                                           operator, now)
         data = {"fieldChanges": [{"field": k, "oldValue": _display(k, o),
                                    "newValue": _display(k, n)} for k, o, n in changes],
-                "mediaChanged": media_changed}
+                "mediaChanged": media_changed,
+                "notifyScope": notify_scope,
+                "notifyUserToken": notify_user_token}
         self._write_outbox(conn, event_id, room_key, action, operator, title, body,
                            data, origin_device_id, now)
         conn.commit()
@@ -503,7 +513,8 @@ class HouseStore:
     # 软删除 / 恢复
     # ------------------------------------------------------------------
     def set_deleted(self, room_key: str, deleted: bool, operator: str,
-                    origin_device_id: str = "") -> dict[str, Any]:
+                    origin_device_id: str = "", notify_scope: str = "all",
+                    notify_user_token: str = "") -> dict[str, Any]:
         with self._lock:
             conn = self._conn
             existing = conn.execute(
@@ -529,7 +540,10 @@ class HouseStore:
             title = f"房源{('删除' if deleted else '恢复')} · {room_key}"
             body = f"{operator} {action}（{human_time(now)}）"
             self._write_outbox(conn, event_id, room_key, action, operator, title, body,
-                               {"deleted": deleted}, origin_device_id, now)
+                               {"deleted": deleted,
+                                "notifyScope": notify_scope,
+                                "notifyUserToken": notify_user_token},
+                               origin_device_id, now)
             conn.commit()
             return self.get_house(room_key)  # type: ignore[return-value]
 

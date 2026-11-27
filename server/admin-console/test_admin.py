@@ -278,6 +278,20 @@ class HouseConsoleTests(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertEqual(res["error"], "not_found")
 
+    def test_update_writes_notify_scope_to_outbox(self) -> None:
+        res = self.console.update("1-2059", {"price": 1100},
+                                  notify_scope="self", notify_user_token="nt_x")
+        self.assertTrue(res["ok"])
+        last = self.store.pending_outbox()[-1]
+        self.assertEqual(last["data"]["notifyScope"], "self")
+        self.assertEqual(last["data"]["notifyUserToken"], "nt_x")
+
+    def test_delete_writes_notify_scope_to_outbox(self) -> None:
+        res = self.console.set_deleted("2-1006", True, notify_scope="none")
+        self.assertTrue(res["ok"])
+        last = self.store.pending_outbox()[-1]
+        self.assertEqual(last["data"]["notifyScope"], "none")
+
     def test_delete_and_restore(self) -> None:
         res = self.console.set_deleted("2-1006", True)
         self.assertTrue(res["ok"])

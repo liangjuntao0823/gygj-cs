@@ -878,31 +878,32 @@ class Engine:
                      title: str, body: str, keys: list[str] | None = None,
                      event_type: str = "alert", data: dict[str, Any] | None = None,
                      subtitle: str = "") -> int:
-        # 优先走统一通知中心：按租户绑定的用户投到该用户自己的 Bark 设备，实现多用户隔离
-        user_token = str(tenant.get("notify_user_token") or "")
-        if user_token and self.hub is not None:
-            try:
-                res = self.hub.dispatch(user_token, "meter", event_type, title, body,
-                                        data=data or {}, subtitle=subtitle)
-                total = int(res.get("total") or 0)
-                if total > 0:
-                    # 已找到用户设备并完成投递尝试（含全部失败 sent=0），不再降级重复推
-                    return int(res.get("sent") or 0)
-                reason = str(res.get("reason") or "")
-                if reason in ("user_disabled", "module_disabled"):
-                    log.info("用户在推送中心关闭该类通知（%s），不降级直推：%s", reason, title)
-                    return 0
-                # unknown_user / no_device：测试期平滑落到旧直推（租户自带 key + 全局兜底）
-                log.info("通知中心暂无可投设备（%s），降级租户直推：%s", reason or "empty", title)
-            except Exception:
-                log.exception("通知中心投递异常，降级 Bark 直推：%s", title)
+        """电表告警只走统一推送中心。
 
-        keys = keys if keys is not None else self.tenant_keys(svc, tenant)
-        if not keys:
-            log.info("（未配置 Bark 接收设备，仅记录告警）%s %s", title, body)
+        租户必须先在 App 里登记推送用户并绑定 Bark 设备；没有绑定时宁可
+        记录日志、返回 0，也不再回落到租户 bark_keys / 全局兜底 key。
+        keys 参数仅为兼容旧调用保留，不参与发送。
+        """
+        user_token = str(tenant.get("notify_user_token") or "")
+        if not user_token:
+            log.info("租户未绑定推送用户，电表告警不发送：%s", title)
             return 0
-        ok, _ = self.pusher(svc).push_many(keys, title, body)
-        return ok
+        if self.hub is None:
+            log.error("推送中心未装配，电表告警无法发送：%s", title)
+            return 0
+        try:
+            res = self.hub.dispatch(user_token, "meter", event_type, title, body,
+                                    data=data or {}, subtitle=subtitle)
+            total = int(res.get("total") or 0)
+            if total > 0:
+                # 已找到用户设备并完成投递尝试（含全部失败 sent=0）
+                return int(res.get("sent") or 0)
+            reason = str(res.get("reason") or "")
+            log.info("推送中心没有可投设备（%s），本次不发送：%s", reason or "empty", title)
+            return 0
+        except Exception:
+            log.exception("推送中心投递异常，本次不发送：%s", title)
+            return 0
 
     def _startup_summary(self, svc: dict[str, Any], tenant: dict[str, Any],
                         ts: dict[str, Any], threshold: float) -> None:

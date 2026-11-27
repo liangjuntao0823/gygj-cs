@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import urllib.parse
@@ -46,21 +47,62 @@ def _bearer(handler: Any) -> str:
     return h[7:].strip() if h.startswith("Bearer ") else ""
 
 
+_DELIVER_LOCK = threading.Lock()
+
+
+def _public_event_data(raw: Any) -> dict[str, Any]:
+    """投递事件里不携带内部通知范围字段，避免把目标用户 token 带进事件详情。"""
+    data = dict(raw) if isinstance(raw, dict) else {}
+    data.pop("notifyScope", None)
+    data.pop("notifyUserToken", None)
+    return data
+
+
 def deliver_pending(store: Any, hub: Any) -> None:
-    """把待投递 outbox 逐条广播；成功标记 sent，失败留 pending 等下轮重试。"""
+    """把待投递 outbox 逐条投递；同一进程同一时刻只允许一个投递者。
+
+    这是单进程部署的单飞锁：后台保存、App 保存、值守 tick 同时触发时，
+    不会再有两条线程同时拿到同一条 pending outbox 而重复广播。
+    """
+    if hub is None:
+        return
+    if not _DELIVER_LOCK.acquire(blocking=False):
+        return
     try:
         for item in store.pending_outbox(limit=50):
-            res = hub.broadcast(
-                "house", item["action"], item["title"], item["body"],
-                exclude_device_id=item["originDeviceId"], data=item["data"])
-            # 标记 sent 的两种情形：①至少一台设备投递成功(ok)；②无任何目标设备
-            # (total=0)，事件已在账本可追溯，不永久堆积。有设备却全部失败则保留
-            # pending，交由 worker 定时分支下轮重试，避免丢推送。
-            if res.get("ok") or res.get("total", 0) == 0:
+            data = item.get("data") if isinstance(item.get("data"), dict) else {}
+            scope = str(data.get("notifyScope") or "all").lower()
+            public_data = _public_event_data(data)
+
+            if scope == "none":
+                store.mark_outbox(item["id"], "skipped")
+                continue
+
+            if scope == "self":
+                target = str(data.get("notifyUserToken") or "")
+                if not target:
+                    store.mark_outbox(item["id"], "failed")
+                    continue
+                res = hub.dispatch(
+                    target, "house", item["action"], item["title"], item["body"],
+                    data=public_data)
+            else:
+                res = hub.broadcast(
+                    "house", item["action"], item["title"], item["body"],
+                    exclude_device_id=item["originDeviceId"], data=public_data)
+
+            # broadcast 没有目标设备时允许标记 sent（账本已可追溯，不永久堆积）。
+            # 全部目标失败则保留 pending，交由值守 tick 下一轮重试。
+            if res.get("ok") or (scope != "self" and res.get("total", 0) == 0):
                 store.mark_outbox(item["id"], "sent")
+            elif scope == "self" and res.get("reason") in ("unknown_user", "no_device",
+                                                            "module_access_denied",
+                                                            "user_disabled", "module_disabled"):
+                store.mark_outbox(item["id"], "failed")
     except Exception:  # 单条失败不影响其余，下轮兜底继续
-        import logging
         logging.getLogger("house-api").exception("outbox 投递异常")
+    finally:
+        _DELIVER_LOCK.release()
 
 
 def _spawn_deliver(store: Any, hub: Any) -> None:

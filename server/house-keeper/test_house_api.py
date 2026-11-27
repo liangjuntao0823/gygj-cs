@@ -1,3 +1,4 @@
+import threading
 import unittest
 
 import house_api
@@ -22,14 +23,21 @@ class FakeHub:
 
     def broadcast(self, module, action, title, body,
                   exclude_device_id="", data=None):
-        self.calls.append({"module": module, "action": action,
-                           "exclude": exclude_device_id})
+        self.calls.append({"kind": "broadcast", "module": module, "action": action,
+                           "exclude": exclude_device_id, "data": data})
+        return dict(self._result)
+
+    def dispatch(self, user_token, module, event_type, title, body,
+                 data=None, idem_key=None, level=None, subtitle=""):
+        self.calls.append({"kind": "dispatch", "user": user_token, "module": module,
+                           "type": event_type, "data": data})
         return dict(self._result)
 
 
-def _item(i):
+def _item(i, scope="all", token=""):
     return {"id": i, "action": "编辑保存", "title": "t", "body": "b",
-            "data": {}, "originDeviceId": "dev_x"}
+            "data": {"notifyScope": scope, "notifyUserToken": token},
+            "originDeviceId": "dev_x"}
 
 
 class DeliverPendingTests(unittest.TestCase):
@@ -55,6 +63,58 @@ class DeliverPendingTests(unittest.TestCase):
         store = FakeStore([_item(4)])
         house_api.deliver_pending(store, None)
         self.assertEqual(store.marked, [])
+
+    def test_none_scope_skips(self):
+        store = FakeStore([_item(5, scope="none")])
+        hub = FakeHub({"ok": True, "sent": 1, "total": 1})
+        house_api.deliver_pending(store, hub)
+        self.assertEqual(store.marked, [(5, "skipped")])
+        self.assertEqual(hub.calls, [])
+
+    def test_self_scope_dispatches_only_target(self):
+        store = FakeStore([_item(6, scope="self", token="nt_target")])
+        hub = FakeHub({"ok": True, "sent": 1, "total": 1})
+        house_api.deliver_pending(store, hub)
+        self.assertEqual(store.marked, [(6, "sent")])
+        self.assertEqual(len(hub.calls), 1)
+        self.assertEqual(hub.calls[0]["kind"], "dispatch")
+        self.assertEqual(hub.calls[0]["user"], "nt_target")
+        self.assertNotIn("notifyScope", hub.calls[0]["data"])
+        self.assertNotIn("notifyUserToken", hub.calls[0]["data"])
+
+    def test_self_scope_without_target_fails(self):
+        store = FakeStore([_item(7, scope="self")])
+        hub = FakeHub({"ok": True, "sent": 1, "total": 1})
+        house_api.deliver_pending(store, hub)
+        self.assertEqual(store.marked, [(7, "failed")])
+        self.assertEqual(hub.calls, [])
+
+
+class SlowStore(FakeStore):
+    def __init__(self, items):
+        super().__init__(items)
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def pending_outbox(self, limit=50):
+        self.started.set()
+        self.release.wait(timeout=1.0)
+        return super().pending_outbox(limit)
+
+
+class SingleFlightTests(unittest.TestCase):
+    def test_two_callers_do_not_duplicate_same_outbox(self):
+        store = SlowStore([_item(8)])
+        hub = FakeHub({"ok": True, "sent": 1, "total": 1})
+        t = threading.Thread(target=house_api.deliver_pending, args=(store, hub))
+        t.start()
+        self.assertTrue(store.started.wait(timeout=1.0))
+        # 第一个投递者卡在 pending_outbox 查询里，第二个调用应直接返回
+        house_api.deliver_pending(store, hub)
+        store.release.set()
+        t.join(timeout=2.0)
+        self.assertEqual(store.marked, [(8, "sent")])
+        self.assertEqual(len(hub.calls), 1)
 
 
 class FakeAuthHandler:

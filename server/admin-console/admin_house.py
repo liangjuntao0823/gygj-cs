@@ -40,8 +40,22 @@ def _matches(house: dict[str, Any], q: str, tower: str, status: str) -> bool:
 
 
 class HouseConsole:
-    def __init__(self, store: Any) -> None:
+    def __init__(self, store: Any, hub: Any = None) -> None:
         self.store = store
+        self.hub = hub
+
+    def deliver_pending(self) -> None:
+        """后台写完房源后立即尝试投递 outbox；真正的发送只走 house_api 一条路。"""
+        if self.hub is None:
+            return
+        try:
+            import house_api as ha
+        except ImportError:
+            import sys
+            from pathlib import Path as _P
+            sys.path.insert(0, str(_P(__file__).resolve().parent.parent / "house-keeper"))
+            import house_api as ha
+        ha.deliver_pending(self.store, self.hub)
 
     def list(self, q: str = "", tower: str = "", status: str = "",
              include_deleted: bool = True) -> dict[str, Any]:
@@ -57,7 +71,8 @@ class HouseConsole:
         house["ledger"] = self.store.ledger(room_key)
         return house
 
-    def update(self, room_key: str, fields: dict[str, Any]) -> dict[str, Any]:
+    def update(self, room_key: str, fields: dict[str, Any], notify_scope: str = "all",
+               notify_user_token: str = "") -> dict[str, Any]:
         existing = self.store.get_house(room_key, with_media=False)
         if existing is None:
             return {"ok": False, "error": "not_found"}
@@ -74,14 +89,19 @@ class HouseConsole:
             "media": existing.get("media", []),
         }
         try:
-            doc = self.store.upsert_house(payload, operator="admin", origin_device_id="admin-web")
+            doc = self.store.upsert_house(
+                payload, operator="admin", origin_device_id="admin-web",
+                notify_scope=notify_scope, notify_user_token=notify_user_token)
             return {"ok": True, "house": doc}
         except Exception as e:
             return {"ok": False, "error": type(e).__name__, "detail": str(e)[:200]}
 
-    def set_deleted(self, room_key: str, deleted: bool) -> dict[str, Any]:
+    def set_deleted(self, room_key: str, deleted: bool, notify_scope: str = "all",
+                    notify_user_token: str = "") -> dict[str, Any]:
         try:
-            doc = self.store.set_deleted(room_key, deleted, "admin", "admin-web")
+            doc = self.store.set_deleted(
+                room_key, deleted, "admin", "admin-web",
+                notify_scope=notify_scope, notify_user_token=notify_user_token)
             return {"ok": True, **doc}
         except Exception as e:
             return {"ok": False, "error": type(e).__name__, "detail": str(e)[:200]}
