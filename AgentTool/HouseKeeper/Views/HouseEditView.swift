@@ -1084,8 +1084,10 @@ struct HouseEditView: View {
                 let remote = try await HouseSyncEngine.shared.pushHouse(
                     target, mediaFileNames: allowedNames)
                 // 改名：清理服务器上旧房号的记录与磁盘媒体（后端级联删除；失败不阻断，留待对账清理）
+                var renamePurgeError: String?
                 if kind == .rename, !oldRoomKey.isEmpty, oldRoomKey != remote.roomKey {
-                    try? await HouseRemoteClient.shared.delete(oldRoomKey)
+                    do { try await HouseRemoteClient.shared.delete(oldRoomKey) }
+                    catch { renamePurgeError = error.localizedDescription }
                 }
                 // 旧正式版规则：服务器推送成功后才落操作日志（本机+云端同一条），
                 // 动作名直接用「新增房源 / 修改备注 / 修改租金…」，失败不再先留一条假成功。
@@ -1099,9 +1101,15 @@ struct HouseEditView: View {
                     }
                 }
                 if kind == .rename && !oldRoomKey.isEmpty && oldRoomKey != remote.roomKey {
-                    BackupLogStore.log(category: "房源", action: "房号迁移", result: "成功",
-                                       detail: "房号迁移（\(oldRoomKey) → \(remote.roomKey)）：服务器旧记录已清理",
-                                       room: remote.roomKey, cloud: true)
+                    if let renamePurgeError {
+                        BackupLogStore.log(category: "房源", action: "房号迁移", result: "部分失败",
+                                           detail: "房号迁移（\(oldRoomKey) → \(remote.roomKey)）：新名已建好，旧记录清理失败：\(renamePurgeError)（下次同步再清）",
+                                           room: remote.roomKey, cloud: true)
+                    } else {
+                        BackupLogStore.log(category: "房源", action: "房号迁移", result: "成功",
+                                           detail: "房号迁移（\(oldRoomKey) → \(remote.roomKey)）：服务器旧记录已清理",
+                                           room: remote.roomKey, cloud: true)
+                    }
                 }
                 await MainActor.run {
                     if !mediaSnapshots.isEmpty { SyncTaskCenter.shared.discard(id: taskID) }
