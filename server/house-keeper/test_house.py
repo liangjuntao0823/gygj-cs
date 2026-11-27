@@ -112,6 +112,22 @@ class HouseStoreTests(unittest.TestCase):
         # outbox 仍写一条删除事件，供其他接入设备同步本地删除
         self.assertEqual(len(self.store.pending_outbox()), before_outbox + 1)
 
+    def test_edit_after_hard_delete_does_not_resurrect(self):
+        self.store.upsert_house(make_house(), operator="A")
+        self.store.hard_delete("1-2059", "B")
+        # 另一台离线设备仍拿旧修订号提交编辑：必须报冲突，不能插回新房源
+        with self.assertRaises(hs_mod.RevisionConflict):
+            self.store.upsert_house(make_house(price=999), operator="A",
+                                   expected_revision=1)
+        self.assertIsNone(self.store.get_house("1-2059"))
+
+    def test_hard_delete_is_idempotent(self):
+        self.store.upsert_house(make_house(), operator="A")
+        self.assertTrue(self.store.hard_delete("1-2059", "A")["hardDelete"])
+        second = self.store.hard_delete("1-2059", "B")
+        self.assertTrue(second["hardDelete"])
+        self.assertTrue(second.get("alreadyDeleted"))
+
     def test_incremental_since(self):
         self.store.upsert_house(make_house("1-2059"), operator="涛(iPhone)")
         self.store.upsert_house(make_house("2-1418", tower=2, media=[{"objectKey": "h/2-1418/a.jpg",

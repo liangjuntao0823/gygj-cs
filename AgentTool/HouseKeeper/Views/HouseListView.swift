@@ -1207,7 +1207,7 @@ struct HouseListView: View {
                 ProgressView(value: deleteTotal == 0 ? 0 : Double(deleteDone) / Double(deleteTotal))
                     .progressViewStyle(.linear)
                     .frame(width: 210)
-                Text("\(deleteDone)/\(deleteTotal)" + (deleteCurrentRoom.isEmpty ? "" : " · h/\(deleteCurrentRoom)/"))
+                Text("\(deleteDone)/\(deleteTotal)" + (deleteCurrentRoom.isEmpty ? "" : " · 房号 \(deleteCurrentRoom)"))
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -1278,7 +1278,7 @@ struct HouseListView: View {
                 HStack(spacing: 8) {
                     Image(systemName: "icloud.and.arrow.down").font(.footnote)
                     VStack(alignment: .leading, spacing: 1) {
-                        Text("检测到云端有更新")
+                        Text("检测到服务器有更新")
                             .font(.footnote.weight(.semibold))
                         Text("点左上角刷新按钮同步")
                             .font(.caption2).opacity(0.85)
@@ -1293,7 +1293,7 @@ struct HouseListView: View {
                             .padding(.leading, 8)
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("关闭云端更新提示")
+                    .accessibilityLabel("关闭服务器更新提示")
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 8)
@@ -1488,7 +1488,7 @@ struct HouseListView: View {
             .map { MediaStore.url(for: $0.fileName, roomKey: house.mediaRoomKey) }
             .filter { FileManager.default.fileExists(atPath: $0.path) }
         guard !urls.isEmpty else {
-            infoMessage = "这套房源没有可分享的视频；视频若还在云端，先下载到本地再分享"
+            infoMessage = "这套房源没有可分享的视频；视频若还在服务器，先下载到本地再分享"
             showInfoAlert = true
             singleShareHouse = nil
             return
@@ -1722,7 +1722,7 @@ struct HouseListView: View {
         }.filter { !$0.isEmpty }
         let flat = videoURLs.flatMap { $0 }
         guard !flat.isEmpty else {
-            infoMessage = "选中的房源没有可分享的视频；视频若还在云端，先下载到本地再分享"
+            infoMessage = "选中的房源没有可分享的视频；视频若还在服务器，先下载到本地再分享"
             showInfoAlert = true
             return
         }

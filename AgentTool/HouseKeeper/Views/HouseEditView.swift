@@ -119,7 +119,7 @@ struct HouseEditView: View {
                 Button("仅存本机", role: .destructive) { performSave() }
                 Button("取消", role: .cancel) {}
             } message: {
-                Text("检测不到网络连接，本次保存只会存在本机，不会同步到云端。联网后可在房源列表刷新同步。")
+                Text("检测不到网络连接，本次保存只会存在本机，不会同步到服务器。联网后可在房源列表点左上角刷新同步。")
             }
             // v1.42：保存后上传云端失败 → 提示已存本机、待网络恢复自动补传（媒体已入队，账本恢复后刷新同步）
             .alert("已保存到本机", isPresented: Binding(
@@ -1163,7 +1163,7 @@ struct HouseEditView: View {
         // v2.62：日志只记数量，不再拼文件名（用户口径：文件只分别记数量）
         let upParts = HouseLedgerFormat.mediaParts(images: upSplit.images, videos: upSplit.videos, includeNames: false)
         if failed > 0 {
-            let upAction = isNewHouse ? "新增房源" : "新增媒体（本地→云端）"
+            let upAction = isNewHouse ? "新增房源" : "新增媒体（本地→服务器）"
             let upResult = isNewHouse && failed >= total ? "失败" : "部分失败"
             let upDetail = isNewHouse
                 ? HouseMediaLogFormat.failureDetail(images: upSplit.images.count, videos: upSplit.videos.count, error: lastError)
@@ -1172,15 +1172,15 @@ struct HouseEditView: View {
                               detail: upDetail, room: roomKey, cloud: true)
             await MainActor.run {
                 if pendingUploadTip == nil {
-                    pendingUploadTip = "房源已保存到本机；媒体上传云端失败（共 \(failed) 个），已挂到「同步任务中心」，联网后在任务条里点重试。"
+                    pendingUploadTip = "房源已保存到本机；媒体上传服务器失败（共 \(failed) 个），已挂到「同步任务中心」，联网后在任务条里点重试。"
                 }
             }
         } else if success > 0 && writeSuccessLog {
             // 单一类型时动作名直接写「新增图片/新增视频」，混合时写「新增媒体」
             let upAction: String
-            if upSplit.videos.isEmpty { upAction = "新增图片（本地→云端）" }
-            else if upSplit.images.isEmpty { upAction = "新增视频（本地→云端）" }
-            else { upAction = "新增媒体（本地→云端）" }
+            if upSplit.videos.isEmpty { upAction = "新增图片（本地→服务器）" }
+            else if upSplit.images.isEmpty { upAction = "新增视频（本地→服务器）" }
+            else { upAction = "新增媒体（本地→服务器）" }
             // 成功事件已由 HouseLedgerStore.append 写入云端 ops；这里只留本地日志，避免重复两条。
             BackupLogStore.log(category: "房源", action: upAction, result: "成功",
                               detail: upParts.joined(separator: "；"), room: roomKey, cloud: false)

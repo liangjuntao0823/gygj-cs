@@ -351,6 +351,11 @@ class HouseStore:
                 "SELECT * FROM houses WHERE room_key=?", (room_key,)).fetchone()
             now = now_local()
             if existing is None:
+                # 另一台设备已把这套房“双端删除”后，本机仍拿着旧修订号提交编辑：
+                # 不能当新房价插回去（否则就是用户最怕的“删了又复活”）。
+                # expectedRevision 只在编辑既有房源时携带；真新建不会带。
+                if expected_revision is not None:
+                    raise RevisionConflict(room_key, expected_revision, 0)
                 return self._insert(conn, room_key, fields, media, operator,
                                     origin_device_id, now, notify_scope, notify_user_token)
             return self._update(conn, existing, room_key, fields, media, operator,
@@ -571,7 +576,10 @@ class HouseStore:
             existing = conn.execute(
                 "SELECT * FROM houses WHERE room_key=?", (room_key,)).fetchone()
             if existing is None:
-                raise HouseNotFound(room_key)
+                # 删除幂等：另一台设备已经删掉时，本次删除按成功处理，
+                # 客户端照常清本地，不会因 500 留在“删不掉”的状态。
+                return {"ok": True, "roomKey": room_key, "hardDelete": True,
+                        "alreadyDeleted": True}
             now = now_local()
             event_id = "ev_" + secrets.token_hex(10)
             action = "删除房源"

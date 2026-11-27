@@ -341,13 +341,16 @@ class NotifyScopeTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class FakeHandler:
-    def __init__(self, path: str, body: dict[str, Any] | None = None, cookie: str = ""):
+    def __init__(self, path: str, body: dict[str, Any] | None = None, cookie: str = "",
+                 headers: dict[str, str] | None = None):
         import io
         self.path = path
         self._body = body
         raw = json.dumps(body or {}).encode("utf-8")
         self.headers = {"Cookie": cookie, "Content-Type": "application/json",
                         "Content-Length": str(len(raw))}
+        if headers:
+            self.headers.update(headers)
         self.status = 0
         self.sent: dict[str, Any] = {}
         self.cookies: dict[str, str] = {}
@@ -469,6 +472,34 @@ class RouteTests(unittest.TestCase):
         self.assertTrue(aw.route_request(h2, "POST", "/admin/api/house/houses/1-2059/restore", admin))
         self.assertEqual(h2.status, 410)
         self.assertEqual(h2.json_body()["error"], "recycle_bin_removed")
+
+    def test_house_media_route_serves_inline_and_range(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        auth = aauth.AdminAuth(tmp.name)
+        store = hs.HouseStore(Path(tmp.name) / "house.db")
+        self.addCleanup(store.close)
+        rel = store.media.save_house_media("1-2059", "a.jpg", b"0123456789")
+        self.assertEqual(rel, "houses/1-2059/a.jpg")
+        admin = type("A", (), {"auth": auth, "sys": None, "meter": None,
+                               "house": ahou.HouseConsole(store), "hub": FakeHub({})})()
+        login = FakeHandler("/admin/api/login", {"username": "admin", "password": "admin"})
+        aw.route_request(login, "POST", "/admin/api/login", admin)
+        cookie = f"admin_session={login.cookies['admin_session']}"
+        h = FakeHandler("/admin/api/house/media/1-2059/a.jpg", cookie=cookie)
+        self.assertTrue(aw.route_request(h, "GET", "/admin/api/house/media/1-2059/a.jpg", admin))
+        self.assertEqual(h.status, 200)
+        self.assertEqual(h._buf.getvalue(), b"0123456789")
+        self.assertEqual(h.sent.get("Content-Type"), "image/jpeg")
+        r = FakeHandler("/admin/api/house/media/1-2059/a.jpg", cookie=cookie,
+                        headers={"Range": "bytes=2-4"})
+        self.assertTrue(aw.route_request(r, "GET", "/admin/api/house/media/1-2059/a.jpg", admin))
+        self.assertEqual(r.status, 206)
+        self.assertEqual(r._buf.getvalue(), b"234")
+        self.assertEqual(r.sent.get("Content-Range"), "bytes 2-4/10")
+        missing = FakeHandler("/admin/api/house/media/1-2059/none.jpg", cookie=cookie)
+        self.assertTrue(aw.route_request(missing, "GET", "/admin/api/house/media/1-2059/none.jpg", admin))
+        self.assertEqual(missing.status, 404)
 
     def test_non_admin_path_returns_false(self) -> None:
         self.assertFalse(aw.route_request(FakeHandler("/api/meter/health"), "GET",

@@ -140,6 +140,11 @@ final class HouseSyncEngine: ObservableObject {
         // 服务器已硬删的本地孤儿：曾同步过（revMap 有记录）但全量清单已不含 → 物理删除本地记录；
         // 从未同步过的纯本地房保留，并明确标为“本地”，避免沿用旧的“双端”。
         let remoteKeys = Set(remoteHouses.map { $0.roomKey })
+        // 服务器已经不存在这套房（被其他设备双端删除）时，清掉本地“隐藏”墓碑；
+        // 否则以后服务器重新收录同房号，会被旧墓碑永久挡住。
+        for key in HouseLocalDeletionStore.keys() where !remoteKeys.contains(key) {
+            HouseLocalDeletionStore.remove(key)
+        }
         for (key, h) in byKey where !remoteKeys.contains(key) {
             if revMap[key] != nil {
                 context.delete(h)
