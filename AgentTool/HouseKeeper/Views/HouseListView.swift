@@ -490,6 +490,19 @@ struct HouseListView: View {
                 if changeState == .hasUpdate { showCloudChangeHint() }
             }
         }
+        // 房源卡片上的「本地 / 云端 / 双端」不是本地持久化的假标识：
+        // 停留在房源板块时每 45 秒按服务器权威清单对账一次，后台删房/改房后无需杀 App 或反复进出。
+        .task {
+            guard HouseServerMode.ready else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 45 * 1_000_000_000)
+                guard !Task.isCancelled else { break }
+                guard let ctx = houseModelContext, !isSyncing else { continue }
+                if let n = try? await HouseSyncEngine.shared.pull(context: ctx), n > 0 {
+                    reloadHouses()
+                }
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: Self.houseStoreChanged)) { _ in
             reloadHouses()
         }
