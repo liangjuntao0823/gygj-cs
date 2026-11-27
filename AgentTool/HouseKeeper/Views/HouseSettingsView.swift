@@ -384,6 +384,9 @@ struct CosConfigView: View {
                 authBusy = false
                 authCode = ""
                 tokenVersion += 1
+                // 绑定成功后立刻把服务器地址/令牌写进 App Group，CloudOps 与分享扩展
+                // 下一次操作即可写日志，不必等退后台或重启 App。
+                SharedBridge.writeMirrors()
                 authTip = "授权成功，已接入服务器"
                 authPositive = true
             } catch {
@@ -398,6 +401,8 @@ struct CosConfigView: View {
     private func clearAuth() {
         sync.clearToken()
         tokenVersion += 1
+        // 清掉 App Group 镜像令牌，避免扩展/CloudOps 继续用旧令牌写服务器
+        SharedBridge.writeMirrors()
         authTip = "本机授权令牌已清除（服务器上已同步的配置仍保留）"
         authPositive = false
     }

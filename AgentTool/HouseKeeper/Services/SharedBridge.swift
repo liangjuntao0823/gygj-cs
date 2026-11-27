@@ -47,6 +47,10 @@ enum SharedBridge {
         d.set(NotifyHub.shared.endpoint, forKey: kEndpoint)
         if let t = MeterCloudSync.shared.token, !t.isEmpty {
             d.set(t, forKey: kToken)
+        } else {
+            // 断开/清除授权后必须同步清掉共享区旧令牌，否则扩展和 CloudOps 会拿旧令牌
+            // 继续写服务器，表现为“已断开但日志/媒体还在上传”。
+            d.removeObject(forKey: kToken)
         }
         #endif
     }

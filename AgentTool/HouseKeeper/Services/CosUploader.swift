@@ -3211,15 +3211,9 @@ enum CloudOps {
         return mirrored
         #else
         if let m = mirrored, !m.isEmpty { return m }
-        if let k = KeychainStore.load("meter.cloud.token"), !k.isEmpty { return k }
-        let fm = FileManager.default
-        let dir = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let file = dir.appendingPathComponent("meter-cloud-token")
-        if let s = try? String(contentsOf: file, encoding: .utf8) {
-            let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !t.isEmpty { return t }
-        }
-        return nil
+        // 与电表/房源共用同一枚账号令牌：`MeterCloudSync.persistedToken()` 是唯一权威读取口，
+        // 依次覆盖钥匙串与本机兜底文件，避免 CloudOps 自己读文件时漏掉 ad-hoc 环境。
+        return MeterCloudSync.persistedToken()
         #endif
     }
     private static var apiURL: URL? {
@@ -3231,13 +3225,16 @@ enum CloudOps {
     /// 本机发起云端操作 → 写一条服务器操作日志（带当前用户名）。
     /// 失败入待补队列，启动/回前台自动补推，避免 fire-and-forget 静默丢日志。
     static func log(category: String, action: String, result: String, detail: String, room: String = "") {
-        guard isConfigured, apiURL != nil else { return }
+        // 先入共享待补队，再尝试发送：即使此刻令牌/网络未就绪，也不会静默丢日志；
+        // 用户绑定服务器或回前台后 flushPending 会补写，与分享扩展同一口径。
         let item = CloudOpPendingQueue.Item(
             category: category, action: action, result: result,
             detail: detail, room: room, uname: CloudUser.username, date: Date())
+        CloudOpPendingQueue.enqueue(item)
+        guard isConfigured, apiURL != nil else { return }
         Task.detached {
             let ok = await CloudOps.send(item)
-            if !ok { CloudOpPendingQueue.enqueue(item) }
+            if ok { CloudOpPendingQueue.remove(item) }
         }
     }
 
@@ -3276,11 +3273,11 @@ enum CloudOps {
 
     /// 分享扩展可靠版：先入共享区待补队再发送，成功才出队。
     static func logAwait(category: String, action: String, result: String, detail: String = "", room: String = "") async {
-        guard isConfigured, apiURL != nil else { return }
         let item = CloudOpPendingQueue.Item(
             category: category, action: action, result: result,
             detail: detail, room: room, uname: CloudUser.username, date: Date())
         CloudOpPendingQueue.enqueue(item)
+        guard isConfigured, apiURL != nil else { return }
         let ok = await send(item)
         if ok { CloudOpPendingQueue.remove(item) }
     }
