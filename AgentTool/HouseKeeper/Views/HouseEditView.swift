@@ -1063,6 +1063,9 @@ struct HouseEditView: View {
                 }()
                 let remote = try await HouseSyncEngine.shared.pushHouse(
                     target, mediaFileNames: allowedNames)
+                // 新房先有房源、后有账本：append 时的上行会因“房源不存在”失败，
+                // 权威房源落库后立刻补一次账本上行，避免新收房源账本要等下次启动才出现。
+                await HouseLedgerStore.syncPending(roomKey: remote.roomKey)
                 // 改名：清理服务器上旧房号的记录与磁盘媒体（后端级联删除；失败不阻断，留待对账清理）
                 var renamePurgeError: String?
                 if kind == .rename, !oldRoomKey.isEmpty, oldRoomKey != remote.roomKey {
