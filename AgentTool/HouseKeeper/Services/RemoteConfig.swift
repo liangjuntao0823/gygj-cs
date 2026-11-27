@@ -48,7 +48,7 @@ enum RemoteConfig {
         var releasedAt: String?
         var sizeBytes: Int?
         var notes: [String]?
-        /// 桶内对象路径（优先），如 update/公寓管家2.21-b144.ipa
+        /// 服务器媒体路径（优先），如 update/公寓管家2.21-b144.ipa
         var objectKey: String?
         /// 备用 https 直链（objectKey 为空时使用）
         var downloadURL: String?
@@ -257,7 +257,7 @@ final class UpdateCenter: ObservableObject {
     }
 }
 
-/// 安装包下载器：桶内取（优先）或直链下载 → 存到 Documents/Updates/ → 可选 sha256 校验
+/// 安装包下载器：服务器媒体取（优先）或直链下载 → 存到 Documents/Updates/ → 可选 sha256 校验
 @MainActor
 final class UpdateDownloader: ObservableObject {
     enum Phase: Equatable {

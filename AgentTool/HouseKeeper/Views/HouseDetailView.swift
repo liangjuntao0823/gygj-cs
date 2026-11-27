@@ -1094,7 +1094,7 @@ struct HouseDetailView: View {
         s.filter { !$0.isWhitespace }
     }
 
-    /// 分享入口：仅做素材前置校验（旧 COS 配置校验已下线，分享回退本地媒体 + 文字系统面板）
+    /// 分享入口：仅做素材前置校验（旧对象存储配置校验已下线，分享回退本地媒体 + 文字系统面板）
     private func shareHouseCard() {
         guard !house.mediaItems.isEmpty else {
             shareError = "这套房源还没有照片或视频，先编辑添加素材再分享"
@@ -1109,7 +1109,7 @@ struct HouseDetailView: View {
         detailShareStep = ShareStep(items: videoShareQueue[videoShareIndex])
     }
 
-    /// v2.17：只分享视频——不走云端卡片（无需备案域名、无需 COS 配置）。
+    /// v2.17：只分享视频——不走云端卡片（无需备案域名、无需对象存储配置）。
     /// 把本地视频转成 mp4 后以「视频素材」交给系统分享面板，微信按视频消息接收（有缩略图、可播放）；
     /// 同时在相册留一份副本，万一某个微信版本仍按文件接收，可从相册再发一次。
     private func startVideoOnlyShare() {
@@ -1153,7 +1153,7 @@ struct HouseDetailView: View {
         // 先在主线程把所有数据拷成值类型，Task 里不再触碰 SwiftData 模型
         let files = house.mediaItems.map { ShareMediaFile(name: $0.fileName, kind: $0.kind) }
         let roomKey = house.mediaRoomKey
-        let profile = CosUploader.loadShareProfile()
+        let profile = ShareProfileStore.load()
         let info = ShareHouseInfo(
             displayRoomNo: house.displayRoomNo,
             towerLabel: house.towerLabel,

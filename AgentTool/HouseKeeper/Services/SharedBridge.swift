@@ -2,9 +2,8 @@ import Foundation
 
 /// 分享扩展 ↔ 主 App 共享桥（App Group：group.com.gj.tg2.shared，与 Widget 同组）。
 /// 口径：
-/// - 敏感密钥（COS sid/skey、后台口令明文）绝不进共享区——扩展经云函数 cosCfg 取 COS 配置，仅内存持有；
-/// - 共享区只放非敏感配置镜像（用户名/云函数地址/口令哈希/压缩开关/自定义域名）与两进程共用的队列；
-/// - 口令哈希本就随每个云函数请求 URL 传输（k= 参数），镜像不扩大暴露面；
+/// - 敏感密钥（后台口令明文、账号令牌）绝不进共享区；
+/// - 共享区只放非敏感配置镜像（用户名/服务器地址/令牌/压缩开关）与两进程共用的队列；
 /// - suite 不可用时回退 standard，主 App 存量行为不变。
 enum SharedBridge {
     static let groupID = "group.com.gj.tg2.shared"
@@ -16,14 +15,13 @@ enum SharedBridge {
     }
 
     /// 扩展进程标记：扩展入口置 true；主 App 恒 false。
-    /// 决定 CosConfig.load / CloudConfig.passwordHash / BackupLogStore 的进程分支。
+    /// 决定 CloudConfig.passwordHash / BackupLogStore 的进程分支。
     static var isExtension = false
 
     // MARK: 镜像键（主 App 写、扩展读）
 
     static let kPasswordHash = "share.mirror.passwordHash"
     static let kCompress = "share.mirror.compressOnShare"
-    static let kCustomDomain = "share.mirror.customDomain"
     static let kEndpoint = "share.mirror.endpoint"
     static let kToken = "share.mirror.houseToken"
 
@@ -40,7 +38,6 @@ enum SharedBridge {
         let compress = UserDefaults.standard.object(forKey: "compressOnShare") as? Bool
             ?? RemoteConfig.feature("compressUpload", true)
         d.set(compress, forKey: kCompress)
-        d.set(CosConfig.load()?.customDomain ?? "", forKey: kCustomDomain)
         #if !APP_EXTENSION
         // 服务器地址与房源/通知令牌镜像进 App Group 共享区，供分享扩展直连服务器；
         // 扩展进程读不到主 App 的 standard UserDefaults 与内存缓存，只能经共享区取。
@@ -71,8 +68,6 @@ enum SharedBridge {
         if defaults.object(forKey: kCompress) != nil { return defaults.bool(forKey: kCompress) }
         return RemoteConfig.feature("compressUpload", true)
     }
-
-    static var mirroredCustomDomain: String { defaults.string(forKey: kCustomDomain) ?? "" }
 
     /// 扩展读服务器端点：镜像优先；未镜像过按主 App 默认地址兜底（与 MeterCloudConfig.defaultEndpoint 同值）。
     /// 规范化口径对齐 NotifyHub.endpoint：补 http:// 前缀、去尾斜杠。

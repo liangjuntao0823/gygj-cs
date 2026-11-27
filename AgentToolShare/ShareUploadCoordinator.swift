@@ -112,7 +112,7 @@ final class ShareUploadCoordinator: ObservableObject {
     private func ingest(_ item: StagedItem, roomKey: String) async -> String? {
         let compress = SharedBridge.mirroredCompress
         if item.kind == "video" {
-            if let optimized = await CosUploader.optimizedVideoDataForUpload(
+            if let optimized = await MediaOptimizer.optimizedVideoDataForUpload(
                 from: item.url, compress: compress) {
                 return MediaStore.save(data: optimized, ext: "mov", roomKey: roomKey)
             }
@@ -120,7 +120,7 @@ final class ShareUploadCoordinator: ObservableObject {
         }
         return autoreleasepool { () -> String? in
             guard let data = try? Data(contentsOf: item.url),
-                  let jpeg = CosUploader.optimizedImageDataForUpload(data, compress: compress) else { return nil }
+                  let jpeg = MediaOptimizer.optimizedImageDataForUpload(data, compress: compress) else { return nil }
             return MediaStore.save(data: jpeg, ext: "jpg", roomKey: roomKey)
         }
     }

@@ -693,7 +693,7 @@ struct AIToolExecutor {
     /// 返回是否推送成功——改房号时只有新账本确认成功，调用方才可以删旧目录，失败则旧目录保留。
     @discardableResult
     private func pushHouseToCloud(_ house: House) async -> Bool {
-        // 服务器模式：走服务器权威库（HouseSyncEngine.pushHouse），不进旧 COS 账本链路
+        // 服务器模式：走服务器权威库（HouseSyncEngine.pushHouse），不进旧对象存储账本链路
         if HouseServerMode.ready {
             do {
                 _ = try await HouseSyncEngine.shared.pushHouse(house)

@@ -29,14 +29,14 @@ enum BackupLogStore {
     static func log(category: String, action: String, result: String, detail: String = "", checksum: String = "", username: String? = nil, room: String = "", cloud: Bool = false) {
         writeLocal(makeEntry(category: category, action: action, result: result, detail: detail,
                              checksum: checksum, username: username, room: room))
-        // 云端区：服务器权威操作日志（2026-11-27 起不再走旧 COS 桶）。
+        // 云端区：服务器权威操作日志（2026-11-27 起不再走旧对象存储桶）。
         if cloud {
             CloudOps.log(category: category, action: action, result: result,
                          detail: detail, room: room)
         }
     }
 
-    /// 分享扩展可靠版：本地留痕同 log()。旧桶公共日志上行已随 COS 链路下线。
+    /// 分享扩展可靠版：本地留痕同 log()。旧对象存储公共日志上行已随旧链路下线。
     static func logAwait(category: String, action: String, result: String, detail: String = "", checksum: String = "", username: String? = nil, room: String = "", cloud: Bool = false) async {
         writeLocal(makeEntry(category: category, action: action, result: result, detail: detail,
                              checksum: checksum, username: username, room: room))

@@ -43,7 +43,7 @@ struct AgentToolApp: App {
         // v1.40 第9点：本地根目录重建——启动时把 备份/Media 整体迁移到 Documents/media/（幂等，不丢数据）
         MediaStore.migrateLegacyMediaIfNeeded()
 
-        // v1.13 需求16：启动时执行一次性目录迁移——旧分区备份 JSON 迁入 备份/旧版备份/，COS 配置 json 迁入 备份/CosConfig/
+        // 启动时执行一次性目录迁移——旧分区备份 JSON 迁入 备份/旧版备份/
         DataBackupManager.migrateLegacyDirectories()
 
         // v1.8：先把此前「容器初始化失败时自动隔离」的主库文件找回原位（仅当当前默认 store 不存在时执行）。
@@ -208,7 +208,7 @@ struct AgentToolApp: App {
                         HouseImportIntent.shared.request()
                         return
                     }
-                    // 旧 COS 配置备份导入已下线：只接受备份 zip，不再识别 bucket/secretId json
+                    // 旧对象存储配置导入已下线：只接受备份 zip
                     BackupImportHandler.handleIncomingZip(url)
                 }
                 // v2.51：电梯码全屏页（URL Scheme / 设置页预览触发）

@@ -3,7 +3,7 @@
 //  公寓管家 · 房源板块服务器权威 API 客户端
 //
 //  服务器（8082 内 house-keeper 模块）为唯一权威；本类负责 JSON 收发与媒体二进制直传/直出，
-//  媒体实体全部落服务器本地磁盘（不再使用 COS 桶）。
+//  媒体实体全部落服务器本地磁盘（不再使用对象存储桶）。
 //  复用：服务器地址 NotifyHub.shared.endpoint、租户令牌 MeterCloudSync.shared.token。
 //
 
@@ -91,7 +91,7 @@ struct RemoteHouseStats: Codable {
     let pendingOutbox: Int
 }
 
-/// 服务器备份 zip 清单条目（替代旧 COS ListObjects 对象元数据）
+/// 服务器备份 zip 清单条目（替代旧对象存储对象元数据）
 struct RemoteBackupRecord: Codable {
     let name: String
     let size: Int64?
@@ -378,14 +378,14 @@ final class HouseRemoteClient {
             let container = MediaNaming.videoExtension(for: data)
             // 只补转真正的 QuickTime 原片；已是 mp4 容器（含本地 .mov 名但内容已压成 mp4）不重复转码。
             if container == "mov" {
-                if let mp4 = await CosUploader.optimizedVideoDataForUpload(
+                if let mp4 = await MediaOptimizer.optimizedVideoDataForUpload(
                     from: data, compress: shareCompressionEnabled) {
                     uploadData = mp4
                     uploadName = (uploadName as NSString).deletingPathExtension + ".mp4"
                 }
             }
         } else if ["jpg", "jpeg"].contains(ext), data.count > 2_500_000 {
-            if let jpeg = CosUploader.optimizedImageDataForUpload(data, compress: true) {
+            if let jpeg = MediaOptimizer.optimizedImageDataForUpload(data, compress: true) {
                 uploadData = jpeg
             }
         }
@@ -481,7 +481,7 @@ final class HouseRemoteClient {
         }
     }
 
-    // MARK: 备份 zip（服务器本地磁盘，替代旧 COS backups/ 目录）
+    // MARK: 备份 zip（服务器本地磁盘，替代旧对象存储备份目录）
 
     /// 读取服务器备份清单
     func listBackups() async throws -> [RemoteBackupRecord] {
@@ -817,7 +817,7 @@ final class HouseRemoteClient {
         if let key = roomKey, !key.isEmpty {
             items.append(URLQueryItem(name: "roomKey", value: key))
         }
-        let profile = CosUploader.loadShareProfile()
+        let profile = ShareProfileStore.load()
         let name = profile.name.trimmingCharacters(in: .whitespacesAndNewlines)
         let phone = profile.phone.trimmingCharacters(in: .whitespacesAndNewlines)
         if !name.isEmpty { items.append(URLQueryItem(name: "n", value: name)) }

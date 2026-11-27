@@ -1246,7 +1246,7 @@ struct HouseEditView: View {
         for item in items {
             if let data = try? await item.loadTransferable(type: Data.self),
                let image = UIImage(data: data),
-               let jpeg = CosUploader.optimizedImageDataForUpload(
+               let jpeg = MediaOptimizer.optimizedImageDataForUpload(
                     data, compress: shareCompressionEnabled)
                     ?? image.jpegData(compressionQuality: 0.85) {
                 let fileName = MediaStore.save(data: jpeg, ext: "jpg", roomKey: currentRoomKey)
@@ -1270,7 +1270,7 @@ struct HouseEditView: View {
                 if FileManager.default.fileExists(atPath: url.path) {
                     // 压缩开关开 → 720p H.264 mp4；关 → 原质量转 mp4 封装。
                     // 本地仍沿用 .mov 名（与旧账本/服务器引用映射一致），上传时统一改成 .mp4。
-                    if let optimized = await CosUploader.optimizedVideoDataForUpload(
+                    if let optimized = await MediaOptimizer.optimizedVideoDataForUpload(
                         from: url, compress: shareCompressionEnabled) {
                         savedName = MediaStore.save(data: optimized, ext: "mov", roomKey: currentRoomKey)
                     } else {
@@ -1283,7 +1283,7 @@ struct HouseEditView: View {
             // v2.37（#9）：不写死 .mov，先看数据真实容器格式再命名，避免「内容 mp4 却套 mov 后缀」
             if savedName == nil,
                let data = try? await item.loadTransferable(type: Data.self) {
-                if let optimized = await CosUploader.optimizedVideoDataForUpload(
+                if let optimized = await MediaOptimizer.optimizedVideoDataForUpload(
                     from: data, compress: shareCompressionEnabled) {
                     savedName = MediaStore.save(data: optimized, ext: "mov", roomKey: currentRoomKey)
                 } else {

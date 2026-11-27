@@ -4,7 +4,7 @@ import UIKit
 import UniformTypeIdentifiers
 import Security
 
-// MARK: - v1.34 钥匙串写入修复（独立实现，避免改动 CosUploader.swift 整文件）
+// MARK: - v1.34 钥匙串写入修复（独立实现，避免改动 KeychainStore 整文件）
 
 /// 旧 KeychainStore.save 的 bug：SecItemDelete 的查询字典里带了 kSecValueData（要写入的新值），
 /// 而删除匹配按查询属性匹配——旧条目存的是旧数据，与新值不匹配 → 删不掉旧条目；
@@ -68,13 +68,11 @@ enum KeychainFix {
     }
 }
 
-/// 设置页（v1.22 重构：归拢成两个入口——远程配置 / 名片信息）
-/// 服务器配置：房源服务器地址与账号授权（旧 COS 桶/密钥配置已下线）
+/// 设置页（房源服务器配置 / 名片信息）
+/// 服务器配置：房源服务器地址与账号授权
 /// 名片信息：姓名/电话只存本机钥匙串，分享链接按参数携带，不上传服务器
 ///
-/// v1.6（公寓管家）：独立设置页取消——房源分享相关设置合并进主 App「设置 → 房源分享」分组，
-/// 本文件保留远程配置（CosConfigView）、名片信息（ShareProfileView）、恢复列表（ConfigRestoreListView）、
-/// 钥匙串修复（KeychainFix）与配置备份（CosConfigBackup）等子页面与工具，供主设置页复用。
+/// 本文件只保留服务器配置（ServerConfigView）、名片信息（ShareProfileView）与钥匙串修复（KeychainFix）。
 
 /// 数据文件夹总大小 = 「备份」子文件夹 + 「media」房源媒体文件夹（平级两个目录）。
 /// v1.40 起房源媒体独立到 Documents/media/（不再挂在备份/Media 下），旧实现只统计「备份」漏掉了整个媒体目录，统计偏小。
@@ -98,97 +96,9 @@ func aiCacheSizeText() -> String {
     return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
 }
 
-// MARK: - 远程配置（腾讯云 COS）
+// MARK: - 房源服务器配置
 
-/// v1.19：新增「自定义域名（可选）」——腾讯云 2024 年后新建桶默认域名会被微信识别成文件，
-/// 绑定自定义域名后微信才会把分享链接抓成网页卡片；域名留空则回退默认域名（仅兜底）
-/// v1.20：保存改为「保存并验证连接」——写入钥匙串成功后立即用当前配置向 COS 上传一个测试文件
-/// 并回读，真实连通才算保存成功；任何环节失败都会给出具体错误码（桶不存在/签名错误/域名未生效），
-/// 不再静默提示「已保存」；同时密钥写入失败也会明确报出。
-// MARK: - COS 配置备份 / 恢复（v1.33 剪贴板版 → v1.34 文件版）
-
-/// v1.13 需求16：COS 配置备份统一存放目录 Documents/备份/CosConfig/（不再散在「备份」根目录）
-enum CosConfigStore {
-    static func directory() -> URL {
-        let dir = DataRoot.url().appendingPathComponent("CosConfig", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir
-    }
-}
-
-/// 把钥匙串里的 COS 配置导出为 JSON（v1.34 改为生成「桶名_地域_日期.json」文件由用户选择位置保存），
-/// 换机 / 重装 / 误改后可从备份文件一键恢复。配置含密钥，备份文件请妥善保管。
-enum CosConfigBackup {
-    /// v1.44：备份文件补全云函数地址 + 用户名——换机/重装后一键还原应包含完整连接参数与身份
-    static func exportJSON() -> String? {
-        guard let config = CosConfig.load() else { return nil }
-        let dict: [String: String] = [
-            "bucket": config.bucket,
-            "region": config.region,
-            "secretId": config.secretId,
-            "secretKey": config.secretKey,
-            "customDomain": config.customDomain,
-            "functionURL": CloudConfig.functionURL,
-            "username": CloudUser.username
-        ]
-        guard let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]),
-              let json = String(data: data, encoding: .utf8) else { return nil }
-        return json
-    }
-
-    /// 从备份文件内容恢复配置到钥匙串；返回 (是否成功, 提示)
-    static func restore(fromJSON json: String) -> (Bool, String) {
-        guard let data = json.data(using: .utf8) else {
-            return (false, "所选文件内容不是有效的配置文本，请确认选择的是「备份配置到文件」生成的 .json 文件")
-        }
-        let parsed: Any?
-        do {
-            parsed = try JSONSerialization.jsonObject(with: data)
-        } catch {
-            return (false, "所选文件内容不是有效的配置文本，请确认选择的是「备份配置到文件」生成的 .json 文件")
-        }
-        guard let dict = parsed as? [String: Any] else {
-            return (false, "所选文件内容不是有效的配置文本，请确认选择的是「备份配置到文件」生成的 .json 文件")
-        }
-        let trimSet = CharacterSet.whitespacesAndNewlines
-        let bucket = (dict["bucket"] as? String ?? "").trimmingCharacters(in: trimSet)
-        let region = (dict["region"] as? String ?? "").trimmingCharacters(in: trimSet)
-        let secretId = (dict["secretId"] as? String ?? "").trimmingCharacters(in: trimSet)
-        let secretKey = (dict["secretKey"] as? String ?? "").trimmingCharacters(in: trimSet)
-        let customDomain = (dict["customDomain"] as? String ?? "").trimmingCharacters(in: trimSet)
-        let functionURL = (dict["functionURL"] as? String ?? "").trimmingCharacters(in: trimSet)
-        let uname = (dict["username"] as? String ?? "").trimmingCharacters(in: trimSet)
-        if bucket.isEmpty || region.isEmpty || secretId.isEmpty || secretKey.isEmpty {
-            return (false, "配置缺少必填项（存储桶 / 地域 / SecretId / SecretKey），请检查备份文件")
-        }
-        var allSaved = true
-        let items: [(String, String)] = [
-            (KeychainKey.bucket, bucket),
-            (KeychainKey.region, region),
-            (KeychainKey.secretId, secretId),
-            (KeychainKey.secretKey, secretKey),
-            (KeychainKey.customDomain, customDomain)
-        ]
-        for item in items {
-            if !KeychainFix.saveVerified(item.1, for: item.0) {
-                allSaved = false
-            }
-        }
-        if !allSaved {
-            return (false, "写入本机钥匙串失败，请重试；若仍失败请重启 App 后再试")
-        }
-        // v1.44：备份里的云函数地址 + 用户名一并还原（旧备份无此字段时保持原值，不覆盖）
-        if !functionURL.isEmpty { CloudConfig.functionURL = functionURL }
-        if !uname.isEmpty { CloudUser.username = uname }
-        let msg = "配置已恢复：地域 " + region + " / 存储桶 " + bucket
-            + (functionURL.isEmpty ? "" : "\n云函数地址：\(functionURL)")
-            + (uname.isEmpty ? "" : "\n用户名：\(uname)")
-            + "\n表单已刷新，可点「保存并验证连接」确认可用"
-        return (true, msg)
-    }
-}
-
-struct CosConfigView: View {
+struct ServerConfigView: View {
     @State private var username = ""
     // 房源服务器（8082 权威库）地址与状态；全工程唯一地址编辑入口，电表/通知通道复用同一地址
     @State private var endpointInput = ""
@@ -413,135 +323,6 @@ struct CosConfigView: View {
             : "用户名已保存：\(trimmed)\n操作日志 / 分享 / 统计都会带上它"
     }
 }
-/// 列出「备份」文件夹内的 .json 备份文件，点击直接恢复（与主 App 恢复备份同款列表写法）；
-/// 列表底部提供「从其他位置选择」用系统文件选择器兜底（保留自由选择路径的能力）。
-/// v1.44：文件选择器改为本列表视图内自挂（此前跨视图延迟弹 sheet 在 iOS 上偶发被吞，按钮无效）
-struct ConfigRestoreListView: View {
-    let onPick: (URL) -> Void
-    @Environment(\.dismiss) private var dismiss
-    @State private var files: [URL] = []
-    @State private var showImporter = false
-
-    var body: some View {
-        NavigationStack {
-            Group {
-                if files.isEmpty {
-                    VStack(spacing: 12) {
-                        Image(systemName: "tray")
-                            .font(.system(size: 44))
-                            .foregroundColor(.secondary)
-                        Text("「备份」文件夹里还没有备份文件")
-                            .font(.headline)
-                        Text("请先点「备份配置到文件」生成备份，或把备份 .json 文件放进 iOS「文件」App → 我的 iPhone → 公寓管家 → 备份 文件夹")
-                            .font(.footnote)
-                            .foregroundColor(.secondary)
-                            .multilineTextAlignment(.center)
-                            .padding(.horizontal, 24)
-                        Button {
-                            showImporter = true
-                        } label: {
-                            Label("从其他位置选择…", systemImage: "folder")
-                                .font(.subheadline)
-                        }
-                        .padding(.top, 6)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    List {
-                        ForEach(files, id: \.self) { url in
-                            Button {
-                                onPick(url)
-                                dismiss()
-                            } label: {
-                                HStack(spacing: 12) {
-                                    Image(systemName: "doc.text")
-                                        .foregroundColor(.blue)
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(url.lastPathComponent)
-                                            .font(.body)
-                                            .foregroundColor(.primary)
-                                        Text(fileSize(of: url))
-                                            .font(.caption)
-                                            .foregroundColor(.secondary)
-                                    }
-                                    Spacer()
-                                    Image(systemName: "chevron.right")
-                                        .font(.caption2)
-                                        .foregroundColor(.secondary)
-                                }
-                                .padding(.vertical, 2)
-                            }
-                        }
-                        Section {
-                            Button {
-                                showImporter = true
-                            } label: {
-                                Label("从其他位置选择…", systemImage: "folder")
-                            }
-                        }
-                    }
-                    .listStyle(.insetGrouped)
-                }
-            }
-            .navigationTitle("选择备份文件")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("取消") { dismiss() }
-                }
-            }
-            .onAppear(perform: loadFiles)
-            // v1.44：文件选择器直接挂在本视图上（不再经父视图延迟弹），保证点按钮立即弹出系统文件选择器
-            .fileImporter(isPresented: $showImporter, allowedContentTypes: [.json], allowsMultipleSelection: false) { result in
-                switch result {
-                case .success(let urls):
-                    if let url = urls.first {
-                        onPick(url)
-                        dismiss()
-                    }
-                case .failure:
-                    break
-                }
-            }
-        }
-    }
-
-    /// 列出「备份/CosConfig」文件夹内的 .json 文件（v1.13 需求16：配置备份收拢到子文件夹），
-    /// 兼容旧位置「备份」根目录残留文件（启动迁移未执行完的场景），按文件名（含日期）倒序，最新的在最上面
-    private func loadFiles() {
-        let fm = FileManager.default
-        var collected: [URL] = []
-        for dir in [CosConfigStore.directory(), DataRoot.url()] {
-            guard let items = try? fm.contentsOfDirectory(
-                at: dir,
-                includingPropertiesForKeys: [.fileSizeKey],
-                options: [.skipsHiddenFiles]
-            ) else { continue }
-            collected += items.filter { $0.pathExtension.lowercased() == "json" }
-        }
-        // 去重（同路径只保留一次）
-        var seen = Set<String>()
-        files = collected
-            .filter { seen.insert($0.path).inserted }
-            .sorted { $0.lastPathComponent > $1.lastPathComponent }
-    }
-
-    private func fileSize(of url: URL) -> String {
-        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-        return ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
-    }
-}
-
-
-// MARK: - 名片信息
-
-/// v1.21：分享名片信息（姓名/电话）——显示在分享 H5 页面的名片区、微信卡片的描述和
-/// 「拨打电话/复制电话」按钮上。v1.22：修改后再次分享自动按新名片重新生成链接
-/// （分享缓存里存了名片，名片一变缓存自动失效，无需手动清缓存）。
-/// v1.26：①新增实时名片预览；②说明应用范围覆盖所有出现姓名/电话的位置
-/// （H5 名片区、微信卡片描述、页面底栏电话、拨打电话/复制电话）。
-/// v1.27：新增「微信二维码」入口——从相册选择二维码图片保存（Documents/qrcode.png），
-/// 分享时自动上传 COS 并显示在所有 H5 名片板块左侧，访客长按可直接被微信识别。
 struct ShareProfileView: View {
     @State private var shareName = ""
     @State private var sharePhone = ""
@@ -659,8 +440,6 @@ struct ShareProfileView: View {
                            let jpeg = image.jpegData(compressionQuality: 0.9) {
                             let ok = QrcodeStore.save(jpeg)
                             qrImage = UIImage(data: jpeg)
-                            // v1.42：保存后立即同步云端桶 users/<用户名>/qrcode.jpg——
-                            //        已发出的 H5 链接动态引用桶 URL，无需重新分享即显示新二维码（此前只写本地，要等下次分享才上传）
                             syncQRToCloud(clear: false)
                             savedTip = ok ? "微信二维码已保存到本机 ✅" : "保存二维码失败，请重试"
                         } else {
@@ -723,15 +502,15 @@ struct ShareProfileView: View {
 /// 选房链接页：生成「公开选房 H5」链接（云函数 ?act=rooms&u=<用户名>），
 /// 复制/分享给租客即可实时查看所有待租房源；改房源、改名片、换二维码后租客刷新即最新。
 struct RoomsShareView: View {
-    @State private var cosLink = ""
+    @State private var serverLink = ""
     @State private var linkTip: String?
     @State private var copiedTip: String?
     @State private var showShareSheet = false
 
-    /// v1.49：公开选房链接改为 COS 签名链接（与单房分享 H5 同域名同机制，微信内可正常打开）。
-    /// 由云函数 roomsSeed 生成静态壳并上传桶 users/<用户名>/rooms/index.html 后返回；
+    /// v1.49：公开选房链接改为 服务器托管链接（与单房分享 H5 同域名同机制，微信内可正常打开）。
+    /// 由云函数 roomsSeed 生成静态壳并上传服务器 users/<用户名>/rooms/index.html 后返回；
     /// 壳页面每次打开/刷新 JS 实时拉 rooms_json 数据，房源/名片/二维码变化刷新即最新，无需重建。
-    private var link: String { cosLink }
+    private var link: String { serverLink }
 
     var body: some View {
         Form {
@@ -774,7 +553,7 @@ struct RoomsShareView: View {
         .navigationTitle("公开选房链接")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
-            if cosLink.isEmpty {
+            if serverLink.isEmpty {
                 Task { await refreshLink() }
             }
         }
@@ -791,19 +570,19 @@ struct RoomsShareView: View {
         }
     }
 
-    /// 选房页由服务器本地托管静态壳，长期有效，房源/名片刷新即最新；旧桶 H5 壳上传链路已下线。
+    /// 选房页由服务器本地托管静态壳，长期有效，房源/名片刷新即最新；旧对象存储 H5 壳上传链路已下线。
     private func refreshLink() async {
         if HouseServerMode.ready {
             if let h5 = HouseRemoteClient.h5URL() {
-                cosLink = h5.absoluteString
+                serverLink = h5.absoluteString
                 linkTip = "链接长期有效；房源、名片或二维码更新后，租客刷新页面即为最新"
             } else {
-                cosLink = ""
+                serverLink = ""
                 linkTip = "尚未接入服务器：请到「云端配置」检查服务器地址或账号绑定"
             }
             return
         }
-        cosLink = ""
+        serverLink = ""
         linkTip = "尚未接入服务器：请到「云端配置」检查服务器地址或账号绑定"
     }
 }

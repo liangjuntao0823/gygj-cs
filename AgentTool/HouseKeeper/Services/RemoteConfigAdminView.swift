@@ -213,7 +213,7 @@ struct RemoteConfigAdminView: View {
                 TextField("最新版本号，如 2.21", text: $updateVersion)
                 TextField("Build 号，如 144", text: $updateBuild)
                     .keyboardType(.numberPad)
-                TextField("桶内对象路径，如 update/公寓管家2.21-b144.ipa", text: $updateObjectKey)
+                TextField("服务器媒体路径，如 update/公寓管家2.21-b144.ipa", text: $updateObjectKey)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
                 TextField("备用直链 https（选填）", text: $updateDownloadURL)

@@ -139,7 +139,7 @@ struct SettingsView: View {
                     .foregroundColor(CloudUser.username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .red : .secondary)
             }
             NavigationLink {
-                CosConfigView()
+                ServerConfigView()
             } label: {
                 Label {
                     VStack(alignment: .leading, spacing: 2) {
@@ -1967,7 +1967,7 @@ struct AccountSettingsPage: View {
                         .foregroundColor(CloudUser.username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .red : .secondary)
                 }
                 NavigationLink {
-                    CosConfigView()
+                    ServerConfigView()
                 } label: {
                     Label {
                         VStack(alignment: .leading, spacing: 2) {

@@ -412,7 +412,7 @@ enum BackupGuide {
         App 数据放在「文件」App → 我的 iPhone → 公寓管家 下，分两个子文件夹：
 
         · 备份/ —— 房源信息数据库（housekeeper.store）、备份包（Backups/）、
-          恢复前快照（PreRestore/）、云端配置（CosConfig/）、分享缓存（ShareCache/）、
+          恢复前快照（PreRestore/）、分享缓存（ShareCache/）、
           名片二维码（qrcode.png）、操作日志（Logs/）、本说明文件
         · media/ —— 所有房源图片和视频，按房号分文件夹
 
@@ -432,14 +432,11 @@ enum BackupGuide {
 // MARK: - 分享链接缓存（v1.18：同一房源的媒体与信息都没变化时，点分享直接复用上次链接，不再重复上传）
 // v1.21：缓存按「分享模式」双轨分开（脱敏 masked / 完整 full），两种分享互不影响、各自增量。
 
-/// 缓存的分享卡片记录：媒体清单 + 房源信息快照 + 上次生成的分享链接 + 当时的 COS 配置（换桶/换域名后自动失效）
+/// 缓存的分享卡片记录：媒体清单 + 房源信息快照 + 上次生成的分享链接与生成条件。
 struct ShareCacheRecord: Codable {
     let mediaFiles: [ShareMediaFile]
     let info: ShareHouseInfo
     let shareURL: String
-    let bucket: String
-    let region: String
-    let customDomain: String?   // v1.19：生成链接时的自定义域名；换域名后旧缓存自动失效（Optional 兼容旧版缓存 JSON）
     var compressOnShare: Bool? = nil          // v1.23：生成链接时的「分享时压缩」开关状态；开关变化 → 缓存失效重新上传（Optional 兼容旧版）
     var collectionRooms: [ShareCollectionItem]? = nil   // v1.22：合集分享缓存——记录合集包含的每套房源快照；任一套变动 → 缓存失效重新生成（Optional 兼容旧版）
     var templateVersion: Int? = nil           // v1.25：生成链接时的 HTML 模板版本；模板改动（改页面设计）→ 旧缓存自动失效重新生成（Optional 兼容旧版）

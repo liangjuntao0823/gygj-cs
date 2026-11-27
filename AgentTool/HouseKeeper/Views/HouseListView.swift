@@ -563,7 +563,7 @@ struct HouseListView: View {
         }
     }
 
-    /// 旧 COS 清单变更感知已下线：服务器模式下权威库由 HouseSyncEngine.pull 增量对账，本方法恒返回无变化。
+    /// 旧对象存储清单变更感知已下线：服务器模式下权威库由 HouseSyncEngine.pull 增量对账，本方法恒返回无变化。
     static func detectCloudLedgerChange(houseContext _: ModelContext?) async -> CloudChangeState {
         .noChange
     }
@@ -1242,9 +1242,9 @@ struct HouseListView: View {
 
     // MARK: - v1.19 云端房源同步（共享房源）
 
-    /// 状态切换上行：服务器模式推服务器权威库（失败入待补传队列）；旧 COS 账本/媒体上行已下线，非服务器模式仅本机落库。
+    /// 状态切换上行：服务器模式推服务器权威库（失败入待补传队列）；旧对象存储账本/媒体上行已下线，非服务器模式仅本机落库。
     private func pushHouseToCloud(_ house: House, action: String = "同步房源（本地→云端）", changeText: String = "") {
-        // 服务器模式：状态切换直接推服务器权威库，不走旧 COS 账本链路；失败入待补传队列
+        // 服务器模式：状态切换直接推服务器权威库，不走旧对象存储账本链路；失败入待补传队列
         if HouseServerMode.ready {
             let roomKey = house.mediaRoomKey
             let roomNo = house.displayRoomNo
@@ -1275,7 +1275,7 @@ struct HouseListView: View {
             }
             return
         }
-        // 旧桶账本上行已下线：非服务器模式仅本机落库，不再上传旧 COS 账本/媒体
+        // 旧桶账本上行已下线：非服务器模式仅本机落库，不再上传旧对象存储账本/媒体
     }
 
     /// v2.50：云端有更新横幅——常驻顶栏，只有点右侧 ✕ 才收起；同步成功后自动收起。
@@ -1417,11 +1417,11 @@ struct HouseListView: View {
         // v2.63：标记「手动云端同步进行中」——自动检测看到这个标记直接跳过，两边不会同时拉清单
         await MainActor.run { CloudDetectActivity.shared.beginManualSync() }
         defer { DispatchQueue.main.async { CloudDetectActivity.shared.endManualSync() } }
-        // 服务器模式：房源读写走 8082 house-keeper 权威接口，短路旧 COS 直连链路
+        // 服务器模式：房源读写走 8082 house-keeper 权威接口，短路旧对象存储直连链路
         if HouseServerMode.ready, let ctx = houseModelContext {
             return await runServerSync(context: ctx)
         }
-        // 旧 COS 直连兜底链路已下线：未连接服务器时仅返回失败，本地数据可离线查看
+        // 旧对象存储直连兜底链路已下线：未连接服务器时仅返回失败，本地数据可离线查看
         return .failed("服务器未连接，请检查网络后重试")
     }
 
@@ -1448,7 +1448,7 @@ struct HouseListView: View {
         }
         try? ctx.save()
         // v2.24：批量已租也要推云端（此前只改本地，下次同步被云端旧状态回滚回去）
-        // 服务器模式：逐套推服务器权威库，失败入待补传；旧 COS 链路仅在非服务器模式走
+        // 服务器模式：逐套推服务器权威库，失败入待补传；旧对象存储链路仅在非服务器模式走
         if HouseServerMode.ready, !rentedHouses.isEmpty {
             let toPush = rentedHouses
             Task {
@@ -1495,7 +1495,7 @@ struct HouseListView: View {
 
     /// v1.7：卡片左滑「分享」→ 单套分享卡片（脱敏 / 完整），生成链接后弹系统分享面板
     /// 注意：Task 内只传值类型，绝不直接访问 SwiftData @Model（跨线程读取模型会闪退）
-    /// v2.17：列表页单套 → 只分享视频（不走云端卡片，不需要 COS 配置）
+    /// v2.17：列表页单套 → 只分享视频（不走云端卡片，不需要对象存储配置）
     private func generateSingleVideoShare() {
         guard let house = singleShareHouse else { return }
         let urls = house.videos
@@ -1549,7 +1549,7 @@ struct HouseListView: View {
         }
         let files = house.mediaItems.map { ShareMediaFile(name: $0.fileName, kind: $0.kind) }
         let roomKey = house.mediaRoomKey
-        let profile = CosUploader.loadShareProfile()
+        let profile = ShareProfileStore.load()
         let info = ShareHouseInfo(
             displayRoomNo: house.displayRoomNo,
             towerLabel: house.towerLabel,
@@ -1622,7 +1622,7 @@ struct HouseListView: View {
             var records: [(roomKey: String, summary: String)] = []
             for house in sortedShareable {
                 let roomKey = house.mediaRoomKey
-                let profile = CosUploader.loadShareProfile()
+                let profile = ShareProfileStore.load()
                 let info = ShareHouseInfo(
                     displayRoomNo: house.displayRoomNo,
                     towerLabel: house.towerLabel,
@@ -1660,7 +1660,7 @@ struct HouseListView: View {
         var localBatches: [[Any]] = []
         for house in sortedShareable {
             let roomKey = house.mediaRoomKey
-            let profile = CosUploader.loadShareProfile()
+            let profile = ShareProfileStore.load()
             let info = ShareHouseInfo(
                 displayRoomNo: house.displayRoomNo,
                 towerLabel: house.towerLabel,
