@@ -399,7 +399,12 @@ final class HouseRemoteClient {
 
     /// 删除服务器上的单个媒体文件
     func deleteMedia(roomKey: String, fileName: String) async throws {
-        let path = "/api/house/media/\(encodedRoomKey(roomKey))/\(encodedRoomKey(fileName))"
+        // 本地视频名可能是 .mov，服务器统一存 .mp4；删除时按同一口径换算。
+        let remoteName = MediaNaming.remoteName(
+            fileName: fileName,
+            kind: ["mov", "m4v", "mp4", "avi"].contains((fileName as NSString).pathExtension.lowercased())
+                ? "video" : "image")
+        let path = "/api/house/media/\(encodedRoomKey(roomKey))/\(encodedRoomKey(remoteName))"
         let (_, http) = try await makeRequest(path, method: "DELETE")
         guard http.statusCode == 200 else {
             throw HouseAPIError(message: "媒体删除失败（服务器 \(http.statusCode)）")

@@ -171,7 +171,9 @@ enum ExtensionHouseClient {
     }
 
     static func deleteMedia(roomKey: String, fileName: String) async throws {
-        let req = try request("/api/house/media/\(encoded(roomKey))/\(encoded(fileName))", method: "DELETE")
+        let kind = kind(ofName: fileName)
+        let remoteName = MediaNaming.remoteName(fileName: fileName, kind: kind)
+        let req = try request("/api/house/media/\(encoded(roomKey))/\(encoded(remoteName))", method: "DELETE")
         let (_, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse else {
             throw ExtHouseError(message: "媒体删除失败（服务器响应无效）")

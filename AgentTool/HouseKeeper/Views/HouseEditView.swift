@@ -1214,8 +1214,8 @@ struct HouseEditView: View {
                     from: data, compress: shareCompressionEnabled) {
                     savedName = MediaStore.save(data: optimized, ext: "mov", roomKey: currentRoomKey)
                 } else {
-                    let realExt = MediaNaming.videoExtension(for: data)
-                    savedName = MediaStore.save(data: data, ext: realExt, roomKey: currentRoomKey)
+                    // 兜底也统一用 .mov 本地名：服务器引用按 .mp4 换算，本地不再出现两套后缀。
+                    savedName = MediaStore.save(data: data, ext: "mov", roomKey: currentRoomKey)
                 }
             }
 
