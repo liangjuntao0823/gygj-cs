@@ -348,7 +348,7 @@ function meterDetail(i){
   const rows=t.meters.map(m=>`<tr><td>${m.room}</td><td>${m.uid}</td><td>${m.shengyu} 度</td><td>${m.leiji}</td><td>${m.zhuangtai||'—'}</td><td>${m.low?'<span class="tag r">低电量</span>':'<span class="tag g">正常</span>'}</td></tr>`).join('');
   openModal(`<h3>账户 ${t.hub.username||t.device||t.token} 电表明细</h3>
     <table><thead><tr><th>房号</th><th>UID</th><th>剩余</th><th>累计</th><th>状态</th><th>判定</th></tr></thead><tbody>${rows||'<tr><td colspan=6 class=muted>无电表</td></tr>'}</tbody></table>
-    <div class="row" style="margin-top:12px"><button id="m-ok">关闭</button></div>`);
+    <div class="row" style="margin-top:12px"><button id="m-ok" onclick="closeModal()">关闭</button></div>`);
 }
 function meterToggle(i){
   const t=STATE.meterTenants[i];
@@ -524,7 +524,7 @@ function houseDetail(i){
     ${notifyPicker('all')}
     <div class="row" style="margin-top:12px">
       <button id="m-ok">保存修改</button>
-      ${h.isDeleted?`<button class="ghost" onclick="houseRestore('${h.roomKey}')">恢复</button>`:`<button class="danger" onclick="houseDelete('${h.roomKey}')">删除</button>`}
+      <button class="danger" onclick="houseDelete('${h.roomKey}')">删除</button>
       <button class="ghost" onclick="closeModal()">关闭</button>
     </div>`,
     async()=>{
@@ -537,16 +537,10 @@ function houseDetail(i){
     });
 }
 function houseDelete(key){
-  openModal(`<h3>删除房源 ${key}</h3><p class="muted">删除后可在后台恢复；此动作默认通知所有房源管理用户。</p>${notifyPicker('all')}
-    <div class="row" style="margin-top:12px"><button class="danger" id="m-ok">确认删除</button><button class="ghost" onclick="closeModal()">取消</button></div>`,
+  openModal(`<h3>永久删除房源 ${key}</h3><p class="muted">房源和实拍图片/视频会一起移除，不能恢复；此动作默认通知所有房源管理用户。</p>${notifyPicker('all')}
+    <div class="row" style="margin-top:12px"><button class="danger" id="m-ok">确认永久删除</button><button class="ghost" onclick="closeModal()">取消</button></div>`,
     async()=>{const r=await api(`/admin/api/house/houses/${encodeURIComponent(key)}/delete`,
-      {method:'POST',body:JSON.stringify({notifyScope:pickScope()})});closeModal();if(r.ok){loadHouses()}else{alert('失败：'+r.error)}});
-}
-function houseRestore(key){
-  openModal(`<h3>恢复房源 ${key}</h3>${notifyPicker('all')}
-    <div class="row" style="margin-top:12px"><button id="m-ok">确认恢复</button><button class="ghost" onclick="closeModal()">取消</button></div>`,
-    async()=>{const r=await api(`/admin/api/house/houses/${encodeURIComponent(key)}/restore`,
-      {method:'POST',body:JSON.stringify({notifyScope:pickScope()})});closeModal();if(r.ok){loadHouses()}else{alert('失败：'+r.error)}});
+      {method:'POST',body:JSON.stringify({notifyScope:pickScope()})});closeModal();if(r.ok){loadHouses()}else{alert('失败：'+(r.detail||r.error))}});
 }
 
 boot();

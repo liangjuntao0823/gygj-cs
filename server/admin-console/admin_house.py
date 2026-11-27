@@ -58,7 +58,7 @@ class HouseConsole:
         ha.deliver_pending(self.store, self.hub)
 
     def list(self, q: str = "", tower: str = "", status: str = "",
-             include_deleted: bool = True) -> dict[str, Any]:
+             include_deleted: bool = False) -> dict[str, Any]:
         doc = self.store.list_houses(include_deleted=include_deleted)
         houses = [h for h in doc.get("houses", []) if _matches(h, q, tower, status)]
         stats = self.store.stats()
@@ -96,6 +96,17 @@ class HouseConsole:
         except Exception as e:
             return {"ok": False, "error": type(e).__name__, "detail": str(e)[:200]}
 
+    def delete(self, room_key: str, notify_scope: str = "all",
+               notify_user_token: str = "") -> dict[str, Any]:
+        """后台删除 = 永久删除：房源/账本/媒体引用一起清掉，不进回收站。"""
+        try:
+            doc = self.store.hard_delete(
+                room_key, "admin", "admin-web",
+                notify_scope=notify_scope, notify_user_token=notify_user_token)
+            return {"ok": True, **doc}
+        except Exception as e:
+            return {"ok": False, "error": type(e).__name__, "detail": str(e)[:200]}
+
     def set_deleted(self, room_key: str, deleted: bool, notify_scope: str = "all",
                     notify_user_token: str = "") -> dict[str, Any]:
         try:
@@ -111,13 +122,13 @@ class HouseConsole:
 
     # ---- 导出 ----
     def export_json(self) -> tuple[bytes, str]:
-        doc = self.store.list_houses(include_deleted=True)
+        doc = self.store.list_houses(include_deleted=False)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         return (json.dumps(doc, ensure_ascii=False, indent=2).encode("utf-8"),
                 f"houses-{stamp}.json")
 
     def export_csv(self) -> tuple[bytes, str]:
-        doc = self.store.list_houses(include_deleted=True)
+        doc = self.store.list_houses(include_deleted=False)
         cols = ["roomKey", "roomNo", "tower", "landlord", "layout", "price",
                 "status", "remark", "password", "revision", "isDeleted",
                 "createdAt", "updatedAt", "updatedBy", "mediaCount"]

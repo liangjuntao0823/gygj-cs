@@ -286,19 +286,15 @@ class HouseConsoleTests(unittest.TestCase):
         self.assertEqual(last["data"]["notifyScope"], "self")
         self.assertEqual(last["data"]["notifyUserToken"], "nt_x")
 
-    def test_delete_writes_notify_scope_to_outbox(self) -> None:
-        res = self.console.set_deleted("2-1006", True, notify_scope="none")
+    def test_delete_is_permanent_and_queues_scope(self) -> None:
+        res = self.console.delete("2-1006", notify_scope="none")
         self.assertTrue(res["ok"])
+        self.assertEqual(res["hardDelete"], True)
+        self.assertIsNone(self.console.detail("2-1006"))
+        self.assertEqual([h["roomKey"] for h in self.console.list()["houses"]], ["1-2059"])
         last = self.store.pending_outbox()[-1]
+        self.assertEqual(last["data"]["hardDelete"], True)
         self.assertEqual(last["data"]["notifyScope"], "none")
-
-    def test_delete_and_restore(self) -> None:
-        res = self.console.set_deleted("2-1006", True)
-        self.assertTrue(res["ok"])
-        self.assertTrue(self.console.detail("2-1006")["isDeleted"])
-        res2 = self.console.set_deleted("2-1006", False)
-        self.assertTrue(res2["ok"])
-        self.assertFalse(self.console.detail("2-1006")["isDeleted"])
 
     def test_export_json_and_csv(self) -> None:
         jdata, jname = self.console.export_json()
@@ -446,6 +442,33 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(hub.broadcast_calls, [])       # 后台不再直接广播
         last = store.pending_outbox()[-1]
         self.assertEqual(last["data"]["notifyScope"], "all")  # 只留一条待发事件
+
+    def test_house_delete_is_permanent_and_restore_is_gone(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        auth = aauth.AdminAuth(tmp.name)
+        store = hs.HouseStore(Path(tmp.name) / "house.db")
+        self.addCleanup(store.close)
+        store.upsert_house({"roomKey": "1-2059", "roomNo": "2059", "tower": 1,
+                            "landlord": "康", "layout": "单间", "price": 1000,
+                            "status": "available"}, operator="t")
+        hub = FakeHub({})
+        admin = type("A", (), {"auth": auth, "sys": None, "meter": None,
+                               "house": ahou.HouseConsole(store), "hub": hub})()
+        login = FakeHandler("/admin/api/login", {"username": "admin", "password": "admin"})
+        aw.route_request(login, "POST", "/admin/api/login", admin)
+        cookie = f"admin_session={login.cookies['admin_session']}"
+        h = FakeHandler("/admin/api/house/houses/1-2059/delete",
+                        {"notifyScope": "none"}, cookie=cookie)
+        self.assertTrue(aw.route_request(h, "POST", "/admin/api/house/houses/1-2059/delete", admin))
+        self.assertEqual(h.status, 200)
+        self.assertIsNone(store.get_house("1-2059"))
+        self.assertEqual(hub.broadcast_calls, [])
+        self.assertEqual(store.pending_outbox()[-1]["data"]["notifyScope"], "none")
+        h2 = FakeHandler("/admin/api/house/houses/1-2059/restore", {}, cookie=cookie)
+        self.assertTrue(aw.route_request(h2, "POST", "/admin/api/house/houses/1-2059/restore", admin))
+        self.assertEqual(h2.status, 410)
+        self.assertEqual(h2.json_body()["error"], "recycle_bin_removed")
 
     def test_non_admin_path_returns_false(self) -> None:
         self.assertFalse(aw.route_request(FakeHandler("/api/meter/health"), "GET",

@@ -551,9 +551,10 @@ class HouseStore:
     # 物理删除（硬删，不进回收站）
     # ------------------------------------------------------------------
     def hard_delete(self, room_key: str, operator: str,
-                    origin_device_id: str = "") -> dict[str, Any]:
+                    origin_device_id: str = "", notify_scope: str = "all",
+                    notify_user_token: str = "") -> dict[str, Any]:
         """彻底删除房源：级联清掉账本事件、字段变更、媒体引用与房源行；
-        outbox 仍写一条删除事件，供其他接入设备同步本地删除。媒体实体仍留在 COS，不在此处清理。"""
+        outbox 仍写一条删除事件，供其他接入设备同步本地删除。"""
         with self._lock:
             conn = self._conn
             existing = conn.execute(
@@ -579,7 +580,10 @@ class HouseStore:
             except Exception:
                 pass
             self._write_outbox(conn, event_id, room_key, action, operator, title, body,
-                               {"deleted": True, "hardDelete": True}, origin_device_id, now)
+                               {"deleted": True, "hardDelete": True,
+                                "notifyScope": notify_scope,
+                                "notifyUserToken": notify_user_token},
+                               origin_device_id, now)
             conn.commit()
             return {"ok": True, "roomKey": room_key, "hardDelete": True}
 

@@ -335,21 +335,24 @@ def route_request(handler: Any, method: str, path: str, admin: Any) -> bool:
             res["notify"] = {"queued": scope != "none", "scope": scope}
         _send_json(handler, 200 if res.get("ok") else 400, res)
         return True
-    if len(segs) == 2 and segs[1] in ("delete", "restore") and method == "POST":
+    if len(segs) == 2 and segs[1] == "delete" and method == "POST":
         body = _read_body(handler)
-        deleted = segs[1] == "delete"
         scope = str(body.get("notifyScope") or "all").lower()
         notify_user_token = ""
         if scope == "self":
             notify_user_token = _resolve_user_token(admin, body.get("notifyUser", ""))
             if not notify_user_token:
                 scope = "none"
-        res = admin.house.set_deleted(
-            segs[0], deleted, notify_scope=scope, notify_user_token=notify_user_token)
+        res = admin.house.delete(
+            segs[0], notify_scope=scope, notify_user_token=notify_user_token)
         if res.get("ok"):
             _spawn_house_delivery(admin, scope)
             res["notify"] = {"queued": scope != "none", "scope": scope}
         _send_json(handler, 200 if res.get("ok") else 400, res)
+        return True
+    if len(segs) == 2 and segs[1] == "restore" and method == "POST":
+        _send_json(handler, 410, {"ok": False, "error": "recycle_bin_removed",
+                                  "note": "后台删除已改为永久删除，不再提供恢复"})
         return True
     if len(segs) == 2 and segs[1] == "ledger" and method == "GET":
         _send_json(handler, 200, {"ok": True, "ledger": admin.house.ledger(segs[0])})
@@ -368,6 +371,7 @@ def _serve_static(handler: Any) -> None:
         body = b"<h1>admin console missing</h1>"
     handler.send_response(200)
     handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Cache-Control", "no-store, max-age=0")
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
