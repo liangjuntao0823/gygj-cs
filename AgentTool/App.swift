@@ -310,8 +310,7 @@ enum BackupImportHandler {
             BackupLogStore.log(category: "备份", action: "导入外部备份", result: "失败", detail: error.localizedDescription)
         }
     }
-
-
+}
 
 // 房源板块专用 ModelContext（独立 HouseStore 容器）。
 // 主 App 页面继续用主容器的 @Environment(\.modelContext)；房源页面用 houseModelContext。
