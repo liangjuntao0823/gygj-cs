@@ -983,13 +983,6 @@ struct TaskCenterView: View {
                                                 Label("撤回本次改动（本地+云端恢复）", systemImage: "arrow.uturn.backward")
                                             }
                                         }
-                                        if record.roomKeys.contains(where: { serverMissingKeys.contains($0) }) {
-                                            Button(role: .destructive) {
-                                                localPurgeTarget = record
-                                            } label: {
-                                                Label("彻底删除本机房源（服务器已删）", systemImage: "trash.slash")
-                                            }
-                                        }
                                         Button(role: .destructive) {
                                             purgeTarget = record
                                         } label: {
@@ -1001,6 +994,19 @@ struct TaskCenterView: View {
                                             .padding(.vertical, 8)
                                             .padding(.horizontal, 12)
                                             .background(Color.gray.opacity(0.12))
+                                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                                    }
+                                }
+                                if record.roomKeys.contains(where: { serverMissingKeys.contains($0) }) {
+                                    Button(role: .destructive) {
+                                        localPurgeTarget = record
+                                    } label: {
+                                        Label("彻底删除本机房源（服务器已删除）", systemImage: "trash.slash")
+                                            .font(.footnote.weight(.medium))
+                                            .frame(maxWidth: .infinity)
+                                            .padding(.vertical, 7)
+                                            .background(Color.red.opacity(0.10))
+                                            .foregroundColor(.red)
                                             .clipShape(RoundedRectangle(cornerRadius: 8))
                                     }
                                 }
