@@ -28,8 +28,8 @@ from typing import Any
 
 PREFIX = "/api/house"
 PUBLIC_PREFIX = "/api/public"
-# 媒体上传上限 60MB（图片 / 视频）
-MEDIA_BODY_LIMIT = 60 * 1024 * 1024
+# 媒体上传上限 500MB（图片 / 视频）
+MEDIA_BODY_LIMIT = 500 * 1024 * 1024
 # 备份 zip 上传上限 200MB（全量备份含媒体镜像，体积大于单条媒体）
 BACKUP_BODY_LIMIT = 200 * 1024 * 1024
 # 备份目录归属：当前单库固定 default；阶段 D 可按令牌隔离
@@ -212,14 +212,34 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
                 room_key = segs[0]
                 file_name = handler.headers.get("X-File-Name") or _q(handler).get("filename", "")
                 kind = handler.headers.get("X-Kind") or ("video" if file_name.lower().endswith((".mov", ".mp4", ".m4v")) else "image")
-                data = read_raw(MEDIA_BODY_LIMIT)
-                if data is None:
-                    return send(400, {"ok": False, "error": "bad_or_too_large"})
-                if not file_name:
+                try:
+                    length = int(handler.headers.get("Content-Length") or 0)
+                except (TypeError, ValueError):
+                    length = 0
+                # 诊断日志：只记录文件名/类型/长度/传输头，不记录令牌和请求体
+                print(
+                    f"[media] upload room={room_key!r} file={file_name!r} kind={kind!r} "
+                    f"length={length} te={handler.headers.get('Transfer-Encoding')!r} "
+                    f"ct={handler.headers.get('Content-Type')!r} "
+                    f"ua={handler.headers.get('User-Agent')!r}",
+                    flush=True,
+                )
+                if length <= 0 or length > MEDIA_BODY_LIMIT:
+                    print(f"[media] reject length={length} limit={MEDIA_BODY_LIMIT} file={file_name!r} path={handler.path}", flush=True)
+                    # 请求体未消费就回 400：必须关闭 keep-alive，否则剩余二进制会被当成下一个请求行解析
+                    handler.close_connection = True
+                    return send(400, {"ok": False, "error": "bad_or_too_large", "length": length, "limit": MEDIA_BODY_LIMIT})
+                if not file_name or not store.media.safe_file_name(file_name):
                     file_name = store.media.new_file_name(room_key, "mp4" if kind == "video" else "jpg")
                 try:
-                    rel = store.media.save_house_media(room_key, file_name, data)
+                    # 文件名后缀白名单只用于常规落盘；HTTP 上传入口放宽未知后缀，
+                    # 避免历史/跨端文件名（.heif/.avi/编码差异）让整次媒体上传 400。
+                    rel = store.media.save_house_media_stream(
+                        room_key, file_name, handler.rfile, length, allow_unknown_ext=True)
                 except ValueError as e:
+                    print(f"[media] fail room={room_key!r} file={file_name!r} kind={kind!r} length={length} error={e!r}", flush=True)
+                    # 出错时请求体可能仍未读完，关闭连接，避免 Bad request version 噪声
+                    handler.close_connection = True
                     return send(400, {"ok": False, "error": str(e)})
                 return send(200, {"ok": True, "objectKey": rel,
                                   "fileName": store.media.safe_file_name(file_name),

@@ -58,6 +58,9 @@ def safe_file_name(file_name: str) -> str:
     # 文件名只取最后一段，杜绝把目录带进文件名
     name = str(file_name).replace("\\", "/").rsplit("/", 1)[-1].strip()
     name = re.sub(r'[\x00-\x1f<>:"|?*/]', "", name)
+    # 单独一个 . / .. 会让 Path 解析到上级目录，直接拒绝
+    if name in ("", ".", ".."):
+        return ""
     return name
 
 
@@ -94,6 +97,10 @@ class MediaStore:
     def rel_house(room_key: str, file_name: str) -> str:
         return f"houses/{safe_room_key(room_key)}/{safe_file_name(file_name)}"
 
+    @staticmethod
+    def safe_file_name(file_name: str) -> str:
+        return safe_file_name(file_name)
+
     # ---- 房源媒体 ----
     def save_house_media(self, room_key: str, file_name: str, data: bytes) -> str:
         fn = safe_file_name(file_name)
@@ -102,6 +109,43 @@ class MediaStore:
         path = self.house_path(room_key, fn)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
+        return self.rel_house(room_key, fn)
+
+    def save_house_media_stream(self, room_key: str, file_name: str, src,
+                                length: int, allow_unknown_ext: bool = False) -> str:
+        """流式落盘：边读边写，避免大视频把整个 body 读进内存。
+
+        allow_unknown_ext=True 时不再按扩展名白名单拒绝。App 端历史/跨端文件名
+        可能带未知后缀（例如 .heif/.avi 或 URLSession 传输时的编码差异），
+        此时按清洗后的原名落盘即可；路径已限制在 media_root/houses/<roomKey>/ 下，
+        且该入口始终经过 Bearer 鉴权。
+        """
+        fn = safe_file_name(file_name)
+        if not fn:
+            raise ValueError("invalid media file name")
+        if not allow_unknown_ext and _ext(fn) not in _MEDIA_EXTS:
+            raise ValueError("unsupported media extension")
+        path = self.house_path(room_key, fn)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".part")
+        remaining = int(length)
+        try:
+            with open(tmp, "wb") as f:
+                while remaining > 0:
+                    chunk = src.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    remaining -= len(chunk)
+            if remaining != 0:
+                raise ValueError("incomplete media body")
+            tmp.replace(path)
+        except Exception:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+            raise
         return self.rel_house(room_key, fn)
 
     def read_house_media(self, room_key: str, file_name: str) -> bytes | None:
