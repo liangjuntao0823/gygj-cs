@@ -321,6 +321,11 @@ enum MediaNaming {
         kind == "video" ? ((fileName as NSString).deletingPathExtension) + ".mp4" : fileName
     }
 
+    /// 服务器落盘名：视频统一 `.mp4`（本地文件名可仍是 `.mov`），图片保持原名。
+    static func remoteName(fileName: String, kind: String) -> String {
+        kind == "video" ? cloudName(fileName: fileName, kind: kind) : fileName
+    }
+
     /// 对账用的「规范键」。
     /// - 视频：.mov / .mp4 统一归一到「同名 .mp4」，正确识别「本地 .mov ↔ 云端 .mp4」本就是同一视频，
     ///   不会再因为两套名字互斥而误判、死循环；
@@ -2468,7 +2473,7 @@ enum CosUploader {
     }
 
     /// 图片轻压缩：长边压到 ≤1600px、JPEG 质量 0.8（参照微信「不加载原图」的画质，不过度压缩，观感基本无损）
-    private static func compressedImageData(from url: URL) -> Data? {
+    static func compressedImageData(from url: URL) -> Data? {
         guard let image = UIImage(contentsOfFile: url.path) else { return nil }
         let maxSide: CGFloat = 1600
         let w = image.size.width
@@ -2480,6 +2485,42 @@ enum CosUploader {
         }
         let target = CGSize(width: max(Int(w * scale), 1), height: max(Int(h * scale), 1))
         return scaledJPEG(image, target: target, quality: 0.8)
+    }
+
+    // MARK: - 服务器媒体上传前的压缩（房源新增/编辑复用分享压缩同一套参数）
+
+    /// 图片：压缩开关开 → 长边 ≤1600、JPEG 0.8；关 → 只重编码 0.85（保持原尺寸）。
+    /// 返回 nil 表示数据不是可解码图片，调用方保留原数据。
+    static func optimizedImageDataForUpload(_ data: Data, compress: Bool) -> Data? {
+        guard let image = UIImage(data: data) else { return nil }
+        let w = image.size.width
+        let h = image.size.height
+        guard w > 0, h > 0 else { return nil }
+        if !compress {
+            return image.jpegData(compressionQuality: 0.85)
+        }
+        let maxSide: CGFloat = 1600
+        let scale = min(maxSide / max(w, h), 1)
+        if scale >= 1 {
+            return image.jpegData(compressionQuality: 0.8)
+        }
+        let target = CGSize(width: max(Int(w * scale), 1), height: max(Int(h * scale), 1))
+        return scaledJPEG(image, target: target, quality: 0.8)
+    }
+
+    /// 视频：统一转 mp4（H.264/AAC）。
+    /// 压缩开关开 → 长边 960 / 约 1 Mbps；关 → 原质量转封装，画质不损失。
+    static func optimizedVideoDataForUpload(from url: URL, compress: Bool) async -> Data? {
+        await uploadVideoData(from: url, compress: compress)
+    }
+
+    /// 内存里的视频数据（旧版本已落盘的 .mov 补传路径）先落临时文件，再走同一套转码。
+    static func optimizedVideoDataForUpload(from data: Data, compress: Bool) async -> Data? {
+        let temp = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString + ".mov")
+        defer { try? FileManager.default.removeItem(at: temp) }
+        guard (try? data.write(to: temp)) != nil else { return nil }
+        return await optimizedVideoDataForUpload(from: temp, compress: compress)
     }
 
     /// 在签名 URL 上追加版本参数 v。v 不参与签名（q-url-param-list 为空，COS 服务端忽略未声明参数，签名仍有效）；

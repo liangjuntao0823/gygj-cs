@@ -2077,6 +2077,8 @@ struct ShareSettingsPage: View {
                     set: { newValue in
                         compressOnShare = newValue
                         UserDefaults.standard.set(newValue, forKey: "compressOnShare")
+                        // 分享扩展与主 App 上传保持同一压缩口径
+                        SharedBridge.defaults.set(newValue, forKey: SharedBridge.kCompress)
                     }
                 )) {
                     VStack(alignment: .leading, spacing: 2) {

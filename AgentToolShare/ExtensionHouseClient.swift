@@ -95,8 +95,8 @@ enum ExtensionHouseClient {
         return (ext == "mp4" || ext == "mov" || ext == "m4v") ? "video" : "image"
     }
 
-    private static func objectKey(roomKey: String, fileName: String) -> String {
-        "houses/\(roomKey)/\(fileName)"
+    private static func objectKey(roomKey: String, fileName: String, kind: String) -> String {
+        "houses/\(roomKey)/\(MediaNaming.remoteName(fileName: fileName, kind: kind))"
     }
 
     private static func request(_ path: String, method: String,
@@ -144,11 +144,12 @@ enum ExtensionHouseClient {
               let url = URL(string: "/api/house/media/\(encoded(roomKey))", relativeTo: base) else {
             throw ExtHouseError(message: "服务器地址无效")
         }
+        let uploadName = MediaNaming.remoteName(fileName: fileName, kind: kind)
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.timeoutInterval = 120
+        req.timeoutInterval = 300
         req.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
-        req.setValue(fileName, forHTTPHeaderField: "X-File-Name")
+        req.setValue(uploadName, forHTTPHeaderField: "X-File-Name")
         req.setValue(kind, forHTTPHeaderField: "X-Kind")
         if let t = token, !t.isEmpty {
             req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization")
@@ -202,8 +203,10 @@ enum ExtensionHouseClient {
     /// 新增/编辑；expectedRevision 为编辑前修订号（乐观锁），新增传 nil；返回服务器回写的权威记录
     static func upsert(_ record: CloudHouseRecord, expectedRevision: Int?) async throws -> CloudHouseRecord {
         let media: [[String: Any]] = record.mediaNames.map { name in
-            ["objectKey": objectKey(roomKey: record.roomKey, fileName: name),
-             "fileName": name, "kind": kind(ofName: name)]
+            let kind = kind(ofName: name)
+            let remoteName = MediaNaming.remoteName(fileName: name, kind: kind)
+            return ["objectKey": objectKey(roomKey: record.roomKey, fileName: name, kind: kind),
+                    "fileName": remoteName, "kind": kind]
         }
         var body: [String: Any] = [
             "roomKey": record.roomKey,

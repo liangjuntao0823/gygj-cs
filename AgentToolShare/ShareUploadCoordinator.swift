@@ -107,15 +107,20 @@ final class ShareUploadCoordinator: ObservableObject {
         }
     }
 
-    /// 入库：图片 UIImage→JPEG 0.85（与 loadPhotos 同参数）；视频原文件+真实容器后缀（与 loadVideos 同口径）。
+    /// 入库：图片走设置页同一套压缩参数（长边≤1600/JPEG 0.8）；视频转 720p H.264 mp4。
     /// 逐张 autoreleasepool，控制扩展内存峰值。
-    private func ingest(_ item: StagedItem, roomKey: String) -> String? {
+    private func ingest(_ item: StagedItem, roomKey: String) async -> String? {
+        let compress = SharedBridge.mirroredCompress
         if item.kind == "video" {
+            if let optimized = await CosUploader.optimizedVideoDataForUpload(
+                from: item.url, compress: compress) {
+                return MediaStore.save(data: optimized, ext: "mov", roomKey: roomKey)
+            }
             return MediaStore.saveFile(from: item.url, roomKey: roomKey)
         }
         return autoreleasepool { () -> String? in
-            guard let image = UIImage(contentsOfFile: item.url.path),
-                  let jpeg = image.jpegData(compressionQuality: 0.85) else { return nil }
+            guard let data = try? Data(contentsOf: item.url),
+                  let jpeg = CosUploader.optimizedImageDataForUpload(data, compress: compress) else { return nil }
             return MediaStore.save(data: jpeg, ext: "jpg", roomKey: roomKey)
         }
     }
@@ -141,7 +146,7 @@ final class ShareUploadCoordinator: ObservableObject {
         phaseText = "媒体入库中"
         var saved: [(fileName: String, kind: String)] = []
         for item in staged {
-            if let name = ingest(item, roomKey: roomKey) {
+            if let name = await ingest(item, roomKey: roomKey) {
                 saved.append((name, item.kind))
                 HouseMediaUploadQueue.enqueue(roomKey: roomKey, fileName: name, kind: item.kind)
             } else {

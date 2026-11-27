@@ -48,9 +48,10 @@ final class HouseSyncEngine: ObservableObject {
 
     // MARK: - 媒体名映射
 
-    /// 本地 MediaItem -> 服务器磁盘相对引用
+    /// 本地 MediaItem -> 服务器磁盘相对引用。
+    /// 视频本地名可能是 .mov，但服务器统一落 .mp4，避免安卓/微信不识别 QuickTime 容器。
     static func objectKey(roomKey: String, fileName: String, kind: String) -> String {
-        "houses/\(roomKey)/\(fileName)"
+        "houses/\(roomKey)/\(MediaNaming.remoteName(fileName: fileName, kind: kind))"
     }
 
     /// 服务器媒体 objectKey -> 本地 MediaItem.fileName
@@ -185,9 +186,10 @@ final class HouseSyncEngine: ObservableObject {
 
     private func mediaArray(_ house: House, roomKey: String) -> [[String: Any]] {
         house.mediaItems.map { item in
+            let remoteName = MediaNaming.remoteName(fileName: item.fileName, kind: item.kind)
             let key = Self.objectKey(roomKey: roomKey, fileName: item.fileName,
                                     kind: item.kind)
-            return ["objectKey": key, "fileName": item.fileName,
+            return ["objectKey": key, "fileName": remoteName,
                     "kind": item.kind]
         }
     }

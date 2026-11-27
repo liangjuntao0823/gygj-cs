@@ -322,16 +322,38 @@ final class HouseRemoteClient {
               let url = URL(string: path, relativeTo: base) else {
             throw HouseAPIError(message: "服务器地址无效")
         }
+
+        // 上传前统一走分享压缩同一套参数：图片长边 ≤1600/JPEG 0.8；视频 960/1 Mbps H.264 mp4。
+        // 本地旧版本已经落盘的 .mov 也在这里补转码，避免原片直传。
+        var uploadData = data
+        var uploadName = MediaNaming.remoteName(fileName: fileName, kind: kind)
+        let ext = (fileName as NSString).pathExtension.lowercased()
+        if kind == "video" {
+            let container = MediaNaming.videoExtension(for: data)
+            // 只补转真正的 QuickTime 原片；已是 mp4 容器（含本地 .mov 名但内容已压成 mp4）不重复转码。
+            if container == "mov" {
+                if let mp4 = await CosUploader.optimizedVideoDataForUpload(
+                    from: data, compress: shareCompressionEnabled) {
+                    uploadData = mp4
+                    uploadName = (uploadName as NSString).deletingPathExtension + ".mp4"
+                }
+            }
+        } else if ["jpg", "jpeg"].contains(ext), data.count > 2_500_000 {
+            if let jpeg = CosUploader.optimizedImageDataForUpload(data, compress: true) {
+                uploadData = jpeg
+            }
+        }
+
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.timeoutInterval = 120
+        req.timeoutInterval = 300
         req.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
-        req.setValue(fileName, forHTTPHeaderField: "X-File-Name")
+        req.setValue(uploadName, forHTTPHeaderField: "X-File-Name")
         req.setValue(kind, forHTTPHeaderField: "X-Kind")
         if let t = token, !t.isEmpty {
             req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization")
         }
-        req.httpBody = data
+        req.httpBody = uploadData
         let (respData, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse else {
             throw HouseAPIError(message: "媒体上传失败（服务器响应无效）")
