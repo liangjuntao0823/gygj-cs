@@ -69,6 +69,31 @@ header.top{display:flex;justify-content:space-between;align-items:center;margin-
 .chk{display:inline-flex;align-items:center;gap:6px;background:#f8fafc;border:1px solid var(--line);border-radius:8px;padding:6px 10px;margin:0 8px 8px 0}
 .chk input{width:auto}
 .device-name{font-weight:600}
+.table-wrap{width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior-x:contain}
+.table-wrap table{min-width:760px}
+@media (max-width:720px){
+  #wrap{padding:12px 10px}
+  header.top{flex-direction:column;align-items:flex-start;gap:10px}
+  header.top .row{width:100%;justify-content:flex-start}
+  .tabs{flex-wrap:nowrap;overflow-x:auto;padding-bottom:4px;gap:6px}
+  .tabs button{flex:0 0 auto;padding:8px 10px}
+  .card{padding:12px;border-radius:10px}
+  h2{font-size:15px}
+  .row{gap:8px}
+  .row > input,.row > select{flex:1 1 calc(50% - 8px);min-width:0;width:auto}
+  .row > button{flex:0 0 auto}
+  #h-q{flex:1 1 100%}
+  .stat{min-width:calc(50% - 8px);padding:10px}
+  .detail-grid{grid-template-columns:1fr}
+  .modal .box{width:calc(100vw - 20px);max-height:92vh;overflow:auto;padding:16px}
+  .media-item{width:calc(33.333vw - 10px);height:calc(33.333vw - 10px);max-width:96px;max-height:96px}
+  .media-item .media-name{font-size:9px}
+  .notify-opt{flex-wrap:wrap}
+  th,td{padding:7px 8px;font-size:12px;white-space:nowrap}
+  .table-wrap table{min-width:720px}
+  #media-viewer{padding:8px}
+  #media-viewer .close{top:8px;right:8px}
+}
 </style>
 </head>
 <body>
@@ -117,11 +142,11 @@ header.top{display:flex;justify-content:space-between;align-items:center;margin-
       <div class="row" id="sys-stats"></div>
       <div class="card">
         <h2>服务进程</h2>
-        <table id="sys-svc"><thead><tr><th>服务</th><th>状态</th><th>子状态</th><th>PID</th><th>内存</th><th>操作</th></tr></thead><tbody></tbody></table>
+        <div class="table-wrap"><table id="sys-svc"><thead><tr><th>服务</th><th>状态</th><th>子状态</th><th>PID</th><th>内存</th><th>操作</th></tr></thead><tbody></tbody></table></div>
       </div>
       <div class="card">
         <h2>后台操作日志</h2>
-        <table id="sys-audit"><thead><tr><th>时间</th><th>操作人</th><th>动作</th><th>目标</th><th>详情</th></tr></thead><tbody></tbody></table>
+        <div class="table-wrap"><table id="sys-audit"><thead><tr><th>时间</th><th>操作人</th><th>动作</th><th>目标</th><th>详情</th></tr></thead><tbody></tbody></table></div>
       </div>
     </section>
 
@@ -141,10 +166,10 @@ header.top{display:flex;justify-content:space-between;align-items:center;margin-
           <h2 style="margin:0">值守账户</h2>
           <button class="ghost" id="meter-export">导出最新快照</button>
         </div>
-        <table id="meter-table" style="margin-top:10px"><thead><tr>
+        <div class="table-wrap"><table id="meter-table" style="margin-top:10px"><thead><tr>
           <th>App 用户</th><th>设备</th><th>状态</th><th>阈值</th><th>轮询</th><th>低电量</th>
           <th>电表</th><th>推送</th><th>最近错误</th><th>操作</th>
-        </tr></thead><tbody></tbody></table>
+        </tr></thead><tbody></tbody></table></div>
       </div>
     </section>
 
@@ -161,7 +186,7 @@ header.top{display:flex;justify-content:space-between;align-items:center;margin-
           <h2 style="margin:0">接入用户与接收设备</h2>
           <button class="ghost" id="push-refresh">刷新</button>
         </div>
-        <div style="overflow:auto;margin-top:10px">
+        <div class="table-wrap" style="margin-top:10px">
           <table id="push-users"><thead><tr>
             <th>App 用户</th><th>接收设备</th><th>设备状态</th><th>实际接收板块</th><th>房源权限</th><th>操作</th>
           </tr></thead><tbody></tbody></table>
@@ -178,9 +203,9 @@ header.top{display:flex;justify-content:space-between;align-items:center;margin-
         </div>
         <p class="subtitle" style="margin:8px 0 10px">只有开启的用户才能读写房源库；关闭后即使推送中心仍订阅房源，也不会收到房源通知。</p>
         <div class="row" id="house-users-summary" style="margin-bottom:10px"></div>
-        <table id="house-users-table"><thead><tr>
+        <div class="table-wrap"><table id="house-users-table"><thead><tr>
           <th>App 用户</th><th>设备</th><th>房源接入</th><th>推送通道</th><th>更新时间</th><th>操作</th>
-        </tr></thead><tbody></tbody></table>
+        </tr></thead><tbody></tbody></table></div>
       </div>
       <div class="card">
         <div class="row">
@@ -195,10 +220,10 @@ header.top{display:flex;justify-content:space-between;align-items:center;margin-
       </div>
       <div class="card">
         <div class="row" id="house-stats" style="margin-bottom:10px"></div>
-        <table id="house-table"><thead><tr>
+        <div class="table-wrap"><table id="house-table"><thead><tr>
           <th>房号</th><th>座</th><th>房东</th><th>户型</th><th>租金</th><th>状态</th>
-          <th>备注</th><th>媒体</th><th>版本</th><th>更新时间</th><th>操作</th>
-        </tr></thead><tbody></tbody></table>
+          <th>备注</th><th>媒体</th><th>版本</th><th>最后维护人</th><th>更新时间</th><th>操作</th>
+        </tr></thead><tbody></tbody></table></div>
       </div>
     </section>
   </div>
@@ -508,9 +533,10 @@ async function loadHouses(){
     <tr><td>${h.roomNo}</td><td>${h.tower}座</td><td>${h.landlord||'—'}</td><td>${h.layout||'—'}</td>
     <td>${h.price}</td><td>${h.status==='rented'?'<span class="tag a">已租</span>':'<span class="tag g">待租</span>'}</td>
     <td class="muted">${h.remark||''}</td><td>${(h.media||[]).length}</td><td>${h.revision}</td>
+    <td>${esc(h.updatedBy||'—')}</td>
     <td class="muted">${(h.updatedAt||'').slice(0,16)}</td>
     <td><button class="ghost" onclick="houseDetail(${i})">详情/编辑</button></td></tr>`).join('')
-    ||'<tr><td colspan="11" class="muted">暂无房源</td></tr>';
+    ||'<tr><td colspan="12" class="muted">暂无房源</td></tr>';
 }
 $('h-search').onclick=loadHouses;
 $('h-export-json').onclick=()=>location.href='/admin/api/house/export?format=json';
@@ -573,6 +599,8 @@ function houseDetail(i){
       ${f('roomNo',h.roomNo)}${f('tower',h.tower)}${f('landlord',h.landlord)}${f('layout',h.layout)}
       ${f('price',h.price)}${f('password',h.password)}${f('remark',h.remark)}
       <div class="field"><label>状态</label><select id="f-status"><option value="available" ${h.status==='available'?'selected':''}>待租</option><option value="rented" ${h.status==='rented'?'selected':''}>已租</option></select></div>
+      <div class="field"><label>最后维护人</label><div class="muted">${esc(h.updatedBy||'—')}</div></div>
+      <div class="field"><label>最后更新时间</label><div class="muted">${esc((h.updatedAt||'—').slice(0,16))}</div></div>
     </div>
     <div class="field"><label>媒体（${(h.media||[]).length}）</label><div class="media">${media||'<span class="media-empty">无</span>'}</div></div>
     <div class="field"><label>账本</label><ul class="ledger">${ledger||'<li class="muted">无记录</li>'}</ul></div>

@@ -39,6 +39,17 @@ struct RemoteMedia: Codable, Identifiable, Hashable {
     var id: String { objectKey }
 }
 
+/// 单次媒体回补结果：成功落盘名单 + 失败名单，供任务中心结算。
+struct DownloadedMedia {
+    let fileName: String
+    let kind: String
+}
+
+struct MediaDownloadResult {
+    let files: [DownloadedMedia]
+    let failedFiles: [String]
+}
+
 struct RemoteHouseList: Codable {
     let ok: Bool
     let serverTime: String?
@@ -556,12 +567,15 @@ final class HouseRemoteClient {
     }
 
     /// 服务器模式回补本地缺失媒体：按本地记录名单逐个从服务器下载落盘，已存在的跳过；
-    /// 单个缺失跳过不中断整批。返回本次新落盘的 (fileName, kind)。
-    func downloadMissingMedia(roomKey: String, records: [(fileName: String, kind: String)]) async -> [(fileName: String, kind: String)] {
+    /// 单个缺失跳过不中断整批。返回本次新落盘的文件及失败名单，供任务中心结算。
+    func downloadMissingMedia(roomKey: String, records: [(fileName: String, kind: String)],
+                              onProgress: ((Int, Int, String) -> Void)? = nil) async -> MediaDownloadResult {
         let existing = Set(MediaStore.existingFileNames(roomKey: roomKey).map { MediaNaming.canonicalKey($0) })
-        var done: [(fileName: String, kind: String)] = []
+        var done: [DownloadedMedia] = []
+        var failed: [String] = []
         let imageExts = [".jpg", ".jpeg", ".png", ".heic", ".webp", ".gif"]
-        for record in records {
+        for (idx, record) in records.enumerated() {
+            defer { onProgress?(idx + 1, records.count, record.fileName) }
             let name = record.fileName
             let lower = name.lowercased()
             let isVideo = record.kind == "video" || lower.hasSuffix(".mp4") || lower.hasSuffix(".mov") || lower.hasSuffix(".m4v")
@@ -586,7 +600,10 @@ final class HouseRemoteClient {
                     break
                 }
             }
-            guard let downloaded = data else { continue }
+            guard let downloaded = data else {
+                failed.append(name)
+                continue
+            }
 
             let saveName: String
             if isVideo {
@@ -595,10 +612,13 @@ final class HouseRemoteClient {
             } else {
                 saveName = remoteName
             }
-            guard MediaStore.write(data: downloaded, fileName: saveName, roomKey: roomKey) else { continue }
-            done.append((saveName, isVideo ? "video" : "image"))
+            guard MediaStore.write(data: downloaded, fileName: saveName, roomKey: roomKey) else {
+                failed.append(name)
+                continue
+            }
+            done.append(DownloadedMedia(fileName: saveName, kind: isVideo ? "video" : "image"))
         }
-        return done
+        return MediaDownloadResult(files: done, failedFiles: failed)
     }
 
     // MARK: 配置 / 名片 / 分享记录（服务器权威）

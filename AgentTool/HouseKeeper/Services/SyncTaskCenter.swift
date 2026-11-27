@@ -9,7 +9,8 @@ import SwiftData
 enum SyncTaskKind: String, Codable, CaseIterable {
     case cloudPull   // 从云端拉下来
     case pushUp      // 把本机改动传上去
-    case media       // 搬媒体（上传/补传/下载）
+    case media       // 搬媒体（上传/补传）
+    case mediaDownload // 把服务器媒体下载到本机
     case cloudDelete // 删云端
     case retry       // 补漏与失败重试
     case mediaDelete // 删云端媒体（本地已删，云端对象没删掉）
@@ -19,6 +20,7 @@ enum SyncTaskKind: String, Codable, CaseIterable {
         case .cloudPull: return "从云端拉下来"
         case .pushUp: return "把本机改动传上去"
         case .media: return "搬媒体"
+        case .mediaDownload: return "下载服务器媒体"
         case .cloudDelete: return "删云端"
         case .retry: return "补漏与失败重试"
         case .mediaDelete: return "删云端媒体"
@@ -30,6 +32,7 @@ enum SyncTaskKind: String, Codable, CaseIterable {
         case .cloudPull: return "arrow.triangle.2.circlepath"
         case .pushUp: return "arrow.up.circle"
         case .media: return "photo.on.rectangle.angled"
+        case .mediaDownload: return "arrow.down.circle"
         case .cloudDelete: return "trash"
         case .retry: return "wrench.and.screwdriver"
         case .mediaDelete: return "trash.slash"
@@ -645,7 +648,7 @@ final class TaskRetryPerformer {
             guard let cloudPull else {
                 completion(.failure(message: "请先到房源页，再点重试")); return
             }
-            switch await cloudPull(nil) {
+            switch await cloudPull(item.id) {
             case .finished:
                 completion(.success(note: "同步完成"))
             case .needsConfirmation:
@@ -659,12 +662,59 @@ final class TaskRetryPerformer {
             await retryPushUp(item, completion: completion)
         case .mediaDelete:
             await retryMediaDelete(item, completion: completion)
+        case .mediaDownload:
+            await retryMediaDownload(item, completion: completion)
         case .media, .retry:
             if item.isHouseUpload == true {
                 await retryHouseUpload(item, completion: completion)
             } else {
                 await retryMedia(item, completion: completion)
             }
+        }
+    }
+
+    /// 下载服务器媒体失败后重试：按任务里的房号，把本地缺的文件重新拉回落盘。
+    private func retryMediaDownload(_ item: TaskRecord,
+                                    completion: @escaping (TaskRetryOutcome) -> Void) async {
+        guard let ctx = houseContext else {
+            completion(.failure(message: "数据容器不可用，请重进 App 再试")); return
+        }
+        let local = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
+        var byKey: [String: House] = [:]
+        for h in local where !h.isTrashed { byKey[h.mediaRoomKey] = h }
+        let total = max(item.total, 1)
+        var downloaded = 0
+        var failed = 0
+        SyncTaskCenter.shared.advance(id: item.id, done: item.done, total: total, note: "重新下载媒体…")
+        for key in item.roomKeys {
+            guard let house = byKey[key] else { continue }
+            let records = house.mediaItems.map { ($0.fileName, $0.kind) }
+            guard !records.isEmpty else { continue }
+            let result = await HouseRemoteClient.shared.downloadMissingMedia(
+                roomKey: key,
+                records: records,
+                onProgress: { fileDone, _, name in
+                    Task { @MainActor in
+                        SyncTaskCenter.shared.advance(id: item.id,
+                                                     done: min(total, item.done + fileDone),
+                                                     total: total,
+                                                     note: "下载 \(name)")
+                    }
+                })
+            for f in result.files where !house.mediaItems.contains(where: { $0.fileName == f.fileName }) {
+                let media = MediaItem(fileName: f.fileName, kind: f.kind)
+                media.house = house
+                ctx.insert(media)
+            }
+            downloaded += result.files.count
+            failed += result.failedFiles.count
+            try? ctx.save()
+            NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
+        }
+        if failed == 0 {
+            completion(.success(note: downloaded > 0 ? "已下载 \(downloaded) 个媒体" : "本地已齐全，无需下载"))
+        } else {
+            completion(.failure(message: "还有 \(failed) 个媒体没下载，点重试"))
         }
     }
 

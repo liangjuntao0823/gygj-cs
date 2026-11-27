@@ -11,6 +11,58 @@
 import Foundation
 import SwiftData
 
+/// 一轮服务器→本地拉取的结果：房源元数据变化 + 媒体回补进度，供列表页和任务中心结算。
+struct HousePullResult {
+    let changed: Int
+    let mediaTotal: Int
+    let mediaDownloaded: Int
+    let mediaFailed: Int
+    let mediaTaskID: UUID?
+
+    var didChangeStore: Bool {
+        changed > 0 || mediaDownloaded > 0
+    }
+
+    var mediaNote: String? {
+        guard mediaTotal > 0 else { return nil }
+        let ok = mediaDownloaded
+        if mediaFailed > 0 {
+            return "媒体 \(ok)/\(mediaTotal) 已下载，\(mediaFailed) 个失败"
+        }
+        return "媒体 \(ok)/\(mediaTotal) 已下载"
+    }
+}
+
+/// 手动总刷新的变化预览：先列出服务器变化，再由用户确认应用。
+struct HouseChangePreview {
+    let newKeys: [String]
+    let updatedKeys: [String]
+    let deletedKeys: [String]
+    let hiddenCount: Int
+
+    private func line(_ label: String, _ keys: [String]) -> String {
+        let head = keys.prefix(8).joined(separator: "、")
+        let more = keys.count > 8 ? " 等 \(keys.count) 套" : ""
+        return "• \(label) \(keys.count) 套：\(head)\(more)"
+    }
+
+    var summary: String {
+        var parts: [String] = []
+        if !newKeys.isEmpty { parts.append(line("新增", newKeys)) }
+        if !updatedKeys.isEmpty { parts.append(line("修改", updatedKeys)) }
+        if !deletedKeys.isEmpty { parts.append(line("服务器删除", deletedKeys)) }
+        if parts.isEmpty {
+            return "服务器暂无新增、修改或删除；仍会核对一次，并补齐本机缺失的媒体。"
+        }
+        var text = "服务器变化：\n" + parts.joined(separator: "\n")
+        if hiddenCount > 0 {
+            text += "\n另有 \(hiddenCount) 套仅删除了本地，本机继续隐藏。"
+        }
+        text += "\n\n会先补传本机未上传的改动，再拉取服务器权威数据。"
+        return text
+    }
+}
+
 @MainActor
 final class HouseSyncEngine: ObservableObject {
     static let shared = HouseSyncEngine()
@@ -82,9 +134,11 @@ final class HouseSyncEngine: ObservableObject {
 
     // MARK: - 拉取（服务器 → 本地）
 
-    /// 拉取服务器全量清单并对账应用；返回实际变化的房源数
+    /// 拉取服务器全量清单并对账应用；返回实际变化的房源数与媒体回补结果。
+    /// - Parameter reportMediaTask: 手动总刷新传 true，把媒体回补挂进任务中心；
+    ///   自动对账传 false，不占任务中心，但卡片进度仍然显示。
     @discardableResult
-    func pull(context: ModelContext) async throws -> Int {
+    func pull(context: ModelContext, reportMediaTask: Bool = false) async throws -> HousePullResult {
         // 全量清单：便于识别「曾同步过、但服务器已硬删」的本地孤儿房并一并清除；
         // 纯本地离线未提交的房（revMap 无记录）不会被误删。
         let list = try await HouseRemoteClient.shared.listHouses(since: nil)
@@ -92,19 +146,151 @@ final class HouseSyncEngine: ObservableObject {
         // 不能因为服务器为空就提前 return：后台硬删最后一套房后，本地 revMap 里仍有
         // 该房记录，必须走一次空清单对账，才能把本地孤儿/“双端”徽章清掉。
         let changed = try applyRemote(list.houses, context: context)
+        // 元数据落盘后立刻通知列表重建卡片；媒体回补在卡片已经显示之后进行。
+        NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
         // 记录对账完成后，把本地磁盘缺失的媒体从服务器回补落盘（已存在自动跳过）
-        await backfillMissingMedia(context: context)
-        return changed
+        let media = await backfillMissingMedia(context: context, reportTask: reportMediaTask)
+        if media.downloaded > 0 || media.failed > 0 {
+            // 缩略图/视频首帧在文件落盘后需要重新读盘
+            NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
+        }
+        return HousePullResult(changed: changed,
+                               mediaTotal: media.total,
+                               mediaDownloaded: media.downloaded,
+                               mediaFailed: media.failed,
+                               mediaTaskID: media.taskID)
     }
 
-    /// 遍历在册房源，回补本地磁盘缺失但服务器有的媒体文件；单个失败跳过，不阻断同步。
-    private func backfillMissingMedia(context: ModelContext) async {
-        let houses = (try? context.fetch(FetchDescriptor<House>())) ?? []
-        for h in houses where !h.isTrashed {
-            let records = h.mediaItems.map { ($0.fileName, $0.kind) }
-            guard !records.isEmpty else { continue }
-            _ = await HouseRemoteClient.shared.downloadMissingMedia(roomKey: h.mediaRoomKey, records: records)
+    /// 手动总刷新前先算服务器变化，供确认框列出“新增/修改/删除”套数。
+    func preview(context: ModelContext) async throws -> HouseChangePreview {
+        let list = try await HouseRemoteClient.shared.listHouses(since: nil)
+        let locals = (try? context.fetch(FetchDescriptor<House>())) ?? []
+        var localByKey: [String: House] = [:]
+        for h in locals { localByKey[h.mediaRoomKey] = h }
+        let remoteKeys = Set(list.houses.map { $0.roomKey })
+        var newKeys: [String] = []
+        var updatedKeys: [String] = []
+
+        for r in list.houses {
+            if HouseLocalDeletionStore.contains(r.roomKey) { continue }
+            guard !r.trashed else { continue }
+            guard let local = localByKey[r.roomKey] else {
+                newKeys.append(r.roomKey)
+                continue
+            }
+            let knownRevision = serverRevision(forKey: r.roomKey)
+            if knownRevision != r.revision || !remoteMatches(local, remote: r) {
+                updatedKeys.append(r.roomKey)
+            }
         }
+
+        var deletedKeys: [String] = []
+        for (key, local) in localByKey where !remoteKeys.contains(key) && !local.isTrashed {
+            // 只有曾同步过（有服务器修订记录）的本地房，才可能是服务器硬删；
+            // 纯本地未提交房不算“服务器删除”。
+            if serverRevision(forKey: key) != nil { deletedKeys.append(key) }
+        }
+
+        return HouseChangePreview(newKeys: newKeys.sorted(),
+                                  updatedKeys: updatedKeys.sorted(),
+                                  deletedKeys: deletedKeys.sorted(),
+                                  hiddenCount: HouseLocalDeletionStore.count())
+    }
+
+    private func remoteMatches(_ local: House, remote r: RemoteHouse) -> Bool {
+        guard local.roomNo == pureRoomNo(r.roomNo, tower: r.tower),
+              local.tower == r.tower,
+              local.landlord == r.landlord,
+              local.layout == r.layout,
+              local.price == r.price,
+              local.password == r.password,
+              local.remark == r.remark,
+              local.statusRaw == r.status,
+              local.isTrashed == r.trashed else { return false }
+        let localMedia = Set(local.mediaItems.map { MediaNaming.canonicalKey($0.fileName) })
+        let remoteMedia = Set((r.media ?? []).map {
+            MediaNaming.canonicalKey(Self.localFileName(objectKey: $0.objectKey,
+                                                        kind: $0.kind,
+                                                        roomKey: r.roomKey))
+        })
+        return localMedia == remoteMedia
+    }
+
+    func serverRevision(forKey key: String) -> Int? {
+        revMap[key]
+    }
+
+    /// 遍历在册房源，回补本地磁盘缺失但服务器有的媒体文件。
+    /// - Parameter reportTask: true 时创建任务中心 `mediaDownload` 任务，可失败重试；
+    ///   false 时只更新卡片进度，用于自动对账。
+    private func backfillMissingMedia(context: ModelContext,
+                                      reportTask: Bool) async -> (total: Int, downloaded: Int, failed: Int, taskID: UUID?) {
+        let houses = (try? context.fetch(FetchDescriptor<House>())) ?? []
+        var jobs: [(house: House, records: [(fileName: String, kind: String)])] = []
+        for h in houses where !h.isTrashed {
+            let onDisk = Set(MediaStore.existingFileNames(roomKey: h.mediaRoomKey)
+                .map { MediaNaming.canonicalKey($0) })
+            let missing = h.mediaItems.filter {
+                !onDisk.contains(MediaNaming.canonicalKey($0.fileName))
+            }
+            guard !missing.isEmpty else { continue }
+            jobs.append((h, missing.map { ($0.fileName, $0.kind) }))
+        }
+        let total = jobs.reduce(0) { $0 + $1.records.count }
+        guard total > 0 else { return (0, 0, 0, nil) }
+
+        var taskID: UUID?
+        if reportTask {
+            taskID = SyncTaskCenter.shared.begin(
+                kind: .mediaDownload,
+                title: "下载服务器媒体",
+                roomKeys: jobs.map { $0.house.mediaRoomKey },
+                total: total,
+                note: "准备下载 \(total) 个媒体"
+            )
+        }
+
+        var downloaded = 0
+        var failed = 0
+        var jobOffset = 0
+        for job in jobs {
+            let roomKey = job.house.mediaRoomKey
+            let offset = jobOffset
+            HouseSyncProgress.shared.begin(roomKey: roomKey, direction: .download,
+                                           progress: 0, label: "下载媒体 0/\(job.records.count)")
+            let result = await HouseRemoteClient.shared.downloadMissingMedia(
+                roomKey: roomKey,
+                records: job.records,
+                onProgress: { fileDone, _, name in
+                    let globalDone = offset + fileDone
+                    Task { @MainActor in
+                        HouseSyncProgress.shared.update(
+                            roomKey: roomKey, direction: .download,
+                            progress: Double(globalDone) / Double(total),
+                            label: "下载媒体 \(globalDone)/\(total)")
+                        if let taskID {
+                            SyncTaskCenter.shared.advance(
+                                id: taskID, done: globalDone,
+                                note: "下载 \(name)（\(globalDone)/\(total)）")
+                        }
+                    }
+                })
+            downloaded += result.files.count
+            failed += result.failedFiles.count
+            jobOffset += job.records.count
+            HouseSyncProgress.shared.end()
+        }
+
+        if let taskID {
+            if failed == 0 {
+                SyncTaskCenter.shared.finish(id: taskID, success: true,
+                                             note: "已下载 \(downloaded)/\(total) 个媒体")
+            } else {
+                SyncTaskCenter.shared.finish(id: taskID, success: false,
+                                             failure: "媒体下载失败 \(failed) 个，点重试")
+            }
+        }
+        return (total, downloaded, failed, taskID)
     }
 
     private func applyRemote(_ remoteHouses: [RemoteHouse], context: ModelContext) throws -> Int {

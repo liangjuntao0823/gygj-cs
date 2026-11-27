@@ -130,8 +130,8 @@ struct HouseListView: View {
     /// 手势会拦截 confirmationDialog 按钮点击，删除确认因此无反应）——统一改用单一 alert 呈现所有确认/提示
     /// v1.16 需求2：枚举仅保留「分享方式选择」两类（multiShare/singleShare）；删除/批量删除走独立 showDeleteConfirm
     enum RefreshPrompt: Identifiable {
-        case confirm(deep: Bool)
-        case hidden(count: Int, deep: Bool)
+        case confirm(deep: Bool, summary: String)
+        case hidden(count: Int, deep: Bool, summary: String?)
         var id: String {
             switch self {
             case .confirm: return "confirm"
@@ -472,18 +472,19 @@ struct HouseListView: View {
             // 点左上角总刷新才触发；自动对账（进页/45 秒）不弹，避免打断当前操作。
             .alert(item: $refreshPrompt) { prompt in
                 switch prompt {
-                case .confirm(let deep):
+                case .confirm(let deep, let summary):
                     return Alert(
-                        title: Text("从服务器同步房源？"),
-                        message: Text("会先补传本机尚未上传的改动，再拉取服务器最新清单。其他设备刚改的房源会同步到本机。"),
+                        title: Text("与服务器同步房源？"),
+                        message: Text(summary),
                         primaryButton: .default(Text("开始同步")) {
                             Task { await syncCloudHouses(deep: deep) }
                         },
                         secondaryButton: .cancel(Text("取消")))
-                case .hidden(let count, let deep):
+                case .hidden(let count, let deep, let summary):
+                    let head = (summary.map { $0 + "\n\n" }) ?? ""
                     return Alert(
                         title: Text("有 \(count) 套仅删了本地的房源"),
-                        message: Text("服务器上仍保留这些房源。直接同步不会自动带回；要恢复显示，还是保持隐藏？"),
+                        message: Text(head + "服务器上仍保留这 \(count) 套。保持隐藏只影响本机显示，不会删服务器；恢复显示会清除本机全部“仅删本地”标记，并把房源和媒体重新拉回本机。"),
                         primaryButton: .default(Text("恢复显示并同步")) {
                             HouseLocalDeletionStore.clearAll()
                             Task { await syncCloudHouses(deep: deep) }
@@ -501,8 +502,8 @@ struct HouseListView: View {
                 Task {
                     // 进页先补传离线未提交的改动，再全量对账权威库（弱网改动不丢）
                     _ = await HousePendingUploader.shared.flush(context: ctx)
-                    let n = try? await HouseSyncEngine.shared.pull(context: ctx)
-                    if (n ?? 0) > 0 {
+                    let result = try? await HouseSyncEngine.shared.pull(context: ctx)
+                    if result?.didChangeStore == true {
                         reloadHouses()
                     }
                 }
@@ -536,7 +537,7 @@ struct HouseListView: View {
                 try? await Task.sleep(nanoseconds: 45 * 1_000_000_000)
                 guard !Task.isCancelled else { break }
                 guard let ctx = houseModelContext, !isSyncing else { continue }
-                if let n = try? await HouseSyncEngine.shared.pull(context: ctx), n > 0 {
+                if let result = try? await HouseSyncEngine.shared.pull(context: ctx), result.didChangeStore {
                     reloadHouses()
                 }
             }
@@ -1159,6 +1160,8 @@ struct HouseListView: View {
         Task {
             var ok = 0
             var localDeleted: [House] = []
+            var failedKeys: [String] = []
+            var failureReasons: [String] = []
             for key in keys {
                 await MainActor.run { deleteCurrentRoom = key }
                 if let h = houses.first(where: { $0.mediaRoomKey == key }) {
@@ -1174,6 +1177,8 @@ struct HouseListView: View {
                         BackupLogStore.log(category: "房源", action: "删除双端房源", result: "失败",
                                            detail: "服务器删除失败：\(error.localizedDescription)，本机记录保留",
                                            room: key, cloud: true)
+                        failedKeys.append(key)
+                        failureReasons.append("\(key)：\(error.localizedDescription)")
                         showToast("删除失败 \(key)：\(error.localizedDescription)", isError: true)
                     }
                 }
@@ -1194,6 +1199,16 @@ struct HouseListView: View {
                 if isBatchDelete { exitMultiSelect() }
                 isBatchDelete = false
                 for key in keys { HouseMediaUploadQueue.removeRoom(key) }
+                if !failedKeys.isEmpty {
+                    // 云端删除失败统一进任务中心，可点“删云端”重试；本地记录保留
+                    SyncTaskCenter.shared.reportFailure(
+                        kind: .cloudDelete,
+                        title: "删除服务器房源",
+                        roomKeys: failedKeys,
+                        failure: failureReasons.joined(separator: "\n"),
+                        note: "服务器没删掉，本机记录保留"
+                    )
+                }
                 NotificationCenter.default.post(name: Self.houseStoreChanged, object: nil)
                 if ok > 0 { showToast("已删除 \(ok) 套（服务器与本地）") }
             }
@@ -1369,40 +1384,89 @@ struct HouseListView: View {
     /// v1.83：同步失败自动重试一次——网络瞬断/弱网（如电梯信号切换）时第一次失败会在 1 秒后自动重跑，
     /// 第二次仍失败才提示。retriedOnce 防止重试套娃无限递归。
     @discardableResult
-    /// 服务器模式同步：增量拉取权威库并直接应用到本地（服务器已做合并，无需本地 diff 预览）
-    private func runServerSync(context ctx: ModelContext) async -> CloudPullRunOutcome {
-        let progressID = syncCenter.beginTransient(kind: .cloudPull, title: "同步房源", total: 1)
+    /// 服务器模式同步：先补传本机改动，再把服务器清单应用到本地；
+    /// 整次动作挂任务中心持久任务，媒体回补另挂“下载服务器媒体”任务并驱动卡片进度。
+    private func runServerSync(context ctx: ModelContext, retryTaskID: UUID? = nil) async -> CloudPullRunOutcome {
+        let taskID: UUID
+        if let retryTaskID {
+            taskID = retryTaskID
+            syncCenter.advance(id: taskID, done: 0, note: "正在补传本机改动")
+        } else {
+            taskID = syncCenter.begin(kind: .cloudPull,
+                                      title: "同步服务器房源",
+                                      total: 1,
+                                      note: "正在补传本机改动")
+        }
         do {
             // 先补传本地离线写，再拉取服务器全量清单对账，保证两端最终一致
             _ = await HousePendingUploader.shared.flush(context: ctx)
-            let changed = try await HouseSyncEngine.shared.pull(context: ctx)
+            syncCenter.advance(id: taskID, done: 0, note: "正在拉取服务器房源")
+            let result = try await HouseSyncEngine.shared.pull(context: ctx, reportMediaTask: true)
             let hidden = HouseSyncEngine.shared.hiddenCloudCount
             let pending = HousePendingUploader.shared.pendingKeys.count
-            let tail = (hidden > 0 ? "；\(hidden) 套仅删本地，仍保持隐藏" : "")
+            var tail = (hidden > 0 ? "；\(hidden) 套仅删本地，仍保持隐藏" : "")
                 + (pending > 0 ? "；\(pending) 套本机改动未同步，已保留本地，请点重试" : "")
-            if changed > 0 {
-                showToast("已从服务器同步 \(changed) 套房源" + tail)
-            } else {
-                showToast("服务器上房源已是最新" + tail)
+            if let mediaNote = result.mediaNote {
+                tail += "；\(mediaNote)"
             }
-            syncCenter.endTransient(id: progressID)
+            let toast: String
+            if result.changed > 0 {
+                toast = "已从服务器同步 \(result.changed) 套房源" + tail
+            } else {
+                toast = "服务器上房源已是最新" + tail
+            }
+            showToast(toast)
+            let note = result.changed > 0
+                ? "已同步 \(result.changed) 套" + (result.mediaTotal > 0 ? "，媒体在任务中心继续" : "")
+                : "已核对，服务器无变化" + (result.mediaTotal > 0 ? "，媒体在任务中心继续" : "")
+            syncCenter.finish(id: taskID, success: true, note: note)
             return .finished
         } catch {
             let msg = "服务器同步失败：\(error.localizedDescription)"
             showToast(msg, isError: true)
-            syncCenter.endTransient(id: progressID)
+            syncCenter.finish(id: taskID, success: false, failure: msg)
             return .failed(msg)
         }
     }
 
-    /// 唯一手动刷新入口：先确认，再同步；有“仅删本地”隐藏房源时先问是否恢复。
+    /// 唯一手动刷新入口：先向服务器查变化并列给用户确认，再同步；有“仅删本地”隐藏房源时也先列变化。
     private func requestManualSync(deep: Bool) {
         guard !isSyncing else {
             showToast("正在同步中，请稍候")
             return
         }
         let hidden = HouseLocalDeletionStore.count()
-        refreshPrompt = hidden > 0 ? .hidden(count: hidden, deep: deep) : .confirm(deep: deep)
+        guard let ctx = houseModelContext else {
+            refreshPrompt = hidden > 0
+                ? .hidden(count: hidden, deep: deep, summary: nil)
+                : .confirm(deep: deep, summary: "数据容器不可用，暂时无法预览服务器变化。仍可尝试同步。")
+            return
+        }
+        isSyncing = true
+        Task {
+            do {
+                let preview = try await HouseSyncEngine.shared.preview(context: ctx)
+                await MainActor.run {
+                    isSyncing = false
+                    if hidden > 0 {
+                        refreshPrompt = .hidden(count: hidden, deep: deep, summary: preview.summary)
+                    } else {
+                        refreshPrompt = .confirm(deep: deep, summary: preview.summary)
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    isSyncing = false
+                    if hidden > 0 {
+                        refreshPrompt = .hidden(count: hidden, deep: deep, summary: nil)
+                    } else {
+                        refreshPrompt = .confirm(
+                            deep: deep,
+                            summary: "无法预览服务器变化（\(error.localizedDescription)）。\n仍可继续同步，同步时会重新核对服务器数据。")
+                    }
+                }
+            }
+        }
     }
 
     private func syncCloudHouses(retriedOnce: Bool = false, retryTaskID: UUID? = nil, deep: Bool = false) async -> CloudPullRunOutcome {
@@ -1419,7 +1483,7 @@ struct HouseListView: View {
         defer { DispatchQueue.main.async { CloudDetectActivity.shared.endManualSync() } }
         // 服务器模式：房源读写走 8082 house-keeper 权威接口，短路旧对象存储直连链路
         if HouseServerMode.ready, let ctx = houseModelContext {
-            return await runServerSync(context: ctx)
+            return await runServerSync(context: ctx, retryTaskID: retryTaskID)
         }
         // 旧对象存储直连兜底链路已下线：未连接服务器时仅返回失败，本地数据可离线查看
         return .failed("服务器未连接，请检查网络后重试")

@@ -859,7 +859,8 @@ struct HouseDetailView: View {
         if HouseServerMode.ready {
             Task {
                 let records = await serverMediaRecords()
-                let files = await HouseRemoteClient.shared.downloadMissingMedia(roomKey: roomKey, records: records)
+                let download = await HouseRemoteClient.shared.downloadMissingMedia(roomKey: roomKey, records: records)
+                let files = download.files
                 await MainActor.run {
                     for f in files {
                         let item = MediaItem(fileName: f.fileName, kind: f.kind)
@@ -911,7 +912,8 @@ struct HouseDetailView: View {
         Task {
             if HouseServerMode.ready {
                 let records = house.mediaItems.map { ($0.fileName, $0.kind) }
-                let files = await HouseRemoteClient.shared.downloadMissingMedia(roomKey: roomKey, records: records)
+                let download = await HouseRemoteClient.shared.downloadMissingMedia(roomKey: roomKey, records: records)
+                let files = download.files
                 await MainActor.run {
                     for f in files where !house.mediaItems.contains(where: { $0.fileName == f.fileName }) {
                         let item = MediaItem(fileName: f.fileName, kind: f.kind)
@@ -940,7 +942,8 @@ struct HouseDetailView: View {
         Task {
             if HouseServerMode.ready {
                 let records = await serverMediaRecords()
-                let files = await HouseRemoteClient.shared.downloadMissingMedia(roomKey: roomKey, records: records)
+                let download = await HouseRemoteClient.shared.downloadMissingMedia(roomKey: roomKey, records: records)
+                let files = download.files
                 await MainActor.run {
                     for f in files {
                         let item = MediaItem(fileName: f.fileName, kind: f.kind)
