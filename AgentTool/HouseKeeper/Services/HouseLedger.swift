@@ -402,6 +402,9 @@ enum HouseLedgerStore {
 // MARK: - 房号解析工具
 
 enum HouseLedgerMigrator {
+    /// 当前代迁移事件的 id 前缀，旧代事件不再接收
+    static let currentHistPrefix = "hist3-"
+
     /// 从文本里提取房号 key（1-/2- 开头，到空格或斜杠为止），如「1-2059/xxx」「1-7899测：更新…」
     static func parseRoomKey(in text: String) -> String? {
         guard let regex = try? NSRegularExpression(pattern: #"(1|2)-[^\s/：:]+"#) else { return nil }
