@@ -845,7 +845,7 @@ struct BackupLogsView: View {
     private var cloudList: some View {
         List(selection: $selectedCloud) {
             if displayCloud.isEmpty {
-                Text(cloudLogs.isEmpty ? (CloudOps.isConfigured ? "暂无云端操作记录" : "未配置云存储，无法读取云端操作") : "没有匹配的记录")
+                Text(cloudLogs.isEmpty ? (CloudOps.isConfigured ? "暂无云端操作记录" : "未连接到服务器，无法读取云端操作") : "没有匹配的记录")
                     .foregroundColor(.secondary)
             } else {
                 ForEach(Array(displayCloud.enumerated()), id: \.offset) { idx, item in

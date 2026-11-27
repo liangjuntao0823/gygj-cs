@@ -72,7 +72,8 @@ final class HouseSyncEngine: ObservableObject {
         // 纯本地离线未提交的房（revMap 无记录）不会被误删。
         let list = try await HouseRemoteClient.shared.listHouses(since: nil)
         setTop(list.topRevision)
-        if list.houses.isEmpty { return 0 }
+        // 不能因为服务器为空就提前 return：后台硬删最后一套房后，本地 revMap 里仍有
+        // 该房记录，必须走一次空清单对账，才能把本地孤儿/“双端”徽章清掉。
         let changed = try applyRemote(list.houses, context: context)
         // 记录对账完成后，把本地磁盘缺失的媒体从服务器回补落盘（已存在自动跳过）
         await backfillMissingMedia(context: context)
@@ -112,6 +113,8 @@ final class HouseSyncEngine: ObservableObject {
             target.remark = r.remark
             target.statusRaw = r.status
             target.isDeleted = r.trashed
+            // 只要服务器权威库返回这套房，徽章就应是“双端”；不能沿用本地旧值。
+            target.cloudStatus = .both
             target.deletedAt = r.trashed ? Date() : nil
             if let updated = r.updatedAt {
                 target.lastUpdatedAt = ISO8601DateFormatter().date(from: updated) ?? Date()
@@ -120,12 +123,18 @@ final class HouseSyncEngine: ObservableObject {
             if snapshot(target) != before { changed += 1 }
             setServerRevision(r.revision, forKey: r.roomKey)
         }
-        // 服务器已硬删的本地孤儿：曾同步过（revMap 有记录）但全量清单已不含 → 物理删除本地记录
+        // 服务器已硬删的本地孤儿：曾同步过（revMap 有记录）但全量清单已不含 → 物理删除本地记录；
+        // 从未同步过的纯本地房保留，并明确标为“本地”，避免沿用旧的“双端”。
         let remoteKeys = Set(remoteHouses.map { $0.roomKey })
-        for (key, h) in byKey where !remoteKeys.contains(key) && revMap[key] != nil {
-            context.delete(h)
-            removeServerRevision(forKey: key)
-            changed += 1
+        for (key, h) in byKey where !remoteKeys.contains(key) {
+            if revMap[key] != nil {
+                context.delete(h)
+                removeServerRevision(forKey: key)
+                changed += 1
+            } else if h.cloudStatus != .local {
+                h.cloudStatus = .local
+                changed += 1
+            }
         }
         try context.save()
         return changed

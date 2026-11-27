@@ -140,6 +140,18 @@ struct MeterSettings: Codable {
 /// 电表云端值守常量（长期令牌只存 Keychain，不进 Codable settings、不进备份与 git）
 enum MeterCloudConfig {
     static let defaultEndpoint = "http://114.132.93.85:8082"
+    /// 非 MainActor 可读的服务器地址缓存（MeterStore 加载/保存设置时同步写入），
+    /// 供 CloudOps / 分享扩展等后台路径使用，避免跨 actor 读 @Published 设置。
+    static let endpointCacheKey = "meter.cloud.endpoint"
+
+    nonisolated static func persistedEndpoint() -> String {
+        var s = (SharedBridge.defaults.string(forKey: endpointCacheKey) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.isEmpty { s = defaultEndpoint }
+        if !s.hasPrefix("http://"), !s.hasPrefix("https://") { s = "http://" + s }
+        while s.hasSuffix("/") { s.removeLast() }
+        return s.isEmpty ? defaultEndpoint : s
+    }
     static let tokenKey = "meter.cloud.token"             // KeychainStore account
     static let wasEnabledKey = "meter.cloud.wasEnabled"   // UserDefaults：关开关时补发一次 enabled=false
     static let dirtyKey = "meter.cloud.dirty"             // UserDefaults：上次同步失败、待补推

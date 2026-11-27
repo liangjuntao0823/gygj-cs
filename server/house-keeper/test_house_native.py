@@ -88,6 +88,26 @@ class NativeStoreTests(unittest.TestCase):
         self.assertIn("roomKey", html)
         self.assertIn("拨打电话", html)
 
+    def test_media_stream_same_name_does_not_overwrite(self):
+        import io
+        rel1 = self.store.media.save_house_media_stream(
+            "1-2222", "1-2222", io.BytesIO(b"first"), 5, allow_unknown_ext=True)
+        rel2 = self.store.media.save_house_media_stream(
+            "1-2222", "1-2222", io.BytesIO(b"second"), 6, allow_unknown_ext=True)
+        self.assertNotEqual(rel1, rel2)
+        self.assertEqual(self.store.media.read_house_media("1-2222", "1-2222.jpg"), b"first")
+        second_name = rel2.rsplit("/", 1)[-1]
+        self.assertEqual(self.store.media.read_house_media("1-2222", second_name), b"second")
+
+    def test_ops_append_list_delete(self):
+        self.store.append_op("房源", "修改租金", "成功", "租金 600→700", "1-2222", "涛")
+        recs = self.store.list_ops()
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["op"], "房源·修改租金·成功")
+        self.assertEqual(recs[0]["room"], "1-2222")
+        self.assertTrue(self.store.delete_op(op_id=recs[0]["id"]))
+        self.assertEqual(self.store.list_ops(), [])
+
     def test_hard_delete_removes_disk_media(self):
         self.store.media.save_house_media("1-2059", "1-2059-JPG-abcd-1.jpg", b"img")
         self.store.upsert_house(make_house("1-2059"), operator="t")

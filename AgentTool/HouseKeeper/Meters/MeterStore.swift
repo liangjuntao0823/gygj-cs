@@ -41,6 +41,9 @@ final class MeterStore: ObservableObject {
             if let data = try? Data(contentsOf: settingsURL) {
                 settings = try JSONDecoder().decode(MeterSettings.self, from: data)
             }
+            // 非 MainActor 的 CloudOps/分享扩展需要读服务器地址：设置加载后同步到共享区。
+            SharedBridge.defaults.set(settings.cloudEndpoint, forKey: MeterCloudConfig.endpointCacheKey)
+            SharedBridge.defaults.set(settings.cloudEndpoint, forKey: SharedBridge.kEndpoint)
             if settings.openId.isEmpty, let link = parseOpenId(from: settings.queryLink) {
                 settings.openId = link
             }
@@ -66,6 +69,8 @@ final class MeterStore: ObservableObject {
         do {
             let data = try JSONEncoder().encode(settings)
             try data.write(to: settingsURL, options: .atomic)
+            SharedBridge.defaults.set(settings.cloudEndpoint, forKey: MeterCloudConfig.endpointCacheKey)
+            SharedBridge.defaults.set(settings.cloudEndpoint, forKey: SharedBridge.kEndpoint)
         } catch {
         }
         // v1.95：设置变化后立即按新开关/间隔重建定时器
@@ -407,9 +412,13 @@ final class MeterCloudSync {
 
     /// nonisolated 只读持久令牌（钥匙串 → 本机兜底文件），供非 MainActor 的路由/账本存储同步判定；
     /// 不依赖 MainActor 内存缓存，避免跨 actor 隔离引用。
+    nonisolated static func persistedToken() -> String? {
+        if let k = KeychainStore.load(MeterCloudConfig.tokenKey), !k.isEmpty { return k }
+        return loadPersistedFileToken()
+    }
+
     nonisolated static func hasPersistedToken() -> Bool {
-        if let k = KeychainStore.load(MeterCloudConfig.tokenKey), !k.isEmpty { return true }
-        return loadPersistedFileToken() != nil
+        (persistedToken() ?? "").isEmpty == false
     }
 
     // 测试诊断：分别读取三个来源的原始状态，不依赖 token 的缓存逻辑，用于定位真机令牌丢失环节

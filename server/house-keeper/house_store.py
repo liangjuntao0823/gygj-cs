@@ -123,10 +123,21 @@ CREATE TABLE IF NOT EXISTS share_records (
   summary TEXT NOT NULL DEFAULT '',
   operator TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS ops (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  category TEXT NOT NULL DEFAULT '',
+  action TEXT NOT NULL DEFAULT '',
+  result TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT '',
+  room TEXT NOT NULL DEFAULT '',
+  operator TEXT NOT NULL DEFAULT ''
+);
 CREATE INDEX IF NOT EXISTS idx_houses_rev ON houses(revision);
 CREATE INDEX IF NOT EXISTS idx_media_room ON media_refs(room_key);
 CREATE INDEX IF NOT EXISTS idx_ledger_room ON ledger_events(room_key);
 CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status);
+CREATE INDEX IF NOT EXISTS idx_ops_id ON ops(id);
 """
 
 
@@ -735,6 +746,53 @@ class HouseStore:
     # ------------------------------------------------------------------
     # 分享记录（取代旧桶 users/<u>/share_records.json）
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 操作日志（云端日志区；服务器权威记录，App/后台共用）
+    # ------------------------------------------------------------------
+    def append_op(self, category: str, action: str, result: str,
+                  detail: str = "", room: str = "", operator: str = "") -> dict[str, Any]:
+        """写一条操作日志；只追加，不进入房源账本/outbox。"""
+        now = now_local()
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO ops (ts,category,action,result,detail,room,operator) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (human_time(now), str(category)[:80], str(action)[:120],
+                 str(result)[:40], str(detail)[:2000], str(room)[:120],
+                 str(operator)[:80]))
+            self._conn.commit()
+            return {"ok": True, "id": cur.lastrowid}
+
+    def list_ops(self, limit: int = 200) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit or 200), 500))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id,ts,category,action,result,detail,room,operator "
+                "FROM ops ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [{
+            "id": str(r["id"]),
+            "t": r["ts"],
+            "op": f"{r['category']}·{r['action']}·{r['result']}",
+            "room": r["room"],
+            "user": r["operator"],
+            "detail": r["detail"],
+        } for r in rows]
+
+    def delete_op(self, op_id: str = "", t: str = "", op: str = "",
+                  room: str = "", user: str = "", detail: str = "") -> bool:
+        with self._lock:
+            conn = self._conn
+            if str(op_id or "").strip().isdigit():
+                conn.execute("DELETE FROM ops WHERE id=?", (int(op_id),))
+            else:
+                # 兼容旧云端复合键删除：字段全等才删，避免误删同分钟其他记录
+                conn.execute(
+                    "DELETE FROM ops WHERE ts=? AND (?='' OR category||'·'||action||'·'||result=?) "
+                    "AND room=? AND operator=? AND detail=?",
+                    (t, op, op, room, user, detail))
+            conn.commit()
+            return True
+
     def share_records_add(self, room_key: str, channel: str, summary: str,
                           operator: str) -> dict[str, Any]:
         with self._lock:

@@ -3122,12 +3122,18 @@ enum CloudUser {
 // App 操作日志分「本机操作」（本地）+「云端操作」（桶记录，显示操作者用户名）。
 
 struct CloudOpEntry: Codable, Identifiable, Hashable {
-    var id: String { "\(t)|\(op)|\(room)|\(user)|\(detail)" }
+    var id: String { dbID ?? "\(t)|\(op)|\(room)|\(user)|\(detail)" }
+    /// 服务器自增 id（新服务器日志用）；旧云端记录没有该字段时为 nil，删除走复合键兼容。
+    let dbID: String?
     let t: String
     let op: String
     let room: String
     let user: String
     let detail: String
+
+    enum CodingKeys: String, CodingKey {
+        case dbID = "id", t, op, room, user, detail
+    }
 }
 struct CloudOpsResponse: Codable {
     let ok: Bool
@@ -3192,15 +3198,40 @@ enum CloudOpPendingQueue {
 }
 
 enum CloudOps {
+    /// 服务器权威日志：地址与令牌都来自 8082 服务器；不再判断旧 COS/云函数配置。
     static var isConfigured: Bool {
-        !CloudConfig.functionURL.isEmpty && !CloudConfig.passwordHash.isEmpty
+        !endpoint.isEmpty && !(token ?? "").isEmpty
     }
-    private static var baseURL: URL? { URL(string: CloudConfig.functionURL) }
+    /// 服务器地址/令牌走 App Group 镜像，主 App 与分享扩展同一口径；
+    /// 不依赖 MeterModels/MeterStore（分享扩展 target 不编译这两个文件）。
+    private static var endpoint: String { SharedBridge.mirroredEndpoint }
+    private static var token: String? {
+        let mirrored = SharedBridge.mirroredHouseToken
+        #if APP_EXTENSION
+        return mirrored
+        #else
+        if let m = mirrored, !m.isEmpty { return m }
+        if let k = KeychainStore.load("meter.cloud.token"), !k.isEmpty { return k }
+        let fm = FileManager.default
+        let dir = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let file = dir.appendingPathComponent("meter-cloud-token")
+        if let s = try? String(contentsOf: file, encoding: .utf8) {
+            let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !t.isEmpty { return t }
+        }
+        return nil
+        #endif
+    }
+    private static var apiURL: URL? {
+        var base = endpoint
+        while base.hasSuffix("/") { base.removeLast() }
+        return URL(string: base + "/api/house/ops")
+    }
 
-    /// 本机发起云端操作 → 写一条云端操作记录（带当前用户名）。
-    /// v2.67：入口不阻塞调用方，后台等待响应并校验结果；失败入待补队列，启动/回前台自动补推。
+    /// 本机发起云端操作 → 写一条服务器操作日志（带当前用户名）。
+    /// 失败入待补队列，启动/回前台自动补推，避免 fire-and-forget 静默丢日志。
     static func log(category: String, action: String, result: String, detail: String, room: String = "") {
-        guard isConfigured, baseURL != nil else { return }
+        guard isConfigured, apiURL != nil else { return }
         let item = CloudOpPendingQueue.Item(
             category: category, action: action, result: result,
             detail: detail, room: room, uname: CloudUser.username, date: Date())
@@ -3210,31 +3241,29 @@ enum CloudOps {
         }
     }
 
-    /// 发送单条公共日志，最多 3 次尝试（首次 + 2 次退避 350ms/700ms）；返回是否最终上云成功。
+    /// 发送单条日志，最多 3 次尝试（首次 + 2 次退避）；返回是否最终写入服务器。
     @discardableResult
     static func send(_ item: CloudOpPendingQueue.Item) async -> Bool {
-        guard isConfigured, let base = baseURL else { return false }
-        let op = "\(item.category)·\(item.action)·\(item.result)"
+        guard isConfigured, let url = apiURL, let token, !token.isEmpty else { return false }
         for attempt in 0..<3 {
             if attempt > 0 {
                 try? await Task.sleep(nanoseconds: UInt64(350 * attempt) * 1_000_000_000)
             }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.timeoutInterval = 10
+            req.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            let body: [String: Any] = [
+                "category": item.category, "action": item.action,
+                "result": item.result, "detail": item.detail,
+                "room": item.room, "operator": item.uname,
+            ]
+            req.httpBody = try? JSONSerialization.data(withJSONObject: body)
             do {
-                var q = URLComponents()
-                q.queryItems = [
-                    .init(name: "act", value: "logOp"),
-                    .init(name: "k", value: CloudConfig.passwordHash),
-                    .init(name: "op", value: op),
-                    .init(name: "room", value: item.room),
-                    .init(name: "uname", value: item.uname),
-                    .init(name: "detail", value: item.detail),
-                ]
-                guard let query = q.percentEncodedQuery,
-                      let url = URL(string: base.absoluteString + "?" + query) else { return false }
-                let (data, response) = try await CosNetwork.session.data(from: url)
+                let (data, response) = try await URLSession.shared.data(for: req)
                 guard let http = response as? HTTPURLResponse,
                       (200..<300).contains(http.statusCode) else { continue }
-                // 对齐电脑端 LooksOk：body 显式 ok=false 才判失败；解析不出 ok 字段视为成功。
                 if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let ok = json["ok"] as? Bool, !ok { continue }
                 return true
@@ -3245,11 +3274,9 @@ enum CloudOps {
         return false
     }
 
-    /// v2.71：分享扩展可靠公共日志——先入共享区待补队再发送、成功才出队。
-    /// 扩展进程可能在发送途中被系统回收：fire-and-forget 会丢日志，
-    /// 入队在先则 App 启动/回前台 flushPending 必补推，与 v2.67 主 App 口径一致。
+    /// 分享扩展可靠版：先入共享区待补队再发送，成功才出队。
     static func logAwait(category: String, action: String, result: String, detail: String = "", room: String = "") async {
-        guard isConfigured, baseURL != nil else { return }
+        guard isConfigured, apiURL != nil else { return }
         let item = CloudOpPendingQueue.Item(
             category: category, action: action, result: result,
             detail: detail, room: room, uname: CloudUser.username, date: Date())
@@ -3258,7 +3285,7 @@ enum CloudOps {
         if ok { CloudOpPendingQueue.remove(item) }
     }
 
-    /// 启动/回前台补推积压的待上云日志；成功出队，仍失败留队等下次。串行发送，避免同时打云函数。
+    /// 启动/回前台补推积压日志；成功出队，仍失败留队等下次。
     static func flushPending() async {
         CloudOpPendingQueue.flushExpired()
         guard isConfigured else { return }
@@ -3268,30 +3295,46 @@ enum CloudOps {
         }
     }
 
-    /// 拉取云端操作记录（日志查看器云端区）
-    /// v2.7（P1⑦ 跨账号日志公共区）：不传 u 参数，拉取所有用户的公共日志——
-    /// 此前按 u=<自己> 过滤，只能看到自己的操作，另一个用户的记录完全看不到。
+    /// 拉取服务器操作记录（日志查看器云端区）。
     static func fetch(completion: @escaping ([CloudOpEntry]) -> Void) {
-        guard isConfigured, let base = baseURL else { completion([]); return }
-        guard let url = URL(string: "\(base.absoluteString)?act=ops&k=\(CloudConfig.passwordHash)") else { completion([]); return }
-        URLSession.shared.dataTask(with: url) { data, _, _ in
-            guard let data = data, let obj = try? JSONDecoder().decode(CloudOpsResponse.self, from: data), obj.ok else { completion([]); return }
+        guard isConfigured, let apiURL, let token, !token.isEmpty else { completion([]); return }
+        var comps = URLComponents(url: apiURL, resolvingAgainstBaseURL: false)
+        comps?.queryItems = [URLQueryItem(name: "limit", value: "200")]
+        guard let url = comps?.url else { completion([]); return }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 12
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            guard let data,
+                  let obj = try? JSONDecoder().decode(CloudOpsResponse.self, from: data),
+                  obj.ok else { completion([]); return }
             completion(obj.records)
         }.resume()
     }
 
-    /// 删除一条云端操作记录（云端区左滑/多选删除）
+    /// 删除一条服务器操作记录；优先按服务器自增 id 删，旧记录回退复合键。
     static func delete(_ e: CloudOpEntry, completion: (() -> Void)? = nil) {
-        guard isConfigured, let base = baseURL else { completion?(); return }
-        let u = CloudUser.username.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-        var q = URLComponents()
-        q.queryItems = [
-            .init(name: "act", value: "delOp"), .init(name: "k", value: CloudConfig.passwordHash), .init(name: "u", value: u),
-            .init(name: "t", value: e.t), .init(name: "op", value: e.op), .init(name: "room", value: e.room),
-            .init(name: "user", value: e.user), .init(name: "detail", value: e.detail),
-        ]
-        guard let query = q.percentEncodedQuery, let url = URL(string: base.absoluteString + "?" + query) else { completion?(); return }
-        URLSession.shared.dataTask(with: url) { _, _, _ in DispatchQueue.main.async { completion?() } }.resume()
+        guard isConfigured, let apiURL, let token, !token.isEmpty else { completion?(); return }
+        var comps = URLComponents(url: apiURL, resolvingAgainstBaseURL: false)
+        if let dbID = e.dbID, !dbID.isEmpty {
+            comps?.queryItems = [URLQueryItem(name: "id", value: dbID)]
+        } else {
+            comps?.queryItems = [
+                URLQueryItem(name: "t", value: e.t),
+                URLQueryItem(name: "op", value: e.op),
+                URLQueryItem(name: "room", value: e.room),
+                URLQueryItem(name: "user", value: e.user),
+                URLQueryItem(name: "detail", value: e.detail),
+            ]
+        }
+        guard let url = comps?.url else { completion?(); return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "DELETE"
+        req.timeoutInterval = 12
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        URLSession.shared.dataTask(with: req) { _, _, _ in
+            DispatchQueue.main.async { completion?() }
+        }.resume()
     }
 }
 

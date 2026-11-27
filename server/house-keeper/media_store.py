@@ -111,8 +111,33 @@ class MediaStore:
         path.write_bytes(data)
         return self.rel_house(room_key, fn)
 
+    def unique_house_file_name(self, room_key: str, file_name: str,
+                               kind: str = "image") -> str:
+        """返回该房目录下不会覆盖既有文件的落盘名。
+
+        - 无后缀名（历史客户端可能只传房号）按 kind 补 .jpg/.mp4；
+        - 同名文件已存在时追加 8 位随机 ID，绝不 replace 既有媒体；
+        - 正常不冲突的文件名原样保留，客户端账本引用不受影响。
+        """
+        fn = safe_file_name(file_name)
+        if not fn:
+            fn = self.new_file_name(room_key, "mp4" if kind == "video" else "jpg")
+        ext = _ext(fn)
+        if not ext:
+            ext = ".mp4" if kind == "video" else ".jpg"
+            fn = fn + ext
+        if not self.house_path(room_key, fn).exists():
+            return fn
+        stem = Path(fn).stem
+        suffix = Path(fn).suffix
+        while True:
+            candidate = f"{stem}-{secrets.token_hex(4)}-1{suffix}"
+            if not self.house_path(room_key, candidate).exists():
+                return candidate
+
     def save_house_media_stream(self, room_key: str, file_name: str, src,
-                                length: int, allow_unknown_ext: bool = False) -> str:
+                                length: int, allow_unknown_ext: bool = False,
+                                kind: str = "image") -> str:
         """流式落盘：边读边写，避免大视频把整个 body 读进内存。
 
         allow_unknown_ext=True 时不再按扩展名白名单拒绝。App 端历史/跨端文件名
@@ -125,6 +150,8 @@ class MediaStore:
             raise ValueError("invalid media file name")
         if not allow_unknown_ext and _ext(fn) not in _MEDIA_EXTS:
             raise ValueError("unsupported media extension")
+        # 上传入口兜底：同名/无后缀一律唯一化，避免第二次上传 replace 掉第一份媒体。
+        fn = self.unique_house_file_name(room_key, fn, kind=kind)
         path = self.house_path(room_key, fn)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".part")

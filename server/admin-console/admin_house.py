@@ -92,6 +92,13 @@ class HouseConsole:
             doc = self.store.upsert_house(
                 payload, operator="admin", origin_device_id="admin-web",
                 notify_scope=notify_scope, notify_user_token=notify_user_token)
+            changed = [k for k in ("roomNo", "tower", "landlord", "layout",
+                                  "price", "password", "remark", "status")
+                       if str(fields.get(k, existing.get(k))) != str(existing.get(k))]
+            self.store.append_op(
+                "房源", "后台修改房源", "成功",
+                "修改字段：" + ("、".join(changed) if changed else "无字段变化"),
+                room_key, "admin")
             return {"ok": True, "house": doc}
         except Exception as e:
             return {"ok": False, "error": type(e).__name__, "detail": str(e)[:200]}
@@ -103,6 +110,9 @@ class HouseConsole:
             doc = self.store.hard_delete(
                 room_key, "admin", "admin-web",
                 notify_scope=notify_scope, notify_user_token=notify_user_token)
+            self.store.append_op(
+                "房源", "后台彻底删除房源", "成功",
+                "后台永久删除房源、账本与媒体", room_key, "admin")
             return {"ok": True, **doc}
         except Exception as e:
             return {"ok": False, "error": type(e).__name__, "detail": str(e)[:200]}
@@ -113,6 +123,10 @@ class HouseConsole:
             doc = self.store.set_deleted(
                 room_key, deleted, "admin", "admin-web",
                 notify_scope=notify_scope, notify_user_token=notify_user_token)
+            self.store.append_op(
+                "房源", "后台恢复房源" if not deleted else "后台删除房源", "成功",
+                "后台" + ("恢复" if not deleted else "移入回收站"),
+                room_key, "admin")
             return {"ok": True, **doc}
         except Exception as e:
             return {"ok": False, "error": type(e).__name__, "detail": str(e)[:200]}

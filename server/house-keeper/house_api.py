@@ -244,6 +244,38 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
             store.config_set("app", body if isinstance(body, dict) else {})
             return send(200, {"ok": True, "config": store.config_get("app")})
 
+        # ---- 操作日志（云端日志区，服务器权威；App 与后台共用）----
+        if path == f"{PREFIX}/ops":
+            if not auth_house():
+                return True
+            if method == "GET":
+                q = _q(handler)
+                try:
+                    limit = int(q.get("limit") or 200)
+                except ValueError:
+                    limit = 200
+                return send(200, {"ok": True, "records": store.list_ops(limit)})
+            if method == "POST":
+                body = handler._read_json()
+                if not isinstance(body, dict):
+                    return send(400, {"ok": False, "error": "bad_json"})
+                res = store.append_op(
+                    category=str(body.get("category") or ""),
+                    action=str(body.get("action") or ""),
+                    result=str(body.get("result") or ""),
+                    detail=str(body.get("detail") or ""),
+                    room=str(body.get("room") or ""),
+                    operator=str(body.get("operator") or body.get("user") or ""))
+                return send(200, res)
+            if method == "DELETE":
+                q = _q(handler)
+                store.delete_op(
+                    op_id=q.get("id") or "", t=q.get("t") or "",
+                    op=q.get("op") or "", room=q.get("room") or "",
+                    user=q.get("user") or "", detail=q.get("detail") or "")
+                return send(200, {"ok": True})
+            return send(405, {"ok": False, "error": "method_not_allowed"})
+
         # ---- 房源媒体（服务器磁盘；二进制直传/直出）----
         if path.startswith(f"{PREFIX}/media/"):
             if not auth_house():
@@ -273,11 +305,15 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
                     return send(400, {"ok": False, "error": "bad_or_too_large", "length": length, "limit": MEDIA_BODY_LIMIT})
                 if not file_name or not store.media.safe_file_name(file_name):
                     file_name = store.media.new_file_name(room_key, "mp4" if kind == "video" else "jpg")
+                # 同名/无后缀先唯一化：返回给客户端的 fileName 与实际落盘名必须一致，
+                # 不能出现“第一张被后一张同名文件覆盖、账本却仍指旧名”的静默丢图。
+                file_name = store.media.unique_house_file_name(room_key, file_name, kind=kind)
                 try:
                     # 文件名后缀白名单只用于常规落盘；HTTP 上传入口放宽未知后缀，
                     # 避免历史/跨端文件名（.heif/.avi/编码差异）让整次媒体上传 400。
                     rel = store.media.save_house_media_stream(
-                        room_key, file_name, handler.rfile, length, allow_unknown_ext=True)
+                        room_key, file_name, handler.rfile, length,
+                        allow_unknown_ext=True, kind=kind)
                 except ValueError as e:
                     print(f"[media] fail room={room_key!r} file={file_name!r} kind={kind!r} length={length} error={e!r}", flush=True)
                     # 出错时请求体可能仍未读完，关闭连接，避免 Bad request version 噪声
