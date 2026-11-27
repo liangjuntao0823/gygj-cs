@@ -57,6 +57,9 @@ struct HouseDetailView: View {
     @State private var recordPickList: [RecordViewItem] = []
     // v1.36 需求1：彻底删除（本地+云端）
     @State private var isDeletingCloud = false
+    /// 服务器已硬删、本机仍待补传：详情页给「彻底删除本机」入口，按服务器为准收口
+    @State private var serverMissing = false
+    @State private var showPurgeLocalConfirm = false
     // v1.19：纯云端房源下载到本地
     @State private var isDownloading = false
     @State private var cloudDeleteMessage: String?
@@ -75,6 +78,7 @@ struct HouseDetailView: View {
                 // v1.44：mediaRefreshTick 变化时强制重建媒体区（自动补缺下载完成后即时显示）
                 mediaSection.id(mediaRefreshTick)
                 infoCard
+                if serverMissing { serverMissingCard }
                 actionCard
             }
             .padding(16)
@@ -217,6 +221,12 @@ struct HouseDetailView: View {
                 // v1.19 补全：删除确认提示按当前存储位置动态显示（是否删云端一目了然）
                 Text(deleteConfirmMessage)
             }
+            .confirmationDialog("彻底删除本机房源？", isPresented: $showPurgeLocalConfirm, titleVisibility: .visible) {
+                Button("彻底删除", role: .destructive) { purgeLocalHouse() }
+                Button("取消", role: .cancel) {}
+            } message: {
+                Text("服务器已删除「\(house.displayRoomNo)」，服务器模式下以服务器为准。本机改动、图片视频和待补传记录将一并清除，不再尝试同步。")
+            }
             .confirmationDialog("选择分享方式", isPresented: $showShareModePicker, titleVisibility: .visible) {
                 // v1.21：脱敏版隐藏房号/价格/房东，发给找房客户；完整版显示全部信息，发给同事
                 Button("发给客户（隐藏版）") { startShare(mode: .masked) }
@@ -255,8 +265,12 @@ struct HouseDetailView: View {
         // v1.43：打开详情自动补缺——记录在但磁盘文件缺失且云端有 → 自动下载回补（用户手删 media 文件夹后重开不再空白）
         .onAppear {
             repairMissingMediaIfNeeded()
+            serverMissing = HouseServerMissingStore.contains(house.mediaRoomKey)
             // v2.20：进来一次就算已读，房源卡片红框消失
             UnreadCloudHouseStore.clear(house.mediaRoomKey)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: HouseServerMissingStore.didChange)) { _ in
+            serverMissing = HouseServerMissingStore.contains(house.mediaRoomKey)
         }
         // v1.44：收到房源数据变更通知（下载完成/编辑保存等）→ 触发媒体区重建，下载后立即显示
         .onReceive(NotificationCenter.default.publisher(for: HouseListView.houseStoreChanged)) { _ in
@@ -722,6 +736,42 @@ struct HouseDetailView: View {
         .padding(14)
         .background(Color.white)
         .clipShape(RoundedRectangle(cornerRadius: 14))
+    }
+
+    /// 服务器已硬删 + 本机待补传：明确告诉用户本机改动不会再有服务器可同步，并提供彻底清理入口。
+    private var serverMissingCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("服务器已删除这套房源", systemImage: "exclamationmark.triangle.fill")
+                .font(.subheadline.weight(.semibold))
+                .foregroundColor(Color(red: 0.65, green: 0.28, blue: 0.08))
+            Text("本机还有未补传的改动。服务器模式下以服务器为准，服务器已删就不用再保留本机副本；反复重试只会一直报冲突。")
+                .font(.footnote)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button(role: .destructive) {
+                showPurgeLocalConfirm = true
+            } label: {
+                Label("彻底删除本机房源", systemImage: "trash.slash")
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 4)
+            }
+            .buttonStyle(.bordered)
+        }
+        .padding(14)
+        .background(Color(red: 1.0, green: 0.96, blue: 0.90))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+    }
+
+    /// 只清本机，不再请求服务器：服务器已经硬删，重复 DELETE 没有意义。
+    private func purgeLocalHouse() {
+        let roomKey = house.mediaRoomKey
+        let displayNo = house.displayRoomNo
+        let deleted = HouseSyncEngine.shared.purgeLocalHouses([roomKey], context: modelContext)
+        if deleted > 0 {
+            deleteResultMessage = "已按服务器为准删除本机房源（\(displayNo)）"
+        } else {
+            cloudDeleteMessage = "本机房源已经不存在，无需重复删除"
+        }
     }
 
     // MARK: - 操作

@@ -71,6 +71,16 @@ class HouseStoreTests(unittest.TestCase):
         self.store.upsert_house(make_house(), operator="涛(iPhone)")
         self.assertEqual(len(self.store.pending_outbox()), before)
 
+    def test_create_only_rejects_duplicate_room(self):
+        """新增房源必须同座同房号唯一；服务器已有该房时不能被新设备覆盖。"""
+        self.store.upsert_house(make_house("1-2334上"), operator="A(iPhone)")
+        with self.assertRaises(hs_mod.DuplicateHouse) as ctx:
+            self.store.upsert_house(make_house("1-2334上", price=999),
+                                    operator="B(iPhone)", create_only=True)
+        self.assertEqual(ctx.exception.room_key, "1-2334上")
+        doc = self.store.get_house("1-2334上")
+        self.assertEqual(doc["price"], 1100)
+
     def test_revision_conflict(self):
         self.store.upsert_house(make_house(), operator="涛(iPhone)")
         with self.assertRaises(hs_mod.RevisionConflict):

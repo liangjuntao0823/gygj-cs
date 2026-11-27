@@ -157,6 +157,14 @@ class HouseNotFound(Exception):
         self.room_key = room_key
 
 
+class DuplicateHouse(Exception):
+    """新增房源时房号已存在（同一座同一房号唯一）。"""
+    def __init__(self, room_key: str, existing: dict[str, Any]):
+        super().__init__(f"duplicate room: {room_key}")
+        self.room_key = room_key
+        self.existing = existing
+
+
 def now_local() -> datetime:
     # 服务器为东八区，统一本地时间，便于人工排查
     return datetime.now(timezone(timedelta(hours=8)))
@@ -329,7 +337,8 @@ class HouseStore:
                      origin_device_id: str = "",
                      expected_revision: int | None = None,
                      notify_scope: str = "all",
-                     notify_user_token: str = "") -> dict[str, Any]:
+                     notify_user_token: str = "",
+                     create_only: bool = False) -> dict[str, Any]:
         """新增或更新一套房源。payload 字段用客户端命名（roomNo/tower/...）。"""
         room_key = str(payload.get("roomKey") or "").strip()
         if not room_key:
@@ -350,6 +359,9 @@ class HouseStore:
             existing = conn.execute(
                 "SELECT * FROM houses WHERE room_key=?", (room_key,)).fetchone()
             now = now_local()
+            if existing is not None and create_only:
+                doc = self._row_to_dict(existing)
+                raise DuplicateHouse(room_key, doc)
             if existing is None:
                 # 另一台设备已把这套房“双端删除”后，本机仍拿着旧修订号提交编辑：
                 # 不能当新房价插回去（否则就是用户最怕的“删了又复活”）。

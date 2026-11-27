@@ -110,11 +110,15 @@ struct HouseAPIError: LocalizedError {
     let forbidden: Bool
     /// 乐观锁冲突：本机基于旧 revision 提交，服务器已有他人新版本
     let revisionConflict: Bool
+    /// 新增房源时服务器已有同座同房号（房号重复）
+    let duplicateRoom: Bool
 
-    init(message: String, forbidden: Bool = false, revisionConflict: Bool = false) {
+    init(message: String, forbidden: Bool = false, revisionConflict: Bool = false,
+         duplicateRoom: Bool = false) {
         self.message = message
         self.forbidden = forbidden
         self.revisionConflict = revisionConflict
+        self.duplicateRoom = duplicateRoom
     }
 
     var errorDescription: String? { message }
@@ -603,11 +607,13 @@ final class HouseRemoteClient {
 
     /// 新增或编辑；expectedRevision 为编辑前修订号（乐观锁），新增传 nil
     @discardableResult
-    func upsert(_ payload: HouseSyncPayload, expectedRevision: Int?) async throws -> RemoteHouse {
+    func upsert(_ payload: HouseSyncPayload, expectedRevision: Int?,
+                createOnly: Bool = false) async throws -> RemoteHouse {
         var body: [String: Any] = payload.json
         body["operator"] = operatorName
         body["originDeviceId"] = originDeviceId
         if let expectedRevision { body["expectedRevision"] = expectedRevision }
+        if createOnly { body["createOnly"] = true }
         let (data, http) = try await makeRequest("/api/house/houses", method: "POST", body: body)
         if http.statusCode == 401 {
             throw HouseAPIError(message: "登录已失效，请重新接入服务器")
@@ -620,6 +626,10 @@ final class HouseRemoteClient {
             if r.error == "revision_conflict" {
                 throw HouseAPIError(message: "该房源刚被其他人修改，请刷新后再编辑",
                                    revisionConflict: true)
+            }
+            if r.error == "duplicate_room" {
+                throw HouseAPIError(message: r.detail ?? "该房号已在服务器收录，不能重复添加",
+                                   duplicateRoom: true)
             }
             throw HouseAPIError(message: r.detail ?? "保存失败")
         }

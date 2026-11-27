@@ -577,13 +577,35 @@ struct HouseEditView: View {
         // 此前「有网络但保存提示没网络、取消再保存就好了」即瞬态误报
         Task {
             let ok = await NetworkMonitor.shared.awaitReachable()
-            if ok {
-                await MainActor.run {
-                    // 查重/占用校验以本地 duplicateCheck + 服务器 pushHouse 乐观锁为准，旧桶先探后写已下线
-                    performSave()
-                }
-            } else {
+            guard ok else {
                 await MainActor.run { showOfflineAlert = true }
+                return
+            }
+            // 新增房源先查服务器：本机没有、但别的设备已收录同一座同一房号时，
+            // 不能落成本地新房再推送覆盖；本地查重只能看到本机缓存，挡不住多设备重复。
+            if house == nil, HouseServerMode.ready {
+                let key = computeNewRoomKey()
+                do {
+                    if let remote = try await HouseRemoteClient.shared.getHouse(key) {
+                        await MainActor.run {
+                            let layout = remote.layout.isEmpty ? "户型未填" : remote.layout
+                            let status = HouseStatus(rawValue: remote.status)?.label ?? remote.status
+                            errorMessage = "这套房源已在服务器收录过：\(remote.roomKey)（\(layout)，\(status)）\n同一座同一房号不能重复添加"
+                            showError = true
+                        }
+                        return
+                    }
+                } catch {
+                    await MainActor.run {
+                        errorMessage = "无法连接服务器确认房号是否重复：\(error.localizedDescription)\n请联网后重试，避免重复收录"
+                        showError = true
+                    }
+                    return
+                }
+            }
+            await MainActor.run {
+                // 本地 duplicateCheck + 服务器 createOnly 双保险；旧桶先探后写已下线
+                performSave()
             }
         }
     }

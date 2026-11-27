@@ -930,6 +930,9 @@ struct TaskCenterView: View {
     @Environment(\.houseModelContext) private var houseModelContext
     // v2.54：无回滚载荷的待处理任务点「删除」时，二次确认防误删
     @State private var purgeTarget: TaskRecord?
+    /// 服务器已硬删、本机待补传：任务中心直接给「彻底删除本机房源」入口
+    @State private var localPurgeTarget: TaskRecord?
+    @State private var serverMissingKeys = Set<String>()
 
     var body: some View {
         NavigationStack {
@@ -980,6 +983,13 @@ struct TaskCenterView: View {
                                                 Label("撤回本次改动（本地+云端恢复）", systemImage: "arrow.uturn.backward")
                                             }
                                         }
+                                        if record.roomKeys.contains(where: { serverMissingKeys.contains($0) }) {
+                                            Button(role: .destructive) {
+                                                localPurgeTarget = record
+                                            } label: {
+                                                Label("彻底删除本机房源（服务器已删）", systemImage: "trash.slash")
+                                            }
+                                        }
                                         Button(role: .destructive) {
                                             purgeTarget = record
                                         } label: {
@@ -1026,6 +1036,10 @@ struct TaskCenterView: View {
                     }
                 }
             }
+            .onAppear { serverMissingKeys = HouseServerMissingStore.keys() }
+            .onReceive(NotificationCenter.default.publisher(for: HouseServerMissingStore.didChange)) { _ in
+                serverMissingKeys = HouseServerMissingStore.keys()
+            }
             .navigationTitle("同步任务中心")
             .navigationBarTitleDisplayMode(.inline)
             .confirmationDialog("删除这条任务？",
@@ -1041,6 +1055,29 @@ struct TaskCenterView: View {
                 Button("取消", role: .cancel) { purgeTarget = nil }
             } message: { _ in
                 Text("仅删除这条任务记录，不会删除本地文件或云端数据。")
+            }
+            .confirmationDialog("彻底删除本机房源？",
+                                isPresented: Binding(
+                                    get: { localPurgeTarget != nil },
+                                    set: { if !$0 { localPurgeTarget = nil } }
+                                ),
+                                presenting: localPurgeTarget) { target in
+                Button("彻底删除", role: .destructive) {
+                    guard let ctx = houseModelContext else {
+                        localPurgeTarget = nil
+                        return
+                    }
+                    let keys = target.roomKeys
+                    _ = HouseSyncEngine.shared.purgeLocalHouses(keys, context: ctx)
+                    // 房源已按服务器为准删除，对应失败任务不能留着再让人重试。
+                    for task in center.failed where !Set(task.roomKeys).isDisjoint(with: Set(keys)) {
+                        center.purge(id: task.id)
+                    }
+                    localPurgeTarget = nil
+                }
+                Button("取消", role: .cancel) { localPurgeTarget = nil }
+            } message: { target in
+                Text("服务器已删除 \(target.roomKeys.first ?? "这套房源")，服务器模式下以服务器为准。本机改动、图片视频和待补传记录将一并清除，不再尝试同步。")
             }
         }
     }

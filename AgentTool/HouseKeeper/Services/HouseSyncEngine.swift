@@ -115,6 +115,8 @@ final class HouseSyncEngine: ObservableObject {
                 }
                 continue
             }
+            // 服务器又出现了这套房：清除“服务器已删除”标记。
+            HouseServerMissingStore.remove(r.roomKey)
             if pendingKeys.contains(r.roomKey) {
                 continue
             }
@@ -152,9 +154,13 @@ final class HouseSyncEngine: ObservableObject {
             HouseLocalDeletionStore.remove(key)
         }
         for (key, h) in byKey where !remoteKeys.contains(key) {
-            // 本机待补传房：即使服务器已没有它，也先保留本地，
-            // 等补传时服务器给出 revision_conflict，用户再明确处理；不在这里静默删。
-            if pendingKeys.contains(key) { continue }
+            // 本机待补传房：服务器已没有它（曾同步过、revMap 有记录）时，标记为
+            // “服务器已删除”，由详情页给用户一个“彻底删除本机房源”按钮；
+            // 不在自动对账里静默删掉本机改动。纯本地未提交房（revMap 无记录）不标记。
+            if pendingKeys.contains(key) {
+                if revMap[key] != nil { HouseServerMissingStore.mark(key) }
+                continue
+            }
             if revMap[key] != nil {
                 context.delete(h)
                 removeServerRevision(forKey: key)
@@ -218,10 +224,13 @@ final class HouseSyncEngine: ObservableObject {
             status: house.statusRaw, media: mediaArray(house, roomKey: roomKey,
                                                        onlyNames: effectiveNames))
         let expected = revMap[roomKey]
+        // 新增/本机从未拿到服务器修订号：按“创建”提交，服务器已同房号时直接拒绝，
+        // 不能把别人的房源当成本机旧版本覆盖掉。
+        let createOnly = (expected == nil)
         let remote: RemoteHouse
         do {
             remote = try await HouseRemoteClient.shared.upsert(
-                payload, expectedRevision: expected)
+                payload, expectedRevision: expected, createOnly: createOnly)
         } catch let error as HouseAPIError where error.revisionConflict {
             // 冲突后不能一直拿旧 revision 重试（会永久卡在待补传）。
             // 先拉一次服务器当前 revision，更新本地基线；本次仍抛给调用方提示/保留本机改动，
@@ -233,15 +242,46 @@ final class HouseSyncEngine: ObservableObject {
                              detail: "服务器已更新到修订 \(fresh.revision)；本机改动保留，下一轮补传按本机版本覆盖",
                              room: roomKey)
             } else {
+                HouseServerMissingStore.mark(roomKey)
                 CloudOps.log(category: "房源", action: "同步冲突", result: "冲突",
-                             detail: "服务器已无此房源（可能被其他设备删除）；本机改动保留，等待人工处理",
+                             detail: "服务器已无此房源（可能被其他设备删除）；本机改动保留，可在详情页彻底删除本机",
                              room: roomKey)
             }
             throw error
         }
         setServerRevision(remote.revision, forKey: roomKey)
         setTop(max(topRevision, remote.revision))
+        HouseServerMissingStore.remove(roomKey)
         return remote
+    }
+
+    /// 服务器已硬删、本机仍残留待补传时，按“服务器为准”彻底清掉本机房源。
+    /// 只动本地，不再请求服务器（避免已删除房源被二次操作）；返回实际清理套数。
+    @discardableResult
+    func purgeLocalHouses(_ roomKeys: [String], context: ModelContext) -> Int {
+        let keys = Set(roomKeys.filter { !$0.isEmpty })
+        guard !keys.isEmpty else { return 0 }
+        let houses = (try? context.fetch(FetchDescriptor<House>())) ?? []
+        var deleted = 0
+        for house in houses where keys.contains(house.mediaRoomKey) {
+            let key = house.mediaRoomKey
+            MediaStore.deleteHouseDirectory(roomKey: key)
+            HousePendingUploader.shared.clearPending(key)
+            SyncFailStore.clear(key)
+            HouseMediaUploadQueue.removeRoom(key)
+            HouseLocalDeletionStore.remove(key)
+            HouseServerMissingStore.remove(key)
+            UnreadCloudHouseStore.clear(key)
+            context.delete(house)
+            deleted += 1
+            CloudOps.log(category: "房源", action: "彻底删除本机房源", result: "成功",
+                         detail: "服务器已删除，按服务器为准清理本机，不再保留本机改动", room: key)
+        }
+        if deleted > 0 {
+            try? context.save()
+            NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
+        }
+        return deleted
     }
 
     /// 硬删：通知服务器物理移除（不进回收站）；本地记录由调用方在成功后 ctx.delete 清除
@@ -349,5 +389,36 @@ enum HouseLocalDeletionStore {
 
     static func clearAll() {
         UserDefaults.standard.removeObject(forKey: key)
+    }
+}
+
+/// 服务器上已经不存在（被其他设备硬删）的房源标记。
+/// 仅用于 UI 给出「彻底删除本机房源」入口；不自动静默删除本地待补传改动。
+enum HouseServerMissingStore {
+    static let didChange = Notification.Name("houseServerMissingChanged")
+    private static let baseKey = "house.serverMissing.roomKeys.v1"
+    private static var key: String { baseKey + "." + CloudUser.safeName }
+
+    static func keys() -> Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+    }
+
+    static func contains(_ roomKey: String) -> Bool {
+        keys().contains(roomKey)
+    }
+
+    static func mark(_ roomKey: String) {
+        guard !roomKey.isEmpty else { return }
+        var set = keys()
+        guard set.insert(roomKey).inserted else { return }
+        UserDefaults.standard.set(Array(set), forKey: key)
+        NotificationCenter.default.post(name: didChange, object: nil)
+    }
+
+    static func remove(_ roomKey: String) {
+        var set = keys()
+        guard set.remove(roomKey) != nil else { return }
+        UserDefaults.standard.set(Array(set), forKey: key)
+        NotificationCenter.default.post(name: didChange, object: nil)
     }
 }
