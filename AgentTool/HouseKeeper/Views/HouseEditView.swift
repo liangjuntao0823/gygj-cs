@@ -901,6 +901,9 @@ struct HouseEditView: View {
         }
         let cloudPushKind: CloudPushKind = isNewHouse ? .newHouse : (roomChanged ? .rename : .plainEdit)
         let oldRoomKeyForPurge = originalRoomKey
+        // 用户重新在本机新建/编辑同一房号时，清掉“仅删本地”的隐藏标记，
+        // 否则下一次同步又会把用户刚建好的房当成需隐藏对象。
+        HouseLocalDeletionStore.remove(target.mediaRoomKey)
         // v1.72（#6）：本地账本镜像（media/<房号>/info.json，与云端同构）——保存即写，删除随目录一步到位
         LocalHouseLedger.save(target)
         // v1.72（#7）：日志动作按实际改动命名（修改租金同步等）；（#8）账本上传也驱动卡片进度条
@@ -996,6 +999,7 @@ struct HouseEditView: View {
     private func launchServerPush(target: House, mediaSnapshots: [MediaUploadSnapshot],
                                   kind: CloudPushKind, oldRoomKey: String) {
         let taskID = UUID()
+        let logRoomKey = target.mediaRoomKey
         if !mediaSnapshots.isEmpty {
             Task { @MainActor in
                 SyncTaskCenter.shared.begin(
@@ -1008,14 +1012,35 @@ struct HouseEditView: View {
         let work = Task {
             // 媒体实体落服务器磁盘：服务器模式下直传服务器 HTTP；
             // 媒体失败不阻塞文本权威同步，未传成功的文件由媒体补传队列后续重试。
+            var uploadResult: (success: Int, failed: Int, failedFiles: [String],
+                               uploaded: [(old: String, new: String)], lastError: String)?
             if !mediaSnapshots.isEmpty {
                 await MediaActivityGate.shared.beginUpload()
                 defer { Task { await MediaActivityGate.shared.endUpload() } }
-                _ = try? await uploadMedia(snapshots: mediaSnapshots,
-                                           writeSuccessLog: false, taskID: taskID)
+                uploadResult = try? await uploadMedia(snapshots: mediaSnapshots,
+                                                       writeSuccessLog: false, taskID: taskID)
+                // 服务器可能把同名/无后缀文件唯一化；把真实落盘名回写到本地记录，
+                // 后续 pushHouse 的 media_refs 才能和服务器磁盘对得上。
+                if let pairs = uploadResult?.uploaded, !pairs.isEmpty {
+                    await MainActor.run {
+                        for pair in pairs where pair.old != pair.new {
+                            for item in target.mediaItems where item.fileName == pair.old {
+                                item.fileName = pair.new
+                            }
+                        }
+                        try? houseModelContext?.save()
+                    }
+                }
             }
             do {
-                let remote = try await HouseSyncEngine.shared.pushHouse(target)
+                // 上传失败的媒体不写进服务器引用；否则服务器账本指向不存在的文件，刷新必 404。
+                let allowedNames: Set<String>? = {
+                    guard let uploadResult, !mediaSnapshots.isEmpty else { return nil }
+                    let failed = Set(uploadResult.failedFiles)
+                    return Set(target.mediaItems.map { $0.fileName }).subtracting(failed)
+                }()
+                let remote = try await HouseSyncEngine.shared.pushHouse(
+                    target, mediaFileNames: allowedNames)
                 // 改名：清理服务器上旧房号的记录与磁盘媒体（后端级联删除；失败不阻断，留待对账清理）
                 if kind == .rename, !oldRoomKey.isEmpty, oldRoomKey != remote.roomKey {
                     try? await HouseRemoteClient.shared.delete(oldRoomKey)
@@ -1036,10 +1061,12 @@ struct HouseEditView: View {
                     }
                 }
             } catch {
+                CloudOps.log(category: "房源", action: "房源同步失败", result: "失败",
+                             detail: error.localizedDescription, room: logRoomKey)
                 await MainActor.run {
                     if !mediaSnapshots.isEmpty { SyncTaskCenter.shared.discard(id: taskID) }
                     // 标记待补传，联网后自动重试，不丢改动
-                    HousePendingUploader.shared.markPending(target.mediaRoomKey)
+                    HousePendingUploader.shared.markPending(logRoomKey)
                     HouseActionNotifier.shared.send(
                         key: "fail.\(target.mediaRoomKey)",
                         title: "已存本机",
@@ -1061,10 +1088,11 @@ struct HouseEditView: View {
         return false
     }
 
-    private func uploadMedia(snapshots: [MediaUploadSnapshot], writeSuccessLog: Bool = true, taskID: UUID? = nil, isNewHouse: Bool = false) async throws -> (success: Int, failed: Int, failedFiles: [String], lastError: String) {
-        guard !snapshots.isEmpty else { return (0, 0, [], "") }
+    private func uploadMedia(snapshots: [MediaUploadSnapshot], writeSuccessLog: Bool = true, taskID: UUID? = nil, isNewHouse: Bool = false) async throws -> (success: Int, failed: Int, failedFiles: [String], uploaded: [(old: String, new: String)], lastError: String) {
+        guard !snapshots.isEmpty else { return (0, 0, [], [], "") }
         var success = 0, failed = 0, lastError = ""
         var failedFiles: [String] = []
+        var uploaded: [(old: String, new: String)] = []
         let total = snapshots.count
         let roomKey = snapshots[0].roomKey
         HouseSyncProgress.shared.begin(roomKey: roomKey, direction: .upload, progress: 0)
@@ -1087,9 +1115,23 @@ struct HouseEditView: View {
             do {
                 let data = try Data(contentsOf: url)
                 HouseSyncProgress.shared.updateStage(roomKey: snap.roomKey, direction: .upload, label: "正在上传")
-                _ = try await HouseRemoteClient.shared.uploadMedia(
+                let result = try await HouseRemoteClient.shared.uploadMedia(
                     roomKey: snap.roomKey, fileName: snap.fileName,
                     kind: snap.kind, data: data)
+                // 服务器实际落盘名与本地名不一致（同名文件被唯一化）时，立即把本地文件改名，
+                // 保证本地记录、磁盘文件和服务器 media_refs 三者同名。
+                let expectedRemote = MediaNaming.remoteName(fileName: snap.fileName, kind: snap.kind)
+                if result.fileName != expectedRemote {
+                    let actualURL = MediaStore.houseDirectory(roomKey: snap.roomKey)
+                        .appendingPathComponent(result.fileName)
+                    if !FileManager.default.fileExists(atPath: actualURL.path),
+                       FileManager.default.fileExists(atPath: url.path) {
+                        try? FileManager.default.moveItem(at: url, to: actualURL)
+                    }
+                    uploaded.append((old: snap.fileName, new: result.fileName))
+                } else {
+                    uploaded.append((old: snap.fileName, new: snap.fileName))
+                }
                 HouseMediaUploadQueue.remove(roomKey: snap.roomKey, fileName: snap.fileName)
                 success += 1
             } catch {
@@ -1139,10 +1181,11 @@ struct HouseEditView: View {
             if upSplit.videos.isEmpty { upAction = "新增图片（本地→云端）" }
             else if upSplit.images.isEmpty { upAction = "新增视频（本地→云端）" }
             else { upAction = "新增媒体（本地→云端）" }
+            // 成功事件已由 HouseLedgerStore.append 写入云端 ops；这里只留本地日志，避免重复两条。
             BackupLogStore.log(category: "房源", action: upAction, result: "成功",
-                              detail: upParts.joined(separator: "；"), room: roomKey, cloud: true)
+                              detail: upParts.joined(separator: "；"), room: roomKey, cloud: false)
         }
-        return (success, failed, failedFiles, lastError)
+        return (success, failed, failedFiles, uploaded, lastError)
     }
 
 

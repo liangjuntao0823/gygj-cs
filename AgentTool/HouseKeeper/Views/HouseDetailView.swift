@@ -343,7 +343,7 @@ struct HouseDetailView: View {
                     Color.black.opacity(0.35).ignoresSafeArea()
                     VStack(spacing: 12) {
                         ProgressView().tint(.white)
-                        Text("本地已删除，正在同步删除云端…")
+                        Text("正在同步删除服务器副本…")
                             .font(.footnote)
                             .foregroundColor(.white)
                     }
@@ -825,7 +825,7 @@ struct HouseDetailView: View {
         }
         // 未接入服务器：旧桶下载兜底已下线
         isDownloading = false
-        cloudDeleteMessage = "未接入服务器，无法下载云端房源"
+        cloudDeleteMessage = "未接入服务器，无法下载服务器房源"
     }
 
     /// 服务器模式回补名单：本地记录优先；本地为空时从服务器房源详情取 media。
@@ -893,7 +893,7 @@ struct HouseDetailView: View {
                     if files.isEmpty {
                         action()
                     } else {
-                        cloudDeleteMessage = "云端房源已自动下载到本地，请再点一次刚才的操作。"
+                        cloudDeleteMessage = "服务器房源已自动下载到本地，请再点一次刚才的操作。"
                     }
                 }
                 return
@@ -904,34 +904,35 @@ struct HouseDetailView: View {
         }
     }
 
-    /// v1.19 补全：删除确认文案按当前存储位置动态生成（本地/云端/双端一目了然）
+    /// v1.19 补全：删除确认文案按当前存储位置动态生成（本地/服务器/双端一目了然）
     private var deleteConfirmMessage: String {
         switch house.cloudStatus {
         case .both:
-            return "将删除「本地 + 云端」：本地照片视频、数据库记录，以及云端 h/\(house.mediaRoomKey)/ 目录一并清除，不可恢复。备份镜像 backups/media 保留。"
+            return "将删除「本地 + 服务器」：本地照片视频、数据库记录，以及服务器上的房源、账本与实拍图片/视频一并永久清除，不可恢复。"
         case .local:
-            return "将删除本地房源（未上传云端）：本地照片视频、数据库记录一并清除，不可恢复。备份镜像 backups/media 保留。"
+            return "将删除本地房源（服务器上没有这套房）：本地照片视频、数据库记录一并清除，不可恢复。"
         case .cloud:
-            return "将删除云端同步副本：该房本机无媒体，将从云端 h/\(house.mediaRoomKey)/ 清除，不可恢复。"
+            return "将删除服务器同步副本：该房本机无媒体，服务器上的房源、账本与实拍图片/视频一并永久清除，不可恢复。"
         }
     }
 
     private func deleteHouse() {
         // 删除：服务器模式先删服务器权威库、成功后删本机记录；未接入仅删本地。
-        // 旧桶文件夹删除编排已下线；backups/media 备份镜像保留（旧备份恢复引用）。
+        // 旧桶文件夹删除编排已下线；服务器模式删除服务器权威库与磁盘媒体。
         guard let ctx = houseModelContext else { return }
         let roomKey = house.mediaRoomKey
         // v2.45：删除事件先写账本（目录随后整体删除；云端删除前会先同步一次留证）
         let deleteDetail = HouseServerMode.ready
-            ? "彻底删除服务器记录与本地房源（桶内媒体保留）"
+            ? "彻底删除服务器房源、账本与媒体，并清除本地房源"
             : "彻底删除本地房源"
         HouseLedgerStore.append(roomKey: roomKey, action: "删除房源", detail: deleteDetail)
-        // 服务器模式：硬删——先删服务器权威库，成功后删本机记录；不进回收站，COS 桶文件夹与媒体本轮保留。
+        // 服务器模式：硬删——先删服务器权威库，成功后删本机记录；不进回收站，服务器本地磁盘媒体一并删除。
         if HouseServerMode.ready {
             isDeletingCloud = true
             Task {
                 do {
                     try await HouseSyncEngine.shared.pushDelete(house)
+                    HouseLocalDeletionStore.remove(roomKey)
                     await MainActor.run {
                         MediaStore.deleteHouseDirectory(roomKey: roomKey)
                         SyncFailStore.clear(roomKey)
@@ -945,6 +946,9 @@ struct HouseDetailView: View {
                         dismiss()
                     }
                 } catch {
+                    CloudOps.log(category: "房源", action: "删除双端房源", result: "失败",
+                                 detail: "服务器删除失败：\(error.localizedDescription)，本机记录保留",
+                                 room: roomKey)
                     await MainActor.run {
                         isDeletingCloud = false
                         cloudDeleteMessage = "删除失败：\(error.localizedDescription)，本机记录保留"

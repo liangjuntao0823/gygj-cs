@@ -186,6 +186,13 @@ enum HouseLedgerStore {
         savePendingUnlocked(roomKey: roomKey, events: pending)
         fileLock.unlock()
         scheduleSync(roomKey: roomKey)
+        // 云端 ops 日志：手机端新增/编辑/状态/删除/媒体动作统一在这里落一条，
+        // 不再依赖各页面各自记得写 cloud:true（此前手机动作在后台日志里完全看不到）。
+        let changeText = fieldChanges.map { "\($0.field)：\($0.oldValue)→\($0.newValue)" }
+            .joined(separator: "；")
+        let logDetail = detail.isEmpty ? changeText : detail
+        CloudOps.log(category: "房源", action: action, result: "成功",
+                     detail: logDetail, room: roomKey)
         return event
     }
 

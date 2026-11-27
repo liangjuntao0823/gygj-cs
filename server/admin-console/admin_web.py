@@ -70,6 +70,45 @@ def _send_file(handler: Any, status: int, body: bytes, filename: str,
     handler.wfile.write(body)
 
 
+def _send_inline_file(handler: Any, status: int, body: bytes, filename: str,
+                      content_type: str) -> None:
+    """浏览器内联预览：图片/视频直接渲染，不触发下载；视频支持 Range 以便拖进度/取首帧。"""
+    total = len(body)
+    start, end = 0, total - 1
+    partial = False
+    range_header = handler.headers.get("Range", "")
+    if range_header.startswith("bytes=") and total > 0:
+        try:
+            spec = range_header[len("bytes="):].split(",", 1)[0]
+            a, _, b = spec.partition("-")
+            if a:
+                start = int(a)
+                end = int(b) if b else total - 1
+            elif b:
+                start = max(0, total - int(b))
+                end = total - 1
+            if start <= end and start < total:
+                end = min(end, total - 1)
+                partial = True
+            else:
+                start, end = 0, total - 1
+        except Exception:
+            start, end, partial = 0, total - 1, False
+    payload = body[start:end + 1] if partial else body
+    handler.send_response(206 if partial else status)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(len(payload)))
+    handler.send_header("Accept-Ranges", "bytes")
+    if partial:
+        handler.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+    handler.send_header(
+        "Content-Disposition",
+        f"inline; filename*=UTF-8''{urllib.parse.quote(filename)}")
+    handler.send_header("Cache-Control", "private, max-age=300")
+    handler.end_headers()
+    handler.wfile.write(payload)
+
+
 def _read_body(handler: Any) -> dict[str, Any]:
     try:
         length = int(handler.headers.get("Content-Length") or 0)
@@ -303,6 +342,22 @@ def route_request(handler: Any, method: str, path: str, admin: Any) -> bool:
         ctype = "text/csv; charset=utf-8" if fmt == "csv" else "application/json; charset=utf-8"
         _send_file(handler, 200, data, fname, ctype)
         return True
+    if path.startswith(PREFIX + "/api/house/media/"):
+        if method != "GET":
+            _send_json(handler, 405, {"ok": False, "error": "method_not_allowed"})
+            return True
+        rest = path[len(PREFIX + "/api/house/media/"):]
+        segs = [urllib.parse.unquote(s) for s in rest.strip("/").split("/") if s]
+        if len(segs) != 2:
+            _send_json(handler, 404, {"ok": False, "error": "not_found"})
+            return True
+        body, ctype = admin.house.media_bytes(segs[0], segs[1])
+        if body is None:
+            _send_json(handler, 404, {"ok": False, "error": "not_found"})
+        else:
+            _send_inline_file(handler, 200, body, segs[1], ctype or "application/octet-stream")
+        return True
+
     if path == PREFIX + "/api/house/houses" and method == "GET":
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query)
         _send_json(handler, 200, admin.house.list(

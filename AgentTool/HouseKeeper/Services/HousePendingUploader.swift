@@ -73,39 +73,53 @@ final class HousePendingUploader {
     /// 联网后按序补传所有待提交房源；返回成功数
     @discardableResult
     func flush(context: ModelContext) async -> Int {
-        let keys = pendingKeys
+        let houses = (try? context.fetch(FetchDescriptor<House>())) ?? []
+        let byKey = Dictionary(houses.map { ($0.mediaRoomKey, $0) },
+                               uniquingKeysWith: { a, _ in a })
+
+        // 先补媒体二进制：媒体成功后才能把真实引用写进服务器。
+        // 之前先 pushHouse 再传媒体，会把还没传上去的文件写进 media_refs，
+        // 刷新时服务器指向不存在的文件，客户端就 404/无图。
+        let uploadedRooms = await flushMedia(context: context)
+
         var done = 0
-        if !keys.isEmpty {
-            let houses = (try? context.fetch(FetchDescriptor<House>())) ?? []
-            let byKey = Dictionary(houses.map { ($0.mediaRoomKey, $0) },
-                                   uniquingKeysWith: { a, _ in a })
-            for key in keys {
-                guard let h = byKey[key] else {
-                    // 本地已无此房（被彻底删除），无需再补传
-                    clearPending(key)
-                    continue
-                }
-                do {
-                    _ = try await HouseSyncEngine.shared.pushHouse(h)
+        var keysToPush = Set(pendingKeys)
+        for key in Array(keysToPush) where byKey[key] == nil {
+            clearPending(key)   // 本地已无此房（被彻底删除），不再补传
+            keysToPush.remove(key)
+        }
+        keysToPush.formUnion(uploadedRooms)
+        for key in keysToPush {
+            guard let h = byKey[key] else { continue }
+            // 仍留在待上传队列里的媒体不写进服务器引用，避免幽灵引用。
+            let pendingNames = Set(HouseMediaUploadQueue.pendingItems()
+                .filter { $0.roomKey == key }
+                .map { $0.fileName })
+            let allowed = Set(h.mediaItems.map { $0.fileName }).subtracting(pendingNames)
+            do {
+                _ = try await HouseSyncEngine.shared.pushHouse(h, mediaFileNames: allowed)
+                if HousePendingRegistry.keys().contains(key) {
                     clearPending(key)
                     done += 1
-                } catch {
-                    // 仍失败（断网/冲突），保留待下轮，不影响其余房源
-                    break
                 }
+            } catch {
+                // 仍失败（断网/冲突），保留待下轮，不影响其余房源
+                continue
             }
         }
-        // 文本补传后顺带把待传媒体二进制补到服务器磁盘
-        await flushMedia()
         return done
     }
 
-    /// 服务器模式：把待传媒体队列逐个补传到服务器磁盘；成功清条目，本地文件已失则清条目，失败保留待下轮
+    /// 服务器模式：把待传媒体队列逐个补传到服务器磁盘；成功清条目，本地文件已失则清条目，失败保留待下轮。
+    /// 返回本次成功上传过的房源 roomKey 集合，调用方据此补写服务器 media_refs。
     @discardableResult
-    func flushMedia() async -> Int {
+    func flushMedia(context: ModelContext) async -> Set<String> {
         let items = HouseMediaUploadQueue.pendingItems()
-        guard !items.isEmpty else { return 0 }
-        var done = 0
+        guard !items.isEmpty else { return [] }
+        var uploadedRooms = Set<String>()
+        let houses = (try? context.fetch(FetchDescriptor<House>())) ?? []
+        let byKey = Dictionary(houses.map { ($0.mediaRoomKey, $0) },
+                               uniquingKeysWith: { a, _ in a })
         for item in items {
             let localURL = MediaStore.url(for: item.fileName, roomKey: item.roomKey)
             guard FileManager.default.fileExists(atPath: localURL.path),
@@ -114,14 +128,31 @@ final class HousePendingUploader {
                 continue
             }
             do {
-                _ = try await HouseRemoteClient.shared.uploadMedia(
+                let result = try await HouseRemoteClient.shared.uploadMedia(
                     roomKey: item.roomKey, fileName: item.fileName, kind: item.kind, data: data)
+                // 服务器可能因为同名/无后缀而唯一化落盘名；必须把本地记录改到真实落盘名，
+                // 否则下一次 pushHouse 仍然引用旧名，服务器就留下 404 幽灵引用。
+                let expectedRemote = MediaNaming.remoteName(fileName: item.fileName, kind: item.kind)
+                if result.fileName != expectedRemote {
+                    let actualURL = MediaStore.houseDirectory(roomKey: item.roomKey)
+                        .appendingPathComponent(result.fileName)
+                    if !FileManager.default.fileExists(atPath: actualURL.path),
+                       FileManager.default.fileExists(atPath: localURL.path) {
+                        try? FileManager.default.moveItem(at: localURL, to: actualURL)
+                    }
+                    if let h = byKey[item.roomKey] {
+                        for media in h.mediaItems where media.fileName == item.fileName {
+                            media.fileName = result.fileName
+                        }
+                    }
+                }
                 HouseMediaUploadQueue.remove(roomKey: item.roomKey, fileName: item.fileName)
-                done += 1
+                uploadedRooms.insert(item.roomKey)
             } catch {
                 // 保留条目，下轮同步再试
             }
         }
-        return done
+        if !uploadedRooms.isEmpty { try? context.save() }
+        return uploadedRooms
     }
 }

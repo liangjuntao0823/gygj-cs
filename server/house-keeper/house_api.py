@@ -284,7 +284,11 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
             segs = [s for s in rest.strip("/").split("/") if s]
             if len(segs) == 1 and method == "POST":
                 room_key = segs[0]
-                file_name = handler.headers.get("X-File-Name") or _q(handler).get("filename", "")
+                # 客户端把中文文件名百分号编码后放进 HTTP 头（HTTP 头只能是 ASCII），
+                # 这里必须还原，否则中文房号会被截成 "1-1234" 这类 ASCII 前缀，落盘名与账本对不上。
+                raw_file_name = (handler.headers.get("X-File-Name")
+                                 or _q(handler).get("filename", ""))
+                file_name = urllib.parse.unquote(raw_file_name or "")
                 kind = handler.headers.get("X-Kind") or ("video" if file_name.lower().endswith((".mov", ".mp4", ".m4v")) else "image")
                 try:
                     length = int(handler.headers.get("Content-Length") or 0)

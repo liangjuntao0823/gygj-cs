@@ -134,6 +134,14 @@ class HouseConsole:
     def ledger(self, room_key: str) -> list[dict[str, Any]]:
         return self.store.ledger(room_key)
 
+    def media_bytes(self, room_key: str, file_name: str):
+        """后台详情/编辑弹窗读真实媒体二进制（Cookie 会话鉴权，不暴露公开目录）。"""
+        rel = self.store.media.rel_house(room_key, file_name)
+        data = self.store.media.read_house_media(room_key, file_name)
+        if data is None:
+            return None, None
+        return data, self.store.media.guess_content_type(rel_path=rel)
+
     # ---- 导出 ----
     def export_json(self) -> tuple[bytes, str]:
         doc = self.store.list_houses(include_deleted=False)

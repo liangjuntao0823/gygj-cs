@@ -17,6 +17,9 @@ final class HouseSyncEngine: ObservableObject {
 
     @Published var busy = false
     @Published var statusText: String?
+    /// 本轮拉取时，服务器有、但被用户“仅删本地”隐藏的房源数量。
+    /// 手动刷新用它做恢复确认；自动对账只跳过，不弹窗、不自动带回。
+    @Published private(set) var hiddenCloudCount = 0
 
     private let topKey = "house.sync.topRevision.v1"
     private let revMapKey = "house.sync.revMap.v1"
@@ -97,7 +100,18 @@ final class HouseSyncEngine: ObservableObject {
             byKey[h.mediaRoomKey] = h
         }
         var changed = 0
+        hiddenCloudCount = 0
         for r in remoteHouses {
+            // 用户明确选择「仅删本地」：服务器仍有这套房，但本机不再自动带回。
+            // 手动刷新时由列表页弹窗询问是否恢复；自动对账只跳过。
+            if HouseLocalDeletionStore.contains(r.roomKey) {
+                hiddenCloudCount += 1
+                if let local = byKey[r.roomKey] {
+                    context.delete(local)
+                    changed += 1
+                }
+                continue
+            }
             let target = byKey[r.roomKey] ?? House()
             if byKey[r.roomKey] == nil {
                 context.insert(target)
@@ -145,8 +159,14 @@ final class HouseSyncEngine: ObservableObject {
         let wantedNames = Set(remoteMedia.map {
             Self.localFileName(objectKey: $0.objectKey, kind: $0.kind)
         })
+        // 本地已登记、但还没传成功的媒体不能因为服务器清单暂时没有就删掉：
+        // 它们还在待上传队列里，删了本地记录会让后补传的图片/视频“人间蒸发”。
+        let pendingNames = Set(HouseMediaUploadQueue.pendingItems()
+            .filter { $0.roomKey == house.mediaRoomKey }
+            .map { $0.fileName })
         // 删除本地不再引用的媒体记录
-        for old in house.mediaItems where !wantedNames.contains(old.fileName) {
+        for old in house.mediaItems where !wantedNames.contains(old.fileName)
+            && !pendingNames.contains(old.fileName) {
             context.delete(old)
         }
         let existing = Set(house.mediaItems.map { $0.fileName })
@@ -161,15 +181,28 @@ final class HouseSyncEngine: ObservableObject {
 
     // MARK: - 推送（本地 → 服务器）
 
-    /// 推送单套房的新增/编辑
+    /// 推送单套房的新增/编辑。
+    /// - Parameter mediaFileNames: 本次允许写进服务器 media_refs 的本地文件名集合；
+    ///   传 nil 表示全部。上传失败的媒体不应写进服务器，否则会在服务器留下 404 幽灵引用。
     @discardableResult
-    func pushHouse(_ house: House) async throws -> RemoteHouse {
+    func pushHouse(_ house: House, mediaFileNames: Set<String>? = nil) async throws -> RemoteHouse {
         let roomKey = house.mediaRoomKey
+        // 任何入口 pushHouse 都自动排除仍在待上传队列里的媒体：
+        // 状态切换、批量导入等路径不会把“本地有、服务器还没有”的文件写进 media_refs。
+        let pendingNames = Set(HouseMediaUploadQueue.pendingItems()
+            .filter { $0.roomKey == roomKey }
+            .map { $0.fileName })
+        let effectiveNames: Set<String>? = {
+            if let mediaFileNames { return mediaFileNames.subtracting(pendingNames) }
+            guard !pendingNames.isEmpty else { return nil }
+            return Set(house.mediaItems.map { $0.fileName }).subtracting(pendingNames)
+        }()
         let payload = HouseSyncPayload(
             roomKey: roomKey, roomNo: house.roomNo, tower: house.tower,
             landlord: house.landlord, layout: house.layout, price: house.price,
             password: house.password, remark: house.remark,
-            status: house.statusRaw, media: mediaArray(house, roomKey: roomKey))
+            status: house.statusRaw, media: mediaArray(house, roomKey: roomKey,
+                                                       onlyNames: effectiveNames))
         let expected = revMap[roomKey]
         let remote = try await HouseRemoteClient.shared.upsert(
             payload, expectedRevision: expected)
@@ -193,8 +226,10 @@ final class HouseSyncEngine: ObservableObject {
         setTop(max(topRevision, remote.revision))
     }
 
-    private func mediaArray(_ house: House, roomKey: String) -> [[String: Any]] {
-        house.mediaItems.map { item in
+    private func mediaArray(_ house: House, roomKey: String,
+                            onlyNames: Set<String>? = nil) -> [[String: Any]] {
+        house.mediaItems.compactMap { item in
+            if let onlyNames, !onlyNames.contains(item.fileName) { return nil }
             let remoteName = MediaNaming.remoteName(fileName: item.fileName, kind: item.kind)
             let key = Self.objectKey(roomKey: roomKey, fileName: item.fileName,
                                     kind: item.kind)
@@ -233,5 +268,38 @@ final class HouseSyncEngine: ObservableObject {
          "layout": h.layout, "price": String(h.price), "password": h.password,
          "remark": h.remark, "status": h.statusRaw, "deleted": String(h.isTrashed),
          "media": h.mediaItems.map { $0.fileName }.sorted().joined(separator: "|")]
+    }
+}
+
+/// “仅删本地”墓碑：记录用户明确从本机删除、但服务器仍保留的房源。
+/// 作用：自动同步/手动同步不再把它们静默带回；只有用户在总刷新确认框里点“恢复”才清除。
+enum HouseLocalDeletionStore {
+    private static let key = "house.localDeletion.roomKeys.v1"
+
+    static func keys() -> Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+    }
+
+    static func count() -> Int { keys().count }
+
+    static func contains(_ roomKey: String) -> Bool {
+        keys().contains(roomKey)
+    }
+
+    static func mark(_ roomKey: String) {
+        guard !roomKey.isEmpty else { return }
+        var set = keys()
+        set.insert(roomKey)
+        UserDefaults.standard.set(Array(set), forKey: key)
+    }
+
+    static func remove(_ roomKey: String) {
+        var set = keys()
+        set.remove(roomKey)
+        UserDefaults.standard.set(Array(set), forKey: key)
+    }
+
+    static func clearAll() {
+        UserDefaults.standard.removeObject(forKey: key)
     }
 }

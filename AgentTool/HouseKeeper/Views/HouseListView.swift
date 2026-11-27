@@ -13,7 +13,7 @@ enum HouseSortMode: String, CaseIterable {
 /// v2.9（P1-1）：轻量变更感知三态结果
 enum CloudChangeState: Equatable {
     case noChange        // 两端一致，无变化
-    case hasUpdate       // 云端有更新，提示用户下拉同步
+    case hasUpdate       // 云端有更新，提示用户点左上角刷新确认后同步
     case detectFailed    // 检测失败（断网/超时/未配置云），不再静默
 }
 
@@ -82,6 +82,9 @@ struct HouseListView: View {
     //   - showShareModeAlert + activeDialog：分享方式选择（普通按钮触发，非 swipeActions）
     //   - showInfoAlert + infoMessage：分享错误 / 批量结果提示
     @State private var showDeleteConfirm = false
+    /// 点左上角刷新时的确认弹窗：有本地隐藏房源时先问“恢复还是保持隐藏”，
+    /// 没有隐藏房源时确认“是否从服务器同步”，避免点一下就直接拉取。
+    @State private var refreshPrompt: RefreshPrompt?
     @State private var isBatchDelete = false
     @State private var deleteRunning = false
     @State private var deleteDone = 0
@@ -126,6 +129,17 @@ struct HouseListView: View {
     /// v1.15 需求2：单一弹窗枚举（iOS 17 同一视图多个 confirmationDialog/alert 会互相覆盖、且 swipeActions
     /// 手势会拦截 confirmationDialog 按钮点击，删除确认因此无反应）——统一改用单一 alert 呈现所有确认/提示
     /// v1.16 需求2：枚举仅保留「分享方式选择」两类（multiShare/singleShare）；删除/批量删除走独立 showDeleteConfirm
+    enum RefreshPrompt: Identifiable {
+        case confirm(deep: Bool)
+        case hidden(count: Int, deep: Bool)
+        var id: String {
+            switch self {
+            case .confirm: return "confirm"
+            case .hidden: return "hidden"
+            }
+        }
+    }
+
     enum HouseListDialog: Identifiable {
         case multiShare
         case singleShare
@@ -273,9 +287,9 @@ struct HouseListView: View {
                 // v1.59：左上角 = 手动同步 + 多选入口（多选从右上角移到刷新旁边）
                 ToolbarItem(placement: .topBarLeading) {
                     HStack(spacing: 14) {
-                        // v1.19：左上角手动同步（与下拉刷新同效果——拉取云端房源）
+                        // v1.19：左上角手动同步（已取消下拉刷新，这里是唯一手动入口）
                         Button {
-                            Task { await syncCloudHouses() }
+                            requestManualSync(deep: false)
                         } label: {
                             if isSyncing {
                                 ProgressView().controlSize(.small)
@@ -287,7 +301,7 @@ struct HouseListView: View {
                         // 日常点按走增量（1~3 秒）；怀疑漏更新时用长按强制全量。
                         .highPriorityGesture(
                             LongPressGesture(minimumDuration: 0.6).onEnded { _ in
-                                Task { await syncCloudHouses(deep: true) }
+                                requestManualSync(deep: true)
                             }
                         )
                         // v2.63：同步进行中禁用按钮（点按与长按都生效），配合入口重入保护，连点不会再开第二份任务
@@ -449,11 +463,35 @@ struct HouseListView: View {
             // 挂在本链最末（最后挂载优先响应），避免 iOS 17 swipeActions 手势拦截 confirmationDialog / 自定义 Binding 失效的问题
             // v1.36 需求1：删除改为彻底删除（不再进回收站）
             .alert(isBatchDelete ? "删除选中的 \(selectedHouseIDs.count) 套房源" : "删除这套房源", isPresented: $showDeleteConfirm) {
-                Button("仅删除本地（云端保留）") { startDelete(both: false) }
-                Button("删除双端（推荐）", role: .destructive) { startDelete(both: true) }
+                Button("仅删除本地（服务器保留）") { startDelete(both: false) }
+                Button("删除本地与服务器（推荐）", role: .destructive) { startDelete(both: true) }
                 Button("取消", role: .cancel) { deleteTarget = nil }
             } message: {
                 Text(deleteConfirmMessage)
+            }
+            // 点左上角总刷新才触发；自动对账（进页/45 秒）不弹，避免打断当前操作。
+            .alert(item: $refreshPrompt) { prompt in
+                switch prompt {
+                case .confirm(let deep):
+                    return Alert(
+                        title: Text("从服务器同步房源？"),
+                        message: Text("会先补传本机尚未上传的改动，再拉取服务器最新清单。其他设备刚改的房源会同步到本机。"),
+                        primaryButton: .default(Text("开始同步")) {
+                            Task { await syncCloudHouses(deep: deep) }
+                        },
+                        secondaryButton: .cancel(Text("取消")))
+                case .hidden(let count, let deep):
+                    return Alert(
+                        title: Text("有 \(count) 套仅删了本地的房源"),
+                        message: Text("服务器上仍保留这些房源。直接同步不会自动带回；要恢复显示，还是保持隐藏？"),
+                        primaryButton: .default(Text("恢复显示并同步")) {
+                            HouseLocalDeletionStore.clearAll()
+                            Task { await syncCloudHouses(deep: deep) }
+                        },
+                        secondaryButton: .default(Text("保持隐藏并同步")) {
+                            Task { await syncCloudHouses(deep: deep) }
+                        })
+                }
             }
         }
         .onAppear {
@@ -507,7 +545,7 @@ struct HouseListView: View {
             reloadHouses()
         }
         // b118（清单12：打开 App 轻量变更感知）：App 启动/回前台探测到云端账本有变化 →
-        // 顶部横幅轻提示「云端有更新」，用户下拉刷新即同步（不自动拉取，省流量、不打断当前操作）
+        // 顶部横幅轻提示「云端有更新」，用户点左上角刷新确认后同步（不自动拉取，省流量、不打断当前操作）
         // b119（清单1 重做）：文案改为「检测到云端有更新，请同步」；本页收到通知直接提示
         // b120：通知到达也走统一提示入口（showCloudChangeHint 防抖），并消费 pendingHint
         .onReceive(NotificationCenter.default.publisher(for: Self.cloudLedgerChangedLight)) { _ in
@@ -893,12 +931,6 @@ struct HouseListView: View {
                 .scrollContentBackground(.hidden)
                 .background(AppTheme.background)
                 // v2.3（需求②）：折叠已改为按钮式手动收起/展开，不再随滚动自动切换（原 b106 自动方案无效）
-                // v1.19：下拉刷新 = 从云端拉取房源（与左上角手动同步同效果）
-                // v1.63：下拉刷新改本地刷新——媒体补全检测（磁盘与记录对账），不再触发云端同步；
-                //        左上角刷新按钮保持云端同步不变
-                .refreshable {
-                    await localRefreshWithMediaCheck()
-                }
             }
         }
         // v1.21：多选模式底部操作栏（v1.12：增加批量已租 / 批量删除，分享逻辑保留不动）
@@ -1024,12 +1056,12 @@ struct HouseListView: View {
         let count = isBatchDelete ? selectedHouseIDs.count : 1
         let scope: String
         switch deleteTarget?.cloudStatus {
-        case .some(.local): scope = "这套房源本机有、云端没有"
-        case .some(.cloud): scope = "这套房源本机无媒体、云端有"
-        default: scope = "这套房源本地和云端都有"
+        case .some(.local): scope = "这套房源仅在本机，服务器上没有"
+        case .some(.cloud): scope = "这套房源本机无媒体、服务器上有"
+        default: scope = "这套房源本机和服务器上都有"
         }
         let head = isBatchDelete ? "共 \(count) 套，\(scope)。" : "\(scope)。"
-        return head + "\n\n仅删除本地：云端不动，下次同步会把它们重新带回列表。\n删除双端（推荐）：本地照片视频、数据库记录、云端 h/<房号>/ 与账本一并清除，不可恢复（备份镜像 backups/media 保留）。"
+        return head + "\n\n仅删除本地：只清本机缓存和照片视频，服务器继续保留，其他设备不受影响。之后点左上角刷新会先问是否恢复，不会自动带回。\n删除本地与服务器（推荐）：本机照片视频、数据库记录，以及服务器上的房源、账本和实拍图片/视频一并永久删除，不可恢复。"
     }
 
     /// v2.57（P1-2）：统一下手改为「先删云端、成功再删本地」——
@@ -1054,9 +1086,14 @@ struct HouseListView: View {
         guard !keys.isEmpty else { deleteTarget = nil; isBatchDelete = false; return }
         _ = rooms
 
-        // 仅删本地：走老路（不动云端），云端本来就不打算删
+        // 仅删本地：服务器不动，但必须留下“本地隐藏”墓碑——否则下一次总刷新
+        // 看到服务器还有这套房，就会不声不响地按云端数据重新 insert（用户看到的“自动带回”）。
         if !both {
-            for h in houses where keys.contains(h.mediaRoomKey) {
+            let targets = houses.filter { keys.contains($0.mediaRoomKey) }
+            for h in targets {
+                if h.cloudStatus != .local {
+                    HouseLocalDeletionStore.mark(h.mediaRoomKey)
+                }
                 MediaStore.deleteHouseDirectory(roomKey: h.mediaRoomKey)
                 SyncFailStore.clear(h.mediaRoomKey)
                 UnreadCloudHouseStore.clear(h.mediaRoomKey)
@@ -1074,11 +1111,15 @@ struct HouseListView: View {
             // v2.57（P1-5）：本地已删，队列里这套房的待传项全部清掉，不再复活成幽灵任务
             for key in keys { HouseMediaUploadQueue.removeRoom(key) }
             NotificationCenter.default.post(name: Self.houseStoreChanged, object: nil)
-            showToast(RemoteConfig.tip("deletedLocalOnly", "已删除本地房源；云端仍保留，下次同步会重新出现").replacingOccurrences(of: "本地房源", with: "\(keys.count) 套本地房源"))
+            for key in keys where HouseLocalDeletionStore.contains(key) {
+                CloudOps.log(category: "房源", action: "仅删本地房源", result: "成功",
+                             detail: "本机删除，服务器保留；刷新时需手动确认恢复", room: key)
+            }
+            showToast("已从本机删除 \(keys.count) 套；服务器仍保留。之后点左上角刷新会先问是否恢复，不会自动带回。")
             return
         }
 
-        // 服务器模式：双端删除走服务器软删除（进回收站，可恢复），逐套同步
+        // 服务器模式：双端删除走服务器硬删（永久，不进回收站），逐套同步
         if HouseServerMode.ready {
             runServerDelete(keys: keys, ctx: ctx)
             return
@@ -1122,9 +1163,15 @@ struct HouseListView: View {
                 if let h = houses.first(where: { $0.mediaRoomKey == key }) {
                     do {
                         try await HouseSyncEngine.shared.pushDelete(h)
+                        HouseLocalDeletionStore.remove(key)
+                        CloudOps.log(category: "房源", action: "删除双端房源", result: "成功",
+                                     detail: "服务器与本地永久删除，不可恢复", room: key)
                         ok += 1
                         localDeleted.append(h)
                     } catch {
+                        CloudOps.log(category: "房源", action: "删除双端房源", result: "失败",
+                                     detail: "服务器删除失败：\(error.localizedDescription)，本机记录保留",
+                                     room: key)
                         showToast("删除失败 \(key)：\(error.localizedDescription)", isError: true)
                     }
                 }
@@ -1151,11 +1198,11 @@ struct HouseListView: View {
         }
     }
 
-    /// 云端删除进度浮层（只负责进行中展示；失败进任务中心，不再在浮层里放重试）
+    /// 服务器删除进度浮层（只负责进行中展示；失败进任务中心，不再在浮层里放重试）
     @ViewBuilder private var deleteOverlayCard: some View {
         if deleteRunning {
             VStack(spacing: 12) {
-                Text("正在同步删除云端")
+                Text("正在同步删除服务器副本")
                     .font(.headline)
                 ProgressView(value: deleteTotal == 0 ? 0 : Double(deleteDone) / Double(deleteTotal))
                     .progressViewStyle(.linear)
@@ -1233,7 +1280,7 @@ struct HouseListView: View {
                     VStack(alignment: .leading, spacing: 1) {
                         Text("检测到云端有更新")
                             .font(.footnote.weight(.semibold))
-                        Text("点右上角刷新或下拉列表同步")
+                        Text("点左上角刷新按钮同步")
                             .font(.caption2).opacity(0.85)
                     }
                     Spacer(minLength: 0)
@@ -1311,74 +1358,6 @@ struct HouseListView: View {
         SyncTaskCenter.shared.running.contains { $0.isHouseUpload == true }
     }
 
-    /// 下拉刷新：本地媒体对账——磁盘有而记录没有 → 自动补建媒体记录；记录有而磁盘没有 → 提示待回补；
-    /// 无对应房源的目录 → 提示可扫描补录。有变化列明细，无变化提示「已刷新，无变化」。
-    private func localRefreshWithMediaCheck() async {
-        // v2.63：重入保护——连续下拉两次时不并发跑两份本地对账，避免同一文件被重复插入媒体记录
-        guard !isSyncing else { return }
-        isSyncing = true   // v1.72（#5）：本地刷新同样给出「正在刷新」反馈
-        defer { isSyncing = false }
-        guard let ctx = houseModelContext else { return }
-        let all = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
-        let active = all.filter { !$0.isTrashed }
-        var addedLines: [String] = []
-        var missingLines: [String] = []
-        var addedCount = 0
-        var addedFiles = 0
-        await MainActor.run {
-            var inserted: [MediaItem] = []
-            for house in active {
-                // v1.69：目录名强制带前缀（mediaRoomKey），不再做无前缀迁移
-                let dir = MediaStore.houseDirectory(roomKey: house.mediaRoomKey)
-                let disk = Set(MediaStore.mediaFileNames(in: dir))
-                let recorded = Set(house.mediaItems.map { $0.fileName })
-                let toAdd = disk.subtracting(recorded)
-                let missing = recorded.subtracting(disk)
-                if !toAdd.isEmpty {
-                    for f in toAdd.sorted() {
-                        let lower = f.lowercased()
-                        let media = MediaItem(fileName: f, kind: (lower.hasSuffix(".mp4") || lower.hasSuffix(".mov")) ? "video" : "image")
-                        media.house = house
-                        ctx.insert(media)
-                        inserted.append(media)
-                        addedFiles += 1
-                    }
-                    addedCount += 1
-                    addedLines.append("\(house.displayRoomNo)：补全 \(toAdd.count) 个媒体")
-                }
-                if !missing.isEmpty {
-                    missingLines.append("\(house.displayRoomNo)：本地缺 \(missing.count) 个文件（云端回补）")
-                }
-            }
-            if !inserted.isEmpty { try? ctx.save() }
-            // 未收录目录：media 下有目录但无对应房源
-            let keys = MediaStore.scanMediaDirectoryKeys()
-            let orphanKeys = keys.filter { key in
-                let (roomNo, tower) = BatchImporter.parseRoom(key, explicitTower: key.hasPrefix("2-") ? 2 : 0)
-                guard !roomNo.isEmpty else { return true }
-                return !active.contains { $0.tower == tower && $0.roomNo == roomNo }
-            }
-            var lines: [String] = []
-            if addedCount > 0 {
-                lines.append("媒体补全 \(addedCount) 间（\(addedFiles) 个文件）：")
-                lines.append(contentsOf: addedLines)
-            }
-            if !missingLines.isEmpty {
-                lines.append("待云端回补：" + missingLines.joined(separator: "；"))
-            }
-            if !orphanKeys.isEmpty {
-                lines.append("未收录目录 \(orphanKeys.count) 个：\(orphanKeys.prefix(5).joined(separator: "、"))（可去批量录入-扫描补录导入）")
-            }
-            if lines.isEmpty {
-                showToast(RemoteConfig.tip("refreshNoChange", "已刷新，无变化"))
-            } else {
-                showToast(lines.joined(separator: "\n"))
-            }
-            // v1.77：下拉刷新（本地刷新）不再重建本地账本镜像——重建只在左上角云端同步后执行
-            NotificationCenter.default.post(name: Self.houseStoreChanged, object: nil)
-        }
-    }
-
     /// v1.83：同步失败自动重试一次——网络瞬断/弱网（如电梯信号切换）时第一次失败会在 1 秒后自动重跑，
     /// 第二次仍失败才提示。retriedOnce 防止重试套娃无限递归。
     @discardableResult
@@ -1389,7 +1368,16 @@ struct HouseListView: View {
             // 先补传本地离线写，再拉取服务器全量清单对账，保证两端最终一致
             _ = await HousePendingUploader.shared.flush(context: ctx)
             let changed = try await HouseSyncEngine.shared.pull(context: ctx)
-            showToast(changed > 0 ? "已从服务器同步 \(changed) 套房源" : "服务器上房源已是最新")
+            let hidden = HouseSyncEngine.shared.hiddenCloudCount
+            if changed > 0 {
+                showToast(hidden > 0
+                    ? "已从服务器同步 \(changed) 套；另有 \(hidden) 套仅删本地，仍保持隐藏"
+                    : "已从服务器同步 \(changed) 套房源")
+            } else {
+                showToast(hidden > 0
+                    ? "服务器上房源已是最新；\(hidden) 套仅删本地，仍保持隐藏"
+                    : "服务器上房源已是最新")
+            }
             syncCenter.endTransient(id: progressID)
             return .finished
         } catch {
@@ -1398,6 +1386,16 @@ struct HouseListView: View {
             syncCenter.endTransient(id: progressID)
             return .failed(msg)
         }
+    }
+
+    /// 唯一手动刷新入口：先确认，再同步；有“仅删本地”隐藏房源时先问是否恢复。
+    private func requestManualSync(deep: Bool) {
+        guard !isSyncing else {
+            showToast("正在同步中，请稍候")
+            return
+        }
+        let hidden = HouseLocalDeletionStore.count()
+        refreshPrompt = hidden > 0 ? .hidden(count: hidden, deep: deep) : .confirm(deep: deep)
     }
 
     private func syncCloudHouses(retriedOnce: Bool = false, retryTaskID: UUID? = nil, deep: Bool = false) async -> CloudPullRunOutcome {

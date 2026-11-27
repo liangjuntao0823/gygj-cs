@@ -348,7 +348,13 @@ final class HouseRemoteClient {
         req.httpMethod = "POST"
         req.timeoutInterval = 300
         req.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
-        req.setValue(uploadName, forHTTPHeaderField: "X-File-Name")
+        // HTTP 头只能是 ASCII：中文房号/文件名的原始值会被 URLSession 截断成 ASCII 前缀
+        //（实测 1-1234测试-... → 服务端只收到 1-1234）。这里百分号编码，服务端 unquote 还原，
+        // 保证落盘名与客户端账本引用一致。
+        let headerName = uploadName.addingPercentEncoding(
+            withAllowedCharacters: CharacterSet(charactersIn:
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")) ?? uploadName
+        req.setValue(headerName, forHTTPHeaderField: "X-File-Name")
         req.setValue(kind, forHTTPHeaderField: "X-Kind")
         if let t = token, !t.isEmpty {
             req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization")
@@ -368,7 +374,7 @@ final class HouseRemoteClient {
         guard envelope.ok, let objectKey = envelope.objectKey else {
             throw HouseAPIError(message: "服务器未返回媒体引用")
         }
-        return (objectKey, envelope.fileName ?? fileName)
+        return (objectKey, envelope.fileName ?? uploadName)
     }
 
     /// 从服务器下载媒体二进制
