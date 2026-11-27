@@ -168,6 +168,7 @@ header.top{display:flex;justify-content:space-between;align-items:center;margin-
           <button class="ghost" id="house-users-refresh">刷新</button>
         </div>
         <p class="subtitle" style="margin:8px 0 10px">只有开启的用户才能读写房源库；关闭后即使推送中心仍订阅房源，也不会收到房源通知。</p>
+        <div class="row" id="house-users-summary" style="margin-bottom:10px"></div>
         <table id="house-users-table"><thead><tr>
           <th>App 用户</th><th>设备</th><th>房源接入</th><th>推送通道</th><th>更新时间</th><th>操作</th>
         </tr></thead><tbody></tbody></table>
@@ -458,6 +459,11 @@ async function loadHouseUsers(){
   if(!d.ok){return}
   STATE.houseUsers=d.users||[];
   const s=d.summary;
+  $('house-users-summary').innerHTML=`
+    <div class="stat"><div class="n">${s.total}</div><div class="l">接入租户</div></div>
+    <div class="stat"><div class="n">${s.allowed}</div><div class="l">房源已开启</div></div>
+    <div class="stat"><div class="n">${s.denied}</div><div class="l">房源已关闭</div></div>
+    <div class="stat"><div class="n">${s.notifyBound}</div><div class="l">已绑定推送</div></div>`;
   $('house-users-table').querySelector('tbody').innerHTML=STATE.houseUsers.map((u,i)=>`
     <tr><td><strong>${u.username||'未绑定推送用户'}</strong><div class="subtitle">${u.notifyTokenMasked||'—'}</div></td>
       <td>${u.device||'—'}<div class="subtitle">${u.tenantToken}</div></td>

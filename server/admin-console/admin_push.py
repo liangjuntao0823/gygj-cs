@@ -74,8 +74,16 @@ class PushConsole:
             if not isinstance(tenant, dict):
                 continue
             nt = str(tenant.get("notify_user_token") or "")
-            if nt:
-                out[nt] = {"tenantToken": token, **tenant}
+            if not nt:
+                continue
+            access = tenant.get("house_access", True) is not False
+            if nt in out:
+                # 同一推送用户可能有多台设备/租户：任一租户关闭即按关闭，和服务端准入校验保持一致。
+                out[nt]["house_access"] = bool(out[nt].get("house_access")) and access
+                out[nt]["tenantTokens"].append(token)
+            else:
+                out[nt] = {"tenantToken": token, "house_access": access,
+                           "tenantTokens": [token], **tenant}
         return out
 
     def _modules_for_user(self, user: dict[str, Any]) -> dict[str, bool]:
