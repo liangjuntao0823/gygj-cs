@@ -815,7 +815,12 @@ struct BackupLogsView: View {
                 Button("清空", role: .destructive) { performClear() }
                 Button("取消", role: .cancel) {}
             }
-            .onAppear { if section == 1 || section == 2 { loadCloud() } }
+            .onAppear {
+                Task {
+                    await CloudOps.flushPending()
+                    if section == 1 || section == 2 { loadCloud() }
+                }
+            }
             .onChange(of: section) { _, s in if s == 1 || s == 2 { loadCloud() } }
         }
     }

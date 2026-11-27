@@ -563,6 +563,8 @@ struct MainTabView: View {
             // v2.68：分享扩展配套——镜像非敏感配置进 App Group + 合并扩展写的本机日志
             SharedBridge.writeMirrors()
             BackupLogStore.mergeExtensionLogs()
+            // 补推上次因未绑定/弱网留在共享队列里的云端操作日志，成功后自动出队
+            Task { await CloudOps.flushPending() }
             // v2.71：收养分享扩展「本地待写账」——建/并房源实体、媒体搬进 Documents、
             // 写镜像与账本基线、失败挂任务中心；须在 bootstrap 前完成，重试绑定才看得到新房
             if let ctx = houseModelContext {
@@ -595,6 +597,8 @@ struct MainTabView: View {
             // v2.68：回前台刷新配置镜像 + 合并分享扩展写的本机日志
             SharedBridge.writeMirrors()
             BackupLogStore.mergeExtensionLogs()
+            // 补推上次因未绑定/弱网留在共享队列里的云端操作日志，成功后自动出队
+            Task { await CloudOps.flushPending() }
             // v2.71：回前台同样收养分享待写账（分享完切回 App 即见新房，不用重启）
             if let ctx = houseModelContext {
                 let adopted = ShareLocalInbox.adoptAll(houseContext: ctx)
