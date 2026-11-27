@@ -56,6 +56,7 @@ try:  # 管理后台（admin-console）：生产同目录导入，本地源码�
     import admin_sys as asym
     import admin_meter as amet
     import admin_house as ahou
+    import admin_push as apush
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "admin-console"))
     import admin_web as aw
@@ -63,6 +64,7 @@ except ImportError:
     import admin_sys as asym
     import admin_meter as amet
     import admin_house as ahou
+    import admin_push as apush
 
 log = logging.getLogger("meter-watch.api")
 
@@ -478,8 +480,28 @@ def serve(store: mw.Store, engine: mw.Engine) -> int:
     admin_sys = asym.SystemBoard()
     admin_meter = amet.MeterConsole(store, hub)
     admin_house = ahou.HouseConsole(house_store)
+    admin_push = apush.PushConsole(hub, admin_meter)
     admin_ctx = types.SimpleNamespace(auth=admin_auth, sys=admin_sys,
-                                       meter=admin_meter, house=admin_house, hub=hub)
+                                       meter=admin_meter, house=admin_house,
+                                       push=admin_push, hub=hub)
+
+    # 房源板块准入优先于推送中心：house_access=False 的用户不接收 house 通知。
+    # 同一 notify_user_token 可能有多台设备/租户，任一租户关闭即按关闭处理。
+    def _notify_module_access(user_token: str, module: str) -> bool:
+        if module != "house":
+            return True
+        matched = False
+        for tenant in store.load_tenants().values():
+            if not isinstance(tenant, dict):
+                continue
+            if str(tenant.get("notify_user_token") or "") != str(user_token or ""):
+                continue
+            matched = True
+            if tenant.get("house_access", True) is False:
+                return False
+        return matched
+
+    hub.access_checker = _notify_module_access
 
     httpd = ThreadingHTTPServer((host, port), CloudHandler)
     httpd.daemon_threads = True

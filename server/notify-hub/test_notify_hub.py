@@ -167,6 +167,25 @@ class TestDispatchIsolation(unittest.TestCase):
         r = self.hub.dispatch(self.t1, "meter", "low", "t", "b")
         self.assertEqual(r["reason"], "no_device")
 
+    def test_device_module_switch_filters(self):
+        d1 = self.u1["devices"][0]["deviceId"]
+        view, err = self.hub.set_device_prefs(self.t1, d1, modules={"house": False})
+        self.assertIsNone(err)
+        self.assertFalse(view["devices"][0]["modules"]["house"])
+        r = self.hub.broadcast("house", "house_add", "房源新增", "只应发给乙")
+        self.assertEqual((r["sent"], r["total"]), (1, 1))
+        self.assertEqual(self.sender.keys(), [KEY_B])
+
+    def test_house_access_checker_overrides_push_switch(self):
+        hub = self.hub
+        hub.access_checker = lambda token, module: token != self.t2
+        r = hub.dispatch(self.t2, "house", "house_add", "标题", "正文")
+        self.assertEqual(r["reason"], "module_access_denied")
+        self.assertEqual(self.sender.calls, [])
+        r2 = hub.broadcast("house", "house_add", "广播", "只发甲")
+        self.assertEqual(r2["sent"], 1)
+        self.assertEqual(self.sender.keys(), [KEY_A])
+
     def test_event_history_masked(self):
         self.hub.dispatch(self.t1, "meter", "low", "历史事件", "正文")
         me = self.hub.public_view(self.hub.store.get_user(self.t1))

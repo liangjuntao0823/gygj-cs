@@ -244,6 +244,43 @@ def route_request(handler: Any, method: str, path: str, admin: Any) -> bool:
         _send_json(handler, 200 if res.get("ok") else 400, res)
         return True
 
+    # ---- 推送中心 ----
+    if path == PREFIX + "/api/push/overview" and method == "GET":
+        _send_json(handler, 200, admin.push.overview())
+        return True
+
+    rest = path[len(PREFIX + "/api/push"):]
+    segs = [urllib.parse.unquote(s) for s in rest.strip("/").split("/") if s]
+    if len(segs) == 3 and segs[0] == "users" and segs[2] == "prefs" and method == "POST":
+        body = _read_body(handler)
+        res = admin.push.set_user(segs[1], enabled=body.get("enabled"),
+                                  modules=body.get("modules"))
+        _send_json(handler, 200 if res.get("ok") else 400, res)
+        return True
+    if len(segs) == 4 and segs[0] == "users" and segs[2] == "devices" and method == "POST":
+        body = _read_body(handler)
+        res = admin.push.set_device(segs[1], segs[3], enabled=body.get("enabled"),
+                                    modules=body.get("modules"), name=body.get("name"))
+        _send_json(handler, 200 if res.get("ok") else 400, res)
+        return True
+    if len(segs) == 5 and segs[0] == "users" and segs[2] == "devices" \
+            and segs[4] == "remove" and method == "POST":
+        res = admin.push.remove_device(segs[1], segs[3])
+        _send_json(handler, 200 if res.get("ok") else 400, res)
+        return True
+
+    # ---- 房源板块接入用户 ----
+    if path == PREFIX + "/api/house/users" and method == "GET":
+        _send_json(handler, 200, admin.push.house_users())
+        return True
+    rest = path[len(PREFIX + "/api/house/users"):]
+    segs = [urllib.parse.unquote(s) for s in rest.strip("/").split("/") if s]
+    if len(segs) == 2 and segs[1] == "access" and method == "POST":
+        body = _read_body(handler)
+        res = admin.push.set_house_access(segs[0], bool(body.get("enabled")))
+        _send_json(handler, 200 if res.get("ok") else 400, res)
+        return True
+
     # ---- 房源管理 ----
     if path == PREFIX + "/api/house/export" and method == "GET":
         q = urllib.parse.urlparse(handler.path).query

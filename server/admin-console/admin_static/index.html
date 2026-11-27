@@ -57,6 +57,9 @@ header.top{display:flex;justify-content:space-between;align-items:center;margin-
 .bar{height:8px;background:#eef2f7;border-radius:6px;overflow:hidden;margin-top:6px}
 .bar i{display:block;height:100%;background:var(--blue)}
 .subtitle{font-size:12px;color:var(--sub)}
+.chk{display:inline-flex;align-items:center;gap:6px;background:#f8fafc;border:1px solid var(--line);border-radius:8px;padding:6px 10px;margin:0 8px 8px 0}
+.chk input{width:auto}
+.device-name{font-weight:600}
 </style>
 </head>
 <body>
@@ -96,6 +99,7 @@ header.top{display:flex;justify-content:space-between;align-items:center;margin-
     <div class="tabs">
       <button class="on" data-tab="sys">服务器</button>
       <button data-tab="meter">电表值守</button>
+      <button data-tab="push">推送中心</button>
       <button data-tab="house">房源管理</button>
     </div>
 
@@ -135,8 +139,39 @@ header.top{display:flex;justify-content:space-between;align-items:center;margin-
       </div>
     </section>
 
+    <!-- 推送中心 -->
+    <section class="panel" id="panel-push">
+      <div class="row" id="push-summary"></div>
+      <div class="card">
+        <h2>业务板块</h2>
+        <p class="subtitle" style="margin-bottom:10px">接入通知中心的所有板块；用户/设备可分别控制接收范围。房源板块准入关闭后，即使这里开启也不推送。</p>
+        <div class="row" id="push-modules"></div>
+      </div>
+      <div class="card">
+        <div class="row" style="justify-content:space-between">
+          <h2 style="margin:0">接入用户与接收设备</h2>
+          <button class="ghost" id="push-refresh">刷新</button>
+        </div>
+        <div style="overflow:auto;margin-top:10px">
+          <table id="push-users"><thead><tr>
+            <th>App 用户</th><th>接收设备</th><th>设备状态</th><th>实际接收板块</th><th>房源权限</th><th>操作</th>
+          </tr></thead><tbody></tbody></table>
+        </div>
+      </div>
+    </section>
+
     <!-- 房源 -->
     <section class="panel" id="panel-house">
+      <div class="card">
+        <div class="row" style="justify-content:space-between">
+          <h2 style="margin:0">接入房源板块的用户</h2>
+          <button class="ghost" id="house-users-refresh">刷新</button>
+        </div>
+        <p class="subtitle" style="margin:8px 0 10px">只有开启的用户才能读写房源库；关闭后即使推送中心仍订阅房源，也不会收到房源通知。</p>
+        <table id="house-users-table"><thead><tr>
+          <th>App 用户</th><th>设备</th><th>房源接入</th><th>推送通道</th><th>更新时间</th><th>操作</th>
+        </tr></thead><tbody></tbody></table>
+      </div>
       <div class="card">
         <div class="row">
           <input id="h-q" placeholder="搜索房号/房东/户型/备注">
@@ -166,7 +201,7 @@ header.top{display:flex;justify-content:space-between;align-items:center;margin-
 
 <script>
 const $=id=>document.getElementById(id);
-let STATE={meta:null, meterTenants:[], houses:[]};
+let STATE={meta:null, meterTenants:[], houses:[], push:null, houseUsers:[]};
 let codeTimer=null;
 function fmtRemain(sec){
   sec=Math.max(0,Math.floor(sec));
@@ -225,7 +260,7 @@ $('btn-pw').onclick=()=>openModal(`<h3>修改密码</h3>
 
 function enterApp(){
   show('view-app');$('me-name').textContent=STATE.meta.username||'admin';
-  loadSys();loadMeter();loadHouses();
+  loadSys();loadMeter();loadPush();loadHouseUsers();loadHouses();
 }
 
 // ---------- tabs ----------
@@ -328,6 +363,120 @@ function meterToggle(i){
 $('meter-rotate').onclick=async()=>{if(!confirm('立即轮换接入码？旧码即刻失效'))return;
   await api('/admin/api/meter/code/rotate',{method:'POST'});loadMeter()};
 $('meter-export').onclick=()=>{location.href='/admin/api/meter/export'};
+
+// ---------- 推送中心 ----------
+function modCatalog(){return (STATE.push&&STATE.push.modules)||[]}
+function modName(k){const m=modCatalog().find(x=>x.key===k);return m?m.name:k}
+function chkBoxes(prefix, values, disabledKeys=[]){
+  return modCatalog().map(m=>{
+    const off=disabledKeys.includes(m.key);
+    return `<label class="chk" title="${m.desc||''}"><input type="checkbox" id="${prefix}-${m.key}" ${values&&values[m.key]?'checked':''} ${off?'disabled':''}>${m.name}${off?'（板块已关闭）':''}</label>`;
+  }).join('');
+}
+function readChecks(prefix){
+  const out={};
+  modCatalog().forEach(m=>{const el=$(prefix+'-'+m.key);if(el&&!el.disabled)out[m.key]=el.checked});
+  return out;
+}
+async function loadPush(){
+  const d=await api('/admin/api/push/overview');
+  if(!d.ok){return}
+  STATE.push=d;
+  const s=d.summary;
+  $('push-summary').innerHTML=`
+    <div class="stat"><div class="n">${s.users}</div><div class="l">推送用户</div></div>
+    <div class="stat"><div class="n">${s.devices}</div><div class="l">接收设备</div></div>
+    <div class="stat"><div class="n">${s.enabledUsers}</div><div class="l">用户总开关开启</div></div>
+    <div class="stat"><div class="n">${s.houseUsers}</div><div class="l">有房源权限</div></div>`;
+  $('push-modules').innerHTML=d.modules.map(m=>`<div class="stat"><div class="n">${s.moduleDevices[m.key]||0}</div><div class="l">${m.name} · 实际接收设备</div></div>`).join('');
+  const rows=d.users.flatMap((u,ui)=>{
+    const userCell=`<td rowspan="${Math.max(1,u.devices.length)}">
+      <strong>${u.username||'未命名'}</strong><div class="subtitle">${u.tokenMasked}</div>
+      <div style="margin-top:6px"><span class="tag ${u.enabled?'g':'r'}">${u.enabled?'总开关开':'总开关关'}</span>
+      <span class="tag ${u.houseAccess?'g':'r'}" style="margin-left:4px">房源${u.houseAccess?'已接入':'未接入'}</span></div></td>`;
+    if(!u.devices.length){
+      return [`<tr>${userCell}<td colspan="3" class="muted">暂无接收设备</td>
+        <td><span class="tag ${u.houseAccess?'g':'r'}">${u.houseAccess?'开启':'关闭'}</span></td>
+        <td><button class="ghost" onclick="pushUserSettings(${ui})">用户设置</button></td></tr>`];
+    }
+    return u.devices.map((dv,di)=>{
+      const tags=modCatalog().map(m=>`<span class="tag ${dv.effectiveModules[m.key]?'g':'gray'}">${m.name}${dv.effectiveModules[m.key]?'✓':'✕'}</span>`).join(' ');
+      return `<tr>${di===0?userCell:''}
+        <td><div class="device-name">${dv.name||'未命名设备'}</div><div class="subtitle">${dv.platform||'—'} · ${dv.deviceId}</div></td>
+        <td><span class="tag ${dv.enabled?'g':'r'}">${dv.enabled?'设备开':'设备关'}</span></td>
+        <td>${tags}</td>
+        <td><span class="tag ${u.houseAccess?'g':'r'}">${u.houseAccess?'开启':'关闭'}</span></td>
+        <td>${di===0?`<button class="ghost" onclick="pushUserSettings(${ui})">用户设置</button> `:''}
+          <button class="ghost" onclick="pushDeviceSettings(${ui},${di})">设备设置</button></td></tr>`;
+    });
+  }).join('');
+  $('push-users').querySelector('tbody').innerHTML=rows||'<tr><td colspan="6" class="muted">暂无接入用户</td></tr>';
+}
+$('push-refresh').onclick=loadPush;
+
+function pushUserSettings(ui){
+  const u=STATE.push.users[ui];
+  openModal(`<h3>${u.username||'未命名用户'} · 推送总开关</h3>
+    <div class="field"><label>该用户是否接收推送</label>
+      <select id="pu-enabled"><option value="1" ${u.enabled?'selected':''}>开启</option><option value="0" ${!u.enabled?'selected':''}>关闭</option></select></div>
+    <div class="field"><label>用户级板块开关</label>${chkBoxes('pu-mod',u.modules,u.houseAccess?[]:['house'])}</div>
+    <p class="subtitle">用户级关闭后，该用户名下所有设备都收不到对应板块。</p>
+    <div class="row" style="margin-top:12px"><button id="m-ok">保存</button><button class="ghost" onclick="closeModal()">取消</button></div>`,
+    async()=>{
+      const r=await api(`/admin/api/push/users/${encodeURIComponent(u.userToken)}/prefs`,
+        {method:'POST',body:JSON.stringify({enabled:$('pu-enabled').value==='1',modules:readChecks('pu-mod')})});
+      closeModal();if(r.ok){loadPush()}else{alert('失败：'+(r.detail||r.error))}
+    });
+}
+function pushDeviceSettings(ui,di){
+  const u=STATE.push.users[ui],dv=u.devices[di];
+  openModal(`<h3>${dv.name||'接收设备'} · 订阅板块</h3>
+    <div class="field"><label>设备名称</label><input id="pd-name" value="${dv.name||''}"></div>
+    <div class="field"><label>设备总开关</label>
+      <select id="pd-enabled"><option value="1" ${dv.enabled?'selected':''}>开启</option><option value="0" ${!dv.enabled?'selected':''}>关闭</option></select></div>
+    <div class="field"><label>这台设备接收哪些板块</label>${chkBoxes('pd-mod',dv.modules,u.houseAccess?[]:['house'])}</div>
+    <p class="subtitle">只影响当前设备；房源板块接入关闭时，房源选项不可用。</p>
+    <div class="row" style="margin-top:12px"><button id="m-ok">保存</button>
+      <button class="danger" onclick="pushRemoveDevice(${ui},${di})">移除设备</button>
+      <button class="ghost" onclick="closeModal()">取消</button></div>`,
+    async()=>{
+      const r=await api(`/admin/api/push/users/${encodeURIComponent(u.userToken)}/devices/${encodeURIComponent(dv.deviceId)}`,
+        {method:'POST',body:JSON.stringify({enabled:$('pd-enabled').value==='1',name:$('pd-name').value,modules:readChecks('pd-mod')})});
+      closeModal();if(r.ok){loadPush()}else{alert('失败：'+(r.detail||r.error))}
+    });
+}
+async function pushRemoveDevice(ui,di){
+  const u=STATE.push.users[ui],dv=u.devices[di];
+  if(!confirm(`确认移除设备 ${dv.name||dv.deviceId}？`))return;
+  const r=await api(`/admin/api/push/users/${encodeURIComponent(u.userToken)}/devices/${encodeURIComponent(dv.deviceId)}/remove`,{method:'POST'});
+  closeModal();if(r.ok){loadPush()}else{alert('失败：'+(r.detail||r.error))}
+}
+
+// ---------- 房源接入用户 ----------
+async function loadHouseUsers(){
+  const d=await api('/admin/api/house/users');
+  if(!d.ok){return}
+  STATE.houseUsers=d.users||[];
+  const s=d.summary;
+  $('house-users-table').querySelector('tbody').innerHTML=STATE.houseUsers.map((u,i)=>`
+    <tr><td><strong>${u.username||'未绑定推送用户'}</strong><div class="subtitle">${u.notifyTokenMasked||'—'}</div></td>
+      <td>${u.device||'—'}<div class="subtitle">${u.tenantToken}</div></td>
+      <td><span class="tag ${u.houseAccess?'g':'r'}">${u.houseAccess?'已接入':'已关闭'}</span></td>
+      <td>${u.notifyBound?`<span class="tag g">已绑定 · ${u.devicesCount} 台设备</span>`:'<span class="tag gray">未绑定通知通道</span>'}</td>
+      <td class="muted">${(u.updatedAt||'').slice(0,16)}</td>
+      <td><button class="${u.houseAccess?'danger':'ghost'}" onclick="houseAccessToggle(${i})">${u.houseAccess?'关闭房源':'开启房源'}</button></td></tr>`).join('')
+    ||'<tr><td colspan="6" class="muted">暂无接入用户</td></tr>';
+}
+$('house-users-refresh').onclick=loadHouseUsers;
+function houseAccessToggle(i){
+  const u=STATE.houseUsers[i];
+  const next=!u.houseAccess;
+  if(!confirm(`确认${next?'开启':'关闭'} ${u.username||u.device||u.tenantToken} 的房源板块接入？`))return;
+  api(`/admin/api/house/users/${encodeURIComponent(u.tenantToken)}/access`,
+    {method:'POST',body:JSON.stringify({enabled:next})}).then(r=>{
+      if(r.ok){loadHouseUsers();loadPush()}else{alert('失败：'+(r.detail||r.error))}
+    });
+}
 
 // ---------- 房源 ----------
 async function loadHouses(){

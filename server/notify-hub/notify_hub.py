@@ -263,6 +263,9 @@ class HubRuntime:
         # 直接持有 meter Store.svc dict 引用：服务器配置变更 restart 后生效；测试可传普通 dict
         self.config = config if isinstance(config, dict) else {}
         self._sender = sender or default_bark_sender
+        # 业务板块准入校验：由服务启动时注入（如房源板块 house_access=False 时禁止 house 通知）。
+        # 签名 (notify_user_token, module) -> allowed；未注入时一律放行（兼容旧部署）。
+        self.access_checker: Callable[[str, str], bool] | None = None
 
     # ---- 配置（复用 meter service.json 的 enroll_code / bark_base，也支持 notify_ 前缀覆盖）----
 
@@ -288,6 +291,8 @@ class HubRuntime:
             "name": d.get("name", ""),
             "platform": d.get("platform", ""),
             "serverBase": d.get("server_base", ""),
+            "enabled": d.get("enabled", True) is not False,
+            "modules": d.get("modules", {}) if isinstance(d.get("modules"), dict) else {},
             "keyMasked": mask_key(d.get("bark_key")),
             "addedAt": d.get("added_at", ""),
             "lastOkAt": d.get("last_ok_at", 0),
@@ -330,6 +335,8 @@ class HubRuntime:
             "name": name or "我的 iPhone",
             "platform": platform or "ios",
             "server_base": server_base or "",
+            "enabled": True,
+            "modules": {},
             "added_at": iso_now(),
             "last_ok_at": 0,
             "last_error": "",
@@ -461,6 +468,65 @@ class HubRuntime:
                 self.store.save(doc)
             return self.public_view(user)
 
+    # ---- 设备级模块开关 / 板块准入 ----
+
+    @staticmethod
+    def device_allows(device: dict[str, Any], module: str) -> bool:
+        """单台设备是否接收某板块：设备总开关 + 设备自己的模块开关（缺省=允许）。"""
+        if not isinstance(device, dict) or not device.get("bark_key"):
+            return False
+        if device.get("enabled") is False:
+            return False
+        modules = device.get("modules") if isinstance(device.get("modules"), dict) else {}
+        return modules.get(str(module), True) is not False
+
+    def set_device_prefs(self, token: str, device_id: str,
+                         enabled: Any = _UNSET, modules: dict | None = None,
+                         name: Any = _UNSET) -> tuple[dict[str, Any] | None, str | None]:  # type: ignore[assignment]
+        """后台管理单台设备：总开关 / 按板块开关 / 备注名。"""
+        device_id = str(device_id or "").strip()
+        if not device_id:
+            return None, "device_id_required"
+        with self.store.lock:
+            doc = self.store.doc()
+            user = doc["users"].get(token)
+            if not isinstance(user, dict):
+                return None, "unauthorized"
+            target = None
+            for d in user.get("devices", []):
+                if isinstance(d, dict) and str(d.get("device_id") or "") == device_id:
+                    target = d
+                    break
+            if target is None:
+                return None, "device_not_found"
+            if enabled is not _UNSET:
+                target["enabled"] = bool(enabled)
+            if name is not _UNSET:
+                new_name = str(name or "").strip()[:60]
+                if new_name:
+                    target["name"] = new_name
+            if isinstance(modules, dict):
+                cur = target.get("modules") if isinstance(target.get("modules"), dict) else {}
+                for k, v in list(modules.items())[:32]:
+                    kk = str(k)[:32]
+                    if isinstance(v, bool):
+                        cur[kk] = v
+                target["modules"] = cur
+            user["updated_at"] = iso_now()
+            doc["users"][token] = user
+            self.store.save(doc)
+            return self.public_view(user), None
+
+    def _module_access_allowed(self, user_token: str, module: str) -> bool:
+        """业务板块准入（如房源 house_access）优先于推送中心的模块开关。"""
+        if module == "system" or self.access_checker is None:
+            return True
+        try:
+            return bool(self.access_checker(str(user_token or ""), str(module or "")))
+        except Exception:
+            log.warning("通知板块准入校验异常 user=%s module=%s", mask_key(user_token), module, exc_info=True)
+            return False
+
     # ---- 事件投递 ----
 
     @staticmethod
@@ -512,6 +578,9 @@ class HubRuntime:
             for user_token, user in doc["users"].items():
                 if not isinstance(user, dict):
                     continue
+                # 板块准入优先：如房源板块 house_access=False，即使推送中心开着也不发。
+                if not self._module_access_allowed(user_token, module):
+                    continue
                 prefs = user.get("prefs") if isinstance(user.get("prefs"), dict) else {}
                 if prefs.get("enabled") is False:
                     continue
@@ -519,8 +588,7 @@ class HubRuntime:
                 if modules.get(module, True) is False:
                     continue
                 devices = [d for d in user.get("devices", [])
-                           if isinstance(d, dict) and d.get("bark_key")
-                           and d.get("enabled") is not False
+                           if self.device_allows(d, module)
                            and str(d.get("device_id")) != str(exclude_device_id)]
                 if not devices:
                     continue
@@ -611,6 +679,11 @@ class HubRuntime:
             if not isinstance(user, dict):
                 return {"ok": False, "reason": "unknown_user", "sent": 0, "total": 0}
 
+            # 板块准入优先于推送中心的模块开关（如房源 house_access=False）
+            if not self._module_access_allowed(user_token, module):
+                return self._suppressed_locked(doc, user, module, event_type, title, body, data,
+                                               "module_access_denied")
+
             prefs = user.get("prefs") if isinstance(user.get("prefs"), dict) else {}
             if prefs.get("enabled") is False:
                 return self._suppressed_locked(doc, user, module, event_type, title, body, data,
@@ -621,7 +694,7 @@ class HubRuntime:
                                                "module_disabled")
 
             devices = [d for d in user.get("devices", [])
-                       if isinstance(d, dict) and d.get("bark_key") and d.get("enabled") is not False]
+                       if self.device_allows(d, module)]
             if not devices:
                 return self._suppressed_locked(doc, user, module, event_type, title, body, data, "no_device")
 
