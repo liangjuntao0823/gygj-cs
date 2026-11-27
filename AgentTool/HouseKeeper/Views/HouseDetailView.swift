@@ -921,11 +921,8 @@ struct HouseDetailView: View {
         // 旧桶文件夹删除编排已下线；服务器模式删除服务器权威库与磁盘媒体。
         guard let ctx = houseModelContext else { return }
         let roomKey = house.mediaRoomKey
-        // v2.45：删除事件先写账本（目录随后整体删除；云端删除前会先同步一次留证）
-        let deleteDetail = HouseServerMode.ready
-            ? "彻底删除服务器房源、账本与媒体，并清除本地房源"
-            : "彻底删除本地房源"
-        HouseLedgerStore.append(roomKey: roomKey, action: "删除房源", detail: deleteDetail)
+        // 删除事件不能先写“成功”：服务器硬删可能失败，账本文件也会随房源目录被删。
+        // 统一在真正删完后写一条云端 ops；失败分支只写失败。
         // 服务器模式：硬删——先删服务器权威库，成功后删本机记录；不进回收站，服务器本地磁盘媒体一并删除。
         if HouseServerMode.ready {
             isDeletingCloud = true
@@ -942,6 +939,8 @@ struct HouseDetailView: View {
                         try? modelContext.save()
                         isDeletingCloud = false
                         deleteResultMessage = "已删除服务器与本地房源"
+                        CloudOps.log(category: "房源", action: "删除双端房源", result: "成功",
+                                     detail: "服务器与本地永久删除，不可恢复", room: roomKey)
                         NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
                         dismiss()
                     }
@@ -964,6 +963,8 @@ struct HouseDetailView: View {
         HouseMediaUploadQueue.removeRoom(roomKey)
         ctx.delete(house)
         try? ctx.save()
+        CloudOps.log(category: "房源", action: "删除房源", result: "成功",
+                     detail: "仅删除本地房源（未接入服务器）", room: roomKey)
         NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
         deleteResultMessage = "已删除本地房源"
     }
