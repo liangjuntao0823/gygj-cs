@@ -83,7 +83,8 @@ final class HousePendingUploader {
         let uploadedRooms = await flushMedia(context: context)
 
         var done = 0
-        var keysToPush = Set(pendingKeys)
+        let pendingKeySet = Set(pendingKeys)
+        var keysToPush = pendingKeySet
         for key in Array(keysToPush) where byKey[key] == nil {
             clearPending(key)   // 本地已无此房（被彻底删除），不再补传
             keysToPush.remove(key)
@@ -98,10 +99,11 @@ final class HousePendingUploader {
             let allowed = Set(h.mediaItems.map { $0.fileName }).subtracting(pendingNames)
             do {
                 _ = try await HouseSyncEngine.shared.pushHouse(h, mediaFileNames: allowed)
-                if HousePendingRegistry.keys().contains(key) {
+                if pendingKeySet.contains(key) || HousePendingRegistry.keys().contains(key) {
                     clearPending(key)
-                    done += 1
                 }
+                // 媒体-only 补传也要计入本次完成数，任务中心才不会显示 0。
+                done += 1
             } catch {
                 // 仍失败（断网/冲突），保留待下轮，不影响其余房源
                 continue

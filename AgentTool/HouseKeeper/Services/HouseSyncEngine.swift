@@ -218,8 +218,27 @@ final class HouseSyncEngine: ObservableObject {
             status: house.statusRaw, media: mediaArray(house, roomKey: roomKey,
                                                        onlyNames: effectiveNames))
         let expected = revMap[roomKey]
-        let remote = try await HouseRemoteClient.shared.upsert(
-            payload, expectedRevision: expected)
+        let remote: RemoteHouse
+        do {
+            remote = try await HouseRemoteClient.shared.upsert(
+                payload, expectedRevision: expected)
+        } catch let error as HouseAPIError where error.revisionConflict {
+            // 冲突后不能一直拿旧 revision 重试（会永久卡在待补传）。
+            // 先拉一次服务器当前 revision，更新本地基线；本次仍抛给调用方提示/保留本机改动，
+            // 下一轮补传按“最后写入者胜”提交本机版本，避免死循环。
+            if let fresh = try? await HouseRemoteClient.shared.getHouse(roomKey) {
+                setServerRevision(fresh.revision, forKey: roomKey)
+                setTop(max(topRevision, fresh.revision))
+                CloudOps.log(category: "房源", action: "同步冲突", result: "冲突",
+                             detail: "服务器已更新到修订 \(fresh.revision)；本机改动保留，下一轮补传按本机版本覆盖",
+                             room: roomKey)
+            } else {
+                CloudOps.log(category: "房源", action: "同步冲突", result: "冲突",
+                             detail: "服务器已无此房源（可能被其他设备删除）；本机改动保留，等待人工处理",
+                             room: roomKey)
+            }
+            throw error
+        }
         setServerRevision(remote.revision, forKey: roomKey)
         setTop(max(topRevision, remote.revision))
         return remote

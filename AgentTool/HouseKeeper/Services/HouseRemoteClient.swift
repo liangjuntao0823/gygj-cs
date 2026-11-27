@@ -108,10 +108,13 @@ struct HouseAPIError: LocalizedError {
     let message: String
     /// 服务器已识别令牌，但该用户未被授权访问房源库（403）；此类错误不应自动重试
     let forbidden: Bool
+    /// 乐观锁冲突：本机基于旧 revision 提交，服务器已有他人新版本
+    let revisionConflict: Bool
 
-    init(message: String, forbidden: Bool = false) {
+    init(message: String, forbidden: Bool = false, revisionConflict: Bool = false) {
         self.message = message
         self.forbidden = forbidden
+        self.revisionConflict = revisionConflict
     }
 
     var errorDescription: String? { message }
@@ -615,7 +618,8 @@ final class HouseRemoteClient {
         }
         if r.ok == false {
             if r.error == "revision_conflict" {
-                throw HouseAPIError(message: "该房源刚被其他人修改，请刷新后再编辑")
+                throw HouseAPIError(message: "该房源刚被其他人修改，请刷新后再编辑",
+                                   revisionConflict: true)
             }
             throw HouseAPIError(message: r.detail ?? "保存失败")
         }
