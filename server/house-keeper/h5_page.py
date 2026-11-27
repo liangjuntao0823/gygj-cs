@@ -6,7 +6,7 @@
 单页应用：
   - `/api/public/h5?roomKey=<房号>`  → 单房卡片（户型 / 租金 / 实拍图文视频 / 名片）
   - `/api/public/h5`                → 公开选房列表（全部待租房源，脱敏）
-数据走免鉴权公开接口：`/api/public/rooms[?roomKey=]`、`/api/public/profile`，
+数据走免鉴权公开接口：`/api/public/rooms[?roomKey=]`；姓名/电话只从分享链接参数读取，
 媒体走 `/api/public/media/<objectKey>`。页面不含房号 / 房东 / 备注等内部信息。
 """
 
@@ -35,7 +35,6 @@ body{background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSys
 .media-grid img,.media-grid video{width:100%;height:100%;object-fit:cover;display:block}
 .badge{display:inline-block;background:#eef3ff;color:var(--brand);font-size:12px;padding:3px 8px;border-radius:6px;margin-left:6px}
 .profile{display:flex;align-items:center;gap:14px;margin-top:4px}
-.profile img.qr{width:88px;height:88px;border-radius:10px;border:1px solid var(--line)}
 .profile .who{flex:1}
 .profile .name{font-size:17px;font-weight:600}
 .profile .phone{color:var(--sub);font-size:15px;margin-top:4px}
