@@ -844,7 +844,8 @@ struct HouseBatchImportView: View {
                 HouseLedgerStore.append(
                     roomKey: h.mediaRoomKey,
                     action: "扫描补全导入",
-                    detail: "本机扫描导入，" + (scanSummary.isEmpty ? "无媒体" : scanSummary))
+                    detail: "本机扫描导入，" + (scanSummary.isEmpty ? "无媒体" : scanSummary),
+                    cloudLog: false)
             }
             isImporting = false
             self.summary = summary
@@ -886,7 +887,8 @@ struct HouseBatchImportView: View {
                     HouseLedgerStore.append(
                         roomKey: h.mediaRoomKey,
                         action: flowTitle,
-                        detail: "新建房源（仅本机），" + (localSummary.isEmpty ? "无媒体" : localSummary))
+                        detail: "新建房源（仅本机），" + (localSummary.isEmpty ? "无媒体" : localSummary),
+                        cloudLog: false)
                 }
                 summary.errors.append("未接入服务器，本次仅保存到本机")
             }

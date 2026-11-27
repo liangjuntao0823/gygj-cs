@@ -1369,14 +1369,13 @@ struct HouseListView: View {
             _ = await HousePendingUploader.shared.flush(context: ctx)
             let changed = try await HouseSyncEngine.shared.pull(context: ctx)
             let hidden = HouseSyncEngine.shared.hiddenCloudCount
+            let pending = HousePendingUploader.shared.pendingKeys.count
+            let tail = (hidden > 0 ? "；\(hidden) 套仅删本地，仍保持隐藏" : "")
+                + (pending > 0 ? "；\(pending) 套本机改动未同步，已保留本地，请点重试" : "")
             if changed > 0 {
-                showToast(hidden > 0
-                    ? "已从服务器同步 \(changed) 套；另有 \(hidden) 套仅删本地，仍保持隐藏"
-                    : "已从服务器同步 \(changed) 套房源")
+                showToast("已从服务器同步 \(changed) 套房源" + tail)
             } else {
-                showToast(hidden > 0
-                    ? "服务器上房源已是最新；\(hidden) 套仅删本地，仍保持隐藏"
-                    : "服务器上房源已是最新")
+                showToast("服务器上房源已是最新" + tail)
             }
             syncCenter.endTransient(id: progressID)
             return .finished

@@ -101,6 +101,9 @@ final class HouseSyncEngine: ObservableObject {
         }
         var changed = 0
         hiddenCloudCount = 0
+        // 本机有还没推上去的改动：服务器清单不能直接盖回来，否则弱网/冲突时
+        // 用户刚改的租金、状态、媒体会被下一次自动对账静默回滚。
+        let pendingKeys = HousePendingRegistry.keys()
         for r in remoteHouses {
             // 用户明确选择「仅删本地」：服务器仍有这套房，但本机不再自动带回。
             // 手动刷新时由列表页弹窗询问是否恢复；自动对账只跳过。
@@ -110,6 +113,9 @@ final class HouseSyncEngine: ObservableObject {
                     context.delete(local)
                     changed += 1
                 }
+                continue
+            }
+            if pendingKeys.contains(r.roomKey) {
                 continue
             }
             let target = byKey[r.roomKey] ?? House()
@@ -146,6 +152,9 @@ final class HouseSyncEngine: ObservableObject {
             HouseLocalDeletionStore.remove(key)
         }
         for (key, h) in byKey where !remoteKeys.contains(key) {
+            // 本机待补传房：即使服务器已没有它，也先保留本地，
+            // 等补传时服务器给出 revision_conflict，用户再明确处理；不在这里静默删。
+            if pendingKeys.contains(key) { continue }
             if revMap[key] != nil {
                 context.delete(h)
                 removeServerRevision(forKey: key)

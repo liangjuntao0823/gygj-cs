@@ -178,7 +178,8 @@ enum HouseLedgerStore {
                        action: String,
                        detail: String = "",
                        fieldChanges: [HouseLedgerFieldChange] = [],
-                       date: Date = Date()) -> HouseLedgerEvent {
+                       date: Date = Date(),
+                       cloudLog: Bool = true) -> HouseLedgerEvent {
         let event = HouseLedgerEvent(date: date, action: action, detail: detail, fieldChanges: fieldChanges)
         fileLock.lock()
         var pending = loadPendingUnlocked(roomKey: roomKey)
@@ -191,8 +192,10 @@ enum HouseLedgerStore {
         let changeText = fieldChanges.map { "\($0.field)：\($0.oldValue)→\($0.newValue)" }
             .joined(separator: "；")
         let logDetail = detail.isEmpty ? changeText : detail
-        CloudOps.log(category: "房源", action: action, result: "成功",
-                     detail: logDetail, room: roomKey)
+        if cloudLog {
+            CloudOps.log(category: "房源", action: action, result: "成功",
+                         detail: logDetail, room: roomKey)
+        }
         return event
     }
 
