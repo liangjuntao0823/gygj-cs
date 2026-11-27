@@ -238,14 +238,14 @@ final class HouseSyncEngine: ObservableObject {
             if let fresh = try? await HouseRemoteClient.shared.getHouse(roomKey) {
                 setServerRevision(fresh.revision, forKey: roomKey)
                 setTop(max(topRevision, fresh.revision))
-                CloudOps.log(category: "房源", action: "同步冲突", result: "冲突",
-                             detail: "服务器已更新到修订 \(fresh.revision)；本机改动保留，下一轮补传按本机版本覆盖",
-                             room: roomKey)
+                BackupLogStore.log(category: "房源", action: "同步冲突", result: "冲突",
+                                   detail: "服务器已更新到修订 \(fresh.revision)；本机改动保留，下一轮补传按本机版本覆盖",
+                                   room: roomKey, cloud: true)
             } else {
                 HouseServerMissingStore.mark(roomKey)
-                CloudOps.log(category: "房源", action: "同步冲突", result: "冲突",
-                             detail: "服务器已无此房源（可能被其他设备删除）；本机改动保留，可在详情页彻底删除本机",
-                             room: roomKey)
+                BackupLogStore.log(category: "房源", action: "同步冲突", result: "冲突",
+                                   detail: "服务器已无此房源（可能被其他设备删除）；本机改动保留，可在详情页彻底删除本机",
+                                   room: roomKey, cloud: true)
             }
             throw error
         }
@@ -274,8 +274,9 @@ final class HouseSyncEngine: ObservableObject {
             UnreadCloudHouseStore.clear(key)
             context.delete(house)
             deleted += 1
-            CloudOps.log(category: "房源", action: "彻底删除本机房源", result: "成功",
-                         detail: "服务器已删除，按服务器为准清理本机，不再保留本机改动", room: key)
+            BackupLogStore.log(category: "房源", action: "彻底删除本机房源", result: "成功",
+                               detail: "服务器已删除，按服务器为准清理本机，不再保留本机改动",
+                               room: key, cloud: true)
         }
         if deleted > 0 {
             try? context.save()

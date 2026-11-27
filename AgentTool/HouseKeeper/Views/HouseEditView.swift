@@ -947,6 +947,17 @@ struct HouseEditView: View {
         let removedParts = HouseLedgerFormat.mediaParts(images: removedSplit.images, videos: removedSplit.videos, includeNames: false)
         let ledgerDetailParts = addedParts.map { "新增\($0)" } + removedParts.map { "删除\($0)" }
         let hasFieldChanges = !ledgerChanges.isEmpty
+        // 旧正式版操作日志口径：动作名写「新增房源 / 修改备注 / 修改租金…」，明细写
+        // 「修改备注 旧 改 新」。账本动作（编辑保存等）只进单房账本，不再冒充操作日志。
+        var opAction = ""
+        var opDetail = ""
+        if isNewHouse {
+            opAction = "新增房源"
+            opDetail = syncChange   // 旧版只写「图片 x 个、视频 y 个」，没有媒体时为空
+        } else if hasFieldChanges {
+            opAction = syncAction
+            opDetail = syncChange
+        }
         // v2.53：收集本次账本事件 id，供「彻底取消」全量撤回时按 id 移除
         var ledgerEventIds: [String] = []
         if isNewHouse {
@@ -954,26 +965,29 @@ struct HouseEditView: View {
             let ev = HouseLedgerStore.append(
                 roomKey: target.mediaRoomKey,
                 action: "新增房源",
-                detail: "新建房源，" + (initial.isEmpty ? "无媒体" : initial))
+                detail: "新建房源，" + (initial.isEmpty ? "无媒体" : initial),
+                writeOpLog: false)
             ledgerEventIds.append(ev.id)
         } else if hasFieldChanges {
-            // 有字段变化（无论是否同时动媒体）：动作名「编辑保存」，媒体变化放明细
+            // 有字段变化（无论是否同时动媒体）：账本动作仍是「编辑保存」，媒体变化放账本明细
             let ev = HouseLedgerStore.append(
                 roomKey: target.mediaRoomKey,
                 action: "编辑保存",
                 detail: ledgerDetailParts.joined(separator: "；"),
-                fieldChanges: ledgerChanges)
+                fieldChanges: ledgerChanges,
+                writeOpLog: false)
             ledgerEventIds.append(ev.id)
         } else {
-            // 纯媒体改动：按真实动作分别记录，动作名直接说清新增/删除、图片/视频，
-            // 绝不写「媒体更新」这种看不懂的笼统动作；只加一个视频时就只有一条记录
+            // 纯媒体改动：账本按真实动作分别记录；操作日志由上传/删除完成后的那条负责，
+            // 不在保存瞬间提前写“成功”（旧版也是传完/删完才落日志）。
             if !addedParts.isEmpty {
                 let addAction = addedSplit.videos.isEmpty ? "新增图片"
                     : (addedSplit.images.isEmpty ? "新增视频" : "新增媒体")
                 let ev = HouseLedgerStore.append(
                     roomKey: target.mediaRoomKey,
                     action: addAction,
-                    detail: addedParts.map { "新增\($0)" }.joined(separator: "；"))
+                    detail: addedParts.map { "新增\($0)" }.joined(separator: "；"),
+                    writeOpLog: false)
                 ledgerEventIds.append(ev.id)
             }
             if !removedParts.isEmpty {
@@ -982,13 +996,15 @@ struct HouseEditView: View {
                 let ev = HouseLedgerStore.append(
                     roomKey: target.mediaRoomKey,
                     action: removeAction,
-                    detail: removedParts.map { "删除\($0)" }.joined(separator: "；"))
+                    detail: removedParts.map { "删除\($0)" }.joined(separator: "；"),
+                    writeOpLog: false)
                 ledgerEventIds.append(ev.id)
             }
         }
         if HouseServerMode.ready {
             launchServerPush(target: target, mediaSnapshots: mediaSnapshots,
-                             kind: cloudPushKind, oldRoomKey: oldRoomKeyForPurge)
+                             kind: cloudPushKind, oldRoomKey: oldRoomKeyForPurge,
+                             opAction: opAction, opDetail: opDetail)
             NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
             dismiss()
             return
@@ -1019,7 +1035,8 @@ struct HouseEditView: View {
     /// 服务器模式推送：媒体文件经服务器 HTTP 落服务器磁盘，文本与媒体引用走服务器权威接口。
     /// 本机沿用现有本地通知文案；服务器再向其他接入设备广播。
     private func launchServerPush(target: House, mediaSnapshots: [MediaUploadSnapshot],
-                                  kind: CloudPushKind, oldRoomKey: String) {
+                                  kind: CloudPushKind, oldRoomKey: String,
+                                  opAction: String, opDetail: String) {
         let taskID = UUID()
         let logRoomKey = target.mediaRoomKey
         if !mediaSnapshots.isEmpty {
@@ -1039,8 +1056,11 @@ struct HouseEditView: View {
             if !mediaSnapshots.isEmpty {
                 await MediaActivityGate.shared.beginUpload()
                 defer { Task { await MediaActivityGate.shared.endUpload() } }
+                // 新增房源的媒体成功并入「新增房源」一条；普通编辑/改名仍按旧版
+                // 单独写「新增图片/新增视频（本地→服务器）」。
                 uploadResult = try? await uploadMedia(snapshots: mediaSnapshots,
-                                                       writeSuccessLog: false, taskID: taskID)
+                                                       writeSuccessLog: (kind != .newHouse),
+                                                       taskID: taskID)
                 // 服务器可能把同名/无后缀文件唯一化；把真实落盘名回写到本地记录，
                 // 后续 pushHouse 的 media_refs 才能和服务器磁盘对得上。
                 if let pairs = uploadResult?.uploaded, !pairs.isEmpty {
@@ -1067,6 +1087,22 @@ struct HouseEditView: View {
                 if kind == .rename, !oldRoomKey.isEmpty, oldRoomKey != remote.roomKey {
                     try? await HouseRemoteClient.shared.delete(oldRoomKey)
                 }
+                // 旧正式版规则：服务器推送成功后才落操作日志（本机+云端同一条），
+                // 动作名直接用「新增房源 / 修改备注 / 修改租金…」，失败不再先留一条假成功。
+                let mediaFailed = uploadResult?.failed ?? 0
+                if !opAction.isEmpty {
+                    if kind == .newHouse && mediaFailed > 0 {
+                        // 媒体失败已由 uploadMedia 写「新增房源 + 失败原因」，这里不再重复
+                    } else {
+                        BackupLogStore.log(category: "房源", action: opAction, result: "成功",
+                                           detail: opDetail, room: remote.roomKey, cloud: true)
+                    }
+                }
+                if kind == .rename && !oldRoomKey.isEmpty && oldRoomKey != remote.roomKey {
+                    BackupLogStore.log(category: "房源", action: "房号迁移", result: "成功",
+                                       detail: "房号迁移（\(oldRoomKey) → \(remote.roomKey)）：服务器旧记录已清理",
+                                       room: remote.roomKey, cloud: true)
+                }
                 await MainActor.run {
                     if !mediaSnapshots.isEmpty { SyncTaskCenter.shared.discard(id: taskID) }
                     let roomKey = remote.roomKey
@@ -1083,8 +1119,11 @@ struct HouseEditView: View {
                     }
                 }
             } catch {
-                CloudOps.log(category: "房源", action: "房源同步失败", result: "失败",
-                             detail: error.localizedDescription, room: logRoomKey)
+                BackupLogStore.log(category: "房源",
+                                   action: opAction.isEmpty ? "房源同步" : opAction,
+                                   result: "失败",
+                                   detail: "服务器更新失败：\(error.localizedDescription)",
+                                   room: logRoomKey, cloud: true)
                 await MainActor.run {
                     if !mediaSnapshots.isEmpty { SyncTaskCenter.shared.discard(id: taskID) }
                     // 标记待补传，联网后自动重试，不丢改动
@@ -1203,9 +1242,9 @@ struct HouseEditView: View {
             if upSplit.videos.isEmpty { upAction = "新增图片（本地→服务器）" }
             else if upSplit.images.isEmpty { upAction = "新增视频（本地→服务器）" }
             else { upAction = "新增媒体（本地→服务器）" }
-            // 成功事件已由 HouseLedgerStore.append 写入云端 ops；这里只留本地日志，避免重复两条。
+            // 旧正式版：媒体真正传完才写成功日志，本机与云端同一条（cloud:true）。
             BackupLogStore.log(category: "房源", action: upAction, result: "成功",
-                              detail: upParts.joined(separator: "；"), room: roomKey, cloud: false)
+                              detail: upParts.joined(separator: "；"), room: roomKey, cloud: true)
         }
         return (success, failed, failedFiles, uploaded, lastError)
     }

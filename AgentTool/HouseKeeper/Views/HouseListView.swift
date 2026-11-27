@@ -1112,8 +1112,9 @@ struct HouseListView: View {
             for key in keys { HouseMediaUploadQueue.removeRoom(key) }
             NotificationCenter.default.post(name: Self.houseStoreChanged, object: nil)
             for key in keys where HouseLocalDeletionStore.contains(key) {
-                CloudOps.log(category: "房源", action: "仅删本地房源", result: "成功",
-                             detail: "本机删除，服务器保留；刷新时需手动确认恢复", room: key)
+                BackupLogStore.log(category: "房源", action: "仅删本地房源", result: "成功",
+                                   detail: "本机删除，服务器保留；刷新时需手动确认恢复",
+                                   room: key, cloud: true)
             }
             showToast("已从本机删除 \(keys.count) 套；服务器仍保留。之后点左上角刷新会先问是否恢复，不会自动带回。")
             return
@@ -1164,14 +1165,15 @@ struct HouseListView: View {
                     do {
                         try await HouseSyncEngine.shared.pushDelete(h)
                         HouseLocalDeletionStore.remove(key)
-                        CloudOps.log(category: "房源", action: "删除双端房源", result: "成功",
-                                     detail: "服务器与本地永久删除，不可恢复", room: key)
+                        BackupLogStore.log(category: "房源", action: "删除双端房源", result: "成功",
+                                           detail: "服务器与本地永久删除，不可恢复",
+                                           room: key, cloud: true)
                         ok += 1
                         localDeleted.append(h)
                     } catch {
-                        CloudOps.log(category: "房源", action: "删除双端房源", result: "失败",
-                                     detail: "服务器删除失败：\(error.localizedDescription)，本机记录保留",
-                                     room: key)
+                        BackupLogStore.log(category: "房源", action: "删除双端房源", result: "失败",
+                                           detail: "服务器删除失败：\(error.localizedDescription)，本机记录保留",
+                                           room: key, cloud: true)
                         showToast("删除失败 \(key)：\(error.localizedDescription)", isError: true)
                     }
                 }
@@ -1232,7 +1234,8 @@ struct HouseListView: View {
         HouseLedgerStore.append(
             roomKey: roomKey,
             action: "切换状态",
-            fieldChanges: [HouseLedgerFieldChange(field: "状态", oldValue: oldStatus.label, newValue: house.status.label)])
+            fieldChanges: [HouseLedgerFieldChange(field: "状态", oldValue: oldStatus.label, newValue: house.status.label)],
+            writeOpLog: false)
         pushHouseToCloud(house, action: "切换状态", changeText: "状态：\(oldStatus.label) → \(house.status.label)")
         NotificationCenter.default.post(name: Self.houseStoreChanged, object: nil)
     }
@@ -1248,6 +1251,8 @@ struct HouseListView: View {
             Task {
                 do {
                     _ = try await HouseSyncEngine.shared.pushHouse(house)
+                    BackupLogStore.log(category: "房源", action: action, result: "成功",
+                                       detail: changeText, room: roomKey, cloud: true)
                     await MainActor.run {
                         HouseActionNotifier.shared.send(
                             key: "status.\(roomKey)",
@@ -1255,6 +1260,9 @@ struct HouseListView: View {
                             body: "\(roomNo) 已改为\(house.status.label)，服务器已更新")
                     }
                 } catch {
+                    BackupLogStore.log(category: "房源", action: action, result: "失败",
+                                       detail: "服务器更新失败：\(error.localizedDescription)",
+                                       room: roomKey, cloud: true)
                     await MainActor.run {
                         HousePendingUploader.shared.markPending(roomKey)
                         HouseActionNotifier.shared.send(
@@ -1433,7 +1441,8 @@ struct HouseListView: View {
                 roomKey: house.mediaRoomKey,
                 action: "批量标记已租",
                 detail: "状态：\(HouseStatus.available.label) → \(HouseStatus.rented.label)",
-                fieldChanges: [HouseLedgerFieldChange(field: "状态", oldValue: HouseStatus.available.label, newValue: HouseStatus.rented.label)])
+                fieldChanges: [HouseLedgerFieldChange(field: "状态", oldValue: HouseStatus.available.label, newValue: HouseStatus.rented.label)],
+                writeOpLog: false)
             rentedHouses.append(house)
             changed += 1
         }
@@ -1450,8 +1459,14 @@ struct HouseListView: View {
                     let roomNo = house.displayRoomNo
                     do {
                         _ = try await HouseSyncEngine.shared.pushHouse(house)
+                        BackupLogStore.log(category: "房源", action: "批量标记已租", result: "成功",
+                                           detail: "状态：\(HouseStatus.available.label) → \(HouseStatus.rented.label)",
+                                           room: roomKey, cloud: true)
                         okRooms.append(roomNo)
                     } catch {
+                        BackupLogStore.log(category: "房源", action: "批量标记已租", result: "失败",
+                                           detail: "服务器更新失败：\(error.localizedDescription)",
+                                           room: roomKey, cloud: true)
                         await MainActor.run { HousePendingUploader.shared.markPending(roomKey) }
                         failRooms.append(roomNo)
                     }

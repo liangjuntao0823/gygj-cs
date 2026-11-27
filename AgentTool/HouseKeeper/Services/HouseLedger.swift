@@ -179,7 +179,10 @@ enum HouseLedgerStore {
                        detail: String = "",
                        fieldChanges: [HouseLedgerFieldChange] = [],
                        date: Date = Date(),
-                       cloudLog: Bool = true) -> HouseLedgerEvent {
+                       cloudLog: Bool = true,
+                       logAction: String? = nil,
+                       logDetail: String? = nil,
+                       writeOpLog: Bool = true) -> HouseLedgerEvent {
         let event = HouseLedgerEvent(date: date, action: action, detail: detail, fieldChanges: fieldChanges)
         fileLock.lock()
         var pending = loadPendingUnlocked(roomKey: roomKey)
@@ -187,14 +190,20 @@ enum HouseLedgerStore {
         savePendingUnlocked(roomKey: roomKey, events: pending)
         fileLock.unlock()
         scheduleSync(roomKey: roomKey)
-        // 云端 ops 日志：手机端新增/编辑/状态/删除/媒体动作统一在这里落一条，
-        // 不再依赖各页面各自记得写 cloud:true（此前手机动作在后台日志里完全看不到）。
-        let changeText = fieldChanges.map { "\($0.field)：\($0.oldValue)→\($0.newValue)" }
+        // 操作日志沿用旧正式版规则：一次动作只走 BackupLogStore.log(cloud:true)，
+        // 同时写本机「本机操作」和服务器 ops「云端操作」，两侧动作名、结果、明细完全一致。
+        // 旧版房源页面也是这个写法，不再直接调 CloudOps.log 只写云端、漏掉本机。
+        // 各页面若需要“服务器成功后再落日志”，传 writeOpLog:false，由推送结果统一写。
+        let changeText = fieldChanges.map { "\($0.field)：\($0.oldValue) → \($0.newValue)" }
             .joined(separator: "；")
-        let logDetail = detail.isEmpty ? changeText : detail
-        if cloudLog {
-            CloudOps.log(category: "房源", action: action, result: "成功",
-                         detail: logDetail, room: roomKey)
+        let finalDetail = logDetail ?? (detail.isEmpty ? changeText : detail)
+        if cloudLog && writeOpLog {
+            BackupLogStore.log(category: "房源",
+                               action: logAction ?? action,
+                               result: "成功",
+                               detail: finalDetail,
+                               room: roomKey,
+                               cloud: true)
         }
         return event
     }
