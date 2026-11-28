@@ -39,6 +39,26 @@ enum RemoteConfig {
         var aiModels: [AIModelInfo]? = nil
         /// v2.21：App 在线更新（云端后台「App 更新」填写；桶里只存最新一个包）
         var update: UpdateInfo? = nil
+
+        /// b29：公开更新接口只返回 update/changelog/minimumVersion 三块，
+        /// 合成 Decodable 对缺失的非可选字段会抛 keyNotFound；这里统一按缺省值解码。
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            version = try c.decodeIfPresent(Int.self, forKey: .version) ?? 0
+            updatedAt = try c.decodeIfPresent(String.self, forKey: .updatedAt)
+            updatedBy = try c.decodeIfPresent(String.self, forKey: .updatedBy)
+            announcement = try c.decodeIfPresent(Announcement.self, forKey: .announcement)
+            minimumVersion = try c.decodeIfPresent(String.self, forKey: .minimumVersion)
+            tips = try c.decodeIfPresent([String: String].self, forKey: .tips) ?? [:]
+            features = try c.decodeIfPresent([String: Bool].self, forKey: .features) ?? [:]
+            params = try c.decodeIfPresent([String: Double].self, forKey: .params) ?? [:]
+            helpTexts = try c.decodeIfPresent([String: String].self, forKey: .helpTexts) ?? [:]
+            changelog = try c.decodeIfPresent([ChangelogEntry].self, forKey: .changelog)
+            aiModels = try c.decodeIfPresent([AIModelInfo].self, forKey: .aiModels)
+            update = try c.decodeIfPresent(UpdateInfo.self, forKey: .update)
+        }
+
+        init() {}
     }
 
     /// v2.21：App 更新信息（云端 config.json 的 update 块）
