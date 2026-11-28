@@ -76,7 +76,7 @@ function profileHTML(p){
   var call=p.phone?'<a class="btn call" href="tel:'+esc(p.phone)+'">拨打电话</a>':"";
   return '<div class="card"><div class="profile">'+who+'</div>'+(call?'<div class="actions">'+call+'</div>':"")+'</div>';
 }
-async function getJSON(u){var r=await fetch(u);if(!r.ok)throw new Error("http "+r.status);return r.json()}
+async function getJSON(u){var r=await fetch(u);if(r.status===404)return null;if(!r.ok)throw new Error("http "+r.status);return r.json()}
 
 async function renderSingle(key){
   document.getElementById("back").style.display="";
@@ -84,7 +84,8 @@ async function renderSingle(key){
   var app=document.getElementById("app");
   try{
     var d=await getJSON("/api/public/rooms/"+encodeURIComponent(key));
-    if(!d.ok){app.innerHTML='<div class="empty">该房源暂不可见</div>';return}
+    // 单房接口直接返回房源对象（没有 ok 字段）；不能再用 !d.ok 判断，否则永远显示“暂不可见”。
+    if(!d || d.ok===false || !d.roomKey){app.innerHTML='<div class="empty">该房源暂不可见</div>';return}
     var h='<div class="card"><div class="meta-row"><span class="layout">'+esc(d.layout||"户型")+'</span>'+
       '<span class="tower">'+esc((d.tower||"")+" "+(d.roomNo||""))+'</span>'+
       '<span class="price">¥'+esc(d.price||"")+'<small> /月</small></span></div>';
