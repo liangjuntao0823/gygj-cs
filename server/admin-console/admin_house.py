@@ -142,7 +142,22 @@ class HouseConsole:
             return None, None
         return data, self.store.media.guess_content_type(rel_path=rel)
 
-    # ---- 导出 ----
+    def config_get(self) -> dict[str, Any]:
+        return {"ok": True, "config": self.store.config_get("app")}
+
+    def config_set(self, value: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {"ok": False, "error": "bad_json"}
+        self.store.config_set("app", value)
+        return {"ok": True, "config": self.store.config_get("app")}
+
+    def share_stats(self, days: int = 30) -> dict[str, Any]:
+        return {"ok": True, **self.store.share_stats(days)}
+
+    def share_records(self, limit: int = 200) -> dict[str, Any]:
+        return {"ok": True, "records": self.store.share_records_list(limit)}
+
+
     def export_json(self) -> tuple[bytes, str]:
         doc = self.store.list_houses(include_deleted=False)
         stamp = time.strftime("%Y%m%d-%H%M%S")

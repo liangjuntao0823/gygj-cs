@@ -1159,17 +1159,29 @@ struct HouseDetailView: View {
             name: profile.name,
             phone: profile.phone
         )
-        // 服务器模式：App 内分享——本地媒体文件 + 服务器 H5 链接 + 纯文字，直接系统面板
+        // 服务器模式：只发一个带签名的 H5 链接（与旧 2.72 一致，不再附本地媒体和长文字）
         if HouseServerMode.ready {
-            let urls: [URL] = files.compactMap { f in
-                let u = MediaStore.url(for: f.name, roomKey: roomKey)
-                return FileManager.default.fileExists(atPath: u.path) ? u : nil
+            isPreparingVideo = true
+            shareError = nil
+            Task {
+                await ShareAssetUploader.prepare(roomKeys: [roomKey], mediaByRoom: [files])
+                _ = await ShareAssetUploader.ensureQRCode()
+                do {
+                    let url = try await HouseRemoteClient.shared.createShare(
+                        kind: "single", roomKeys: [roomKey], mode: mode.rawValue,
+                        expiryDays: 3650, watermark: ShareAssetUploader.watermarkDict(),
+                        summary: info.shareText(mode: mode))
+                    await MainActor.run {
+                        isPreparingVideo = false
+                        presentDetailShare([url])
+                    }
+                } catch {
+                    await MainActor.run {
+                        isPreparingVideo = false
+                        shareError = error.localizedDescription
+                    }
+                }
             }
-            var items: [Any] = urls
-            if let h5 = HouseRemoteClient.h5URL(roomKey: roomKey) { items.append(h5) }
-            items.append(info.shareText)
-            presentDetailShare(items)
-            Task { try? await HouseRepository.shared.addShareRecord(roomKey: roomKey, channel: "app内分享", summary: info.shareText) }
             return
         }
         // 未接入服务器：旧桶卡片链接已下线，回退本地媒体 + 文字系统分享

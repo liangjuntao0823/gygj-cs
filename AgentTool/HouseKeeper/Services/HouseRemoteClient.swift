@@ -700,6 +700,156 @@ final class HouseRemoteClient {
         return (json?["records"] as? [[String: Any]]) ?? []
     }
 
+    /// 获客分析（近 N 天）
+    func fetchShareStats(days: Int = 30) async throws -> [String: Any] {
+        let (data, http) = try await makeRequest("/api/house/share-stats?days=\(days)", method: "GET")
+        guard http.statusCode == 200 else {
+            throw HouseAPIError(message: "读取获客统计失败（服务器 \(http.statusCode)）")
+        }
+        return (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// 创建分享记录并返回带 HMAC 签名的 H5 链接（服务器唯一权威）。
+    /// kind: single / collection / list；mode: masked / full。
+    func createShare(kind: String, roomKeys: [String], mode: String,
+                     expiryDays: Int, watermark: [String: Any]?,
+                     summary: String = "") async throws -> URL {
+        var body: [String: Any] = [
+            "kind": kind, "roomKeys": roomKeys, "mode": mode,
+            "expiryDays": expiryDays, "operator": operatorName,
+            "name": ShareProfileStore.load().name,
+            "phone": ShareProfileStore.load().phone,
+        ]
+        if !summary.isEmpty { body["summary"] = summary }
+        if let watermark { body["watermark"] = watermark }
+        let (data, http) = try await makeRequest("/api/house/share/create", method: "POST", body: body)
+        guard http.statusCode == 200 else {
+            throw HouseAPIError(message: "创建分享链接失败（服务器 \(http.statusCode)）")
+        }
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        guard let urlText = json?["url"] as? String, let url = URL(string: urlText) else {
+            throw HouseAPIError(message: "服务器未返回分享链接")
+        }
+        return url
+    }
+
+    /// 上传客户端生成的分享封面 / 视频首帧到服务器 share/<房号>/
+    func uploadShareAsset(roomKey: String, fileName: String, data: Data) async throws -> String {
+        let fn = fileName.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? fileName
+        let rk = roomKey.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? roomKey
+        let path = "/api/house/share-asset?roomKey=\(rk)&filename=\(fn)"
+        let (resp, http) = try await uploadRaw(path: path, data: data,
+                                               contentType: "image/jpeg",
+                                               fileName: fileName)
+        guard http.statusCode == 200 else {
+            throw HouseAPIError(message: "上传分享封面失败（服务器 \(http.statusCode)）")
+        }
+        let json = try? JSONSerialization.jsonObject(with: resp) as? [String: Any]
+        return (json?["objectKey"] as? String) ?? ""
+    }
+
+    /// 上传微信二维码（服务器 profile/qrcode.<ext>），返回相对路径
+    func uploadQRCode(fileName: String, data: Data) async throws -> String {
+        let (resp, http) = try await uploadRaw(path: "/api/house/profile/qrcode", data: data,
+                                               contentType: "image/jpeg", fileName: fileName)
+        guard http.statusCode == 200 else {
+            throw HouseAPIError(message: "上传二维码失败（服务器 \(http.statusCode)）")
+        }
+        let json = try? JSONSerialization.jsonObject(with: resp) as? [String: Any]
+        return (json?["qrPath"] as? String) ?? ""
+    }
+
+    /// 上传在线更新安装包，服务器自动算大小与 SHA256
+    func uploadRelease(fileName: String, data: Data) async throws -> [String: Any] {
+        let (resp, http) = try await uploadRaw(path: "/api/house/release", data: data,
+                                               contentType: "application/octet-stream",
+                                               fileName: fileName, timeout: 300)
+        guard http.statusCode == 200 else {
+            throw HouseAPIError(message: "上传安装包失败（服务器 \(http.statusCode)）")
+        }
+        return (try? JSONSerialization.jsonObject(with: resp) as? [String: Any]) ?? [:]
+    }
+
+    private func uploadRaw(path: String, data: Data, contentType: String,
+                           fileName: String, timeout: TimeInterval = 60)
+    async throws -> (Data, HTTPURLResponse) {
+        guard let base = URL(string: endpoint),
+              let url = URL(string: path, relativeTo: base) else {
+            throw HouseAPIError(message: "服务器地址无效")
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = timeout
+        req.setValue(contentType, forHTTPHeaderField: "Content-Type")
+        if let t = token, !t.isEmpty {
+            req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization")
+        }
+        // HTTP 头只能 ASCII：文件名百分号编码后再放头
+        let asciiName = fileName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "file"
+        req.setValue(asciiName, forHTTPHeaderField: "X-File-Name")
+        req.setValue(String(data.count), forHTTPHeaderField: "Content-Length")
+        req.httpBody = data
+        let (resp, http) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse else {
+            throw HouseAPIError(message: "服务器无响应")
+        }
+        if http.statusCode == 403 {
+            throw HouseAPIError(message: "暂无房源访问权限，请联系管理员开通", forbidden: true)
+        }
+        return (resp, http)
+    }
+
+    /// 管理后台登录：返回 admin_session token（后续后台接口用 Cookie 携带）
+    func adminLogin(username: String, password: String) async throws -> String {
+        guard let base = URL(string: endpoint),
+              let url = URL(string: "/admin/api/login", relativeTo: base) else {
+            throw HouseAPIError(message: "服务器地址无效")
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = timeout
+        req.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: ["username": username, "password": password])
+        let (data, http) = try await URLSession.shared.data(for: req)
+        guard http.statusCode == 200,
+              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              json["ok"] as? Bool == true,
+              let token = json["token"] as? String else {
+            throw HouseAPIError(message: "后台账号或密码不正确")
+        }
+        return token
+    }
+
+    /// App 内改后台密码：先登录换 admin_session，再提交新密码
+    func adminChangePassword(current: String, newPassword: String) async throws {
+        let session = try await adminLogin(username: "admin", password: current)
+        guard let base = URL(string: endpoint),
+              let url = URL(string: "/admin/api/password", relativeTo: base) else {
+            throw HouseAPIError(message: "服务器地址无效")
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = timeout
+        req.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        req.setValue("admin_session=\(session)", forHTTPHeaderField: "Cookie")
+        req.httpBody = try JSONSerialization.data(withJSONObject: ["newPassword": newPassword])
+        let (data, http) = try await URLSession.shared.data(for: req)
+        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        guard http.statusCode == 200, (json?["ok"] as? Bool) == true else {
+            let err = (json?["error"] as? String) ?? "服务器 \(http.statusCode)"
+            throw HouseAPIError(message: err == "password_required" ? "新密码不能为空" : "改密失败：\(err)")
+        }
+    }
+
+    /// 远程配置「草稿」把本地 JSON 提交后由服务器统一加版本号
+    func fetchAdminMeta() async throws -> [String: Any] {
+        let (data, http) = try await makeRequest("/admin/api/meta", method: "GET")
+        guard http.statusCode == 200 else {
+            throw HouseAPIError(message: "读取后台状态失败（服务器 \(http.statusCode)）")
+        }
+        return (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
     /// 追加一条分享记录
     func addShareRecord(roomKey: String, channel: String, summary: String) async throws {
         let body: [String: Any] = ["roomKey": roomKey, "channel": channel,
@@ -860,21 +1010,7 @@ final class HouseRemoteClient {
 
     /// 公开分享 H5 链接（服务器本地托管静态壳；roomKey 为空时为公开选房列表）。
     /// 姓名/电话只在本机，随链接参数传给页面，服务器不落库；二维码不上服务器、H5 不展示。
-    static func h5URL(roomKey: String? = nil) -> URL? {
-        guard var comps = URLComponents(string: NotifyHub.shared.endpoint) else { return nil }
-        comps.path = "/api/public/h5"
-        var items: [URLQueryItem] = []
-        if let key = roomKey, !key.isEmpty {
-            items.append(URLQueryItem(name: "roomKey", value: key))
-        }
-        let profile = ShareProfileStore.load()
-        let name = profile.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let phone = profile.phone.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !name.isEmpty { items.append(URLQueryItem(name: "n", value: name)) }
-        if !phone.isEmpty { items.append(URLQueryItem(name: "p", value: phone)) }
-        comps.queryItems = items.isEmpty ? nil : items
-        return comps.url
-    }
+
 }
 
 /// POST /houses 单条返回（服务器对单条也包成 results）

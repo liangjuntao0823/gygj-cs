@@ -102,7 +102,7 @@ header.top{display:flex;justify-content:space-between;align-items:center;margin-
 <div id="view-login">
   <div class="card">
     <h2>公寓管家 · 管理后台</h2>
-    <div class="field"><label>账号</label><input id="li-user" placeholder="admin" autocomplete="username"></div>
+    <div class="field"><label>账号</label><input id="li-user" autocomplete="username"></div>
     <div class="field"><label>密码</label><input id="li-pass" type="password" autocomplete="current-password"></div>
     <button id="li-btn" style="width:100%">登录</button>
     <p id="li-err" class="muted" style="margin-top:10px;color:var(--red)"></p>
@@ -135,6 +135,8 @@ header.top{display:flex;justify-content:space-between;align-items:center;margin-
       <button data-tab="meter">电表值守</button>
       <button data-tab="push">推送中心</button>
       <button data-tab="house">房源管理</button>
+      <button data-tab="config">远程配置</button>
+      <button data-tab="insight">获客 / 分享</button>
     </div>
 
     <!-- 服务器 -->
@@ -226,6 +228,37 @@ header.top{display:flex;justify-content:space-between;align-items:center;margin-
         </tr></thead><tbody></tbody></table></div>
       </div>
     </section>
+
+    <!-- 远程配置 -->
+    <section class="panel" id="panel-config">
+      <div class="card">
+        <div class="row" style="justify-content:space-between">
+          <h2 style="margin:0">App 远程配置（服务器权威）</h2>
+          <div class="row">
+            <button class="ghost" id="cfg-load">重新加载</button>
+            <button id="cfg-save">保存并生效</button>
+          </div>
+        </div>
+        <p class="subtitle">与 App「远程配置」同源，保存后 App 启动/刷新即生效。字段包含公告、最低版本、功能开关、数值参数、提示文案、帮助说明、在线更新、AI 模型、版本记录。在线更新请填 App 上传后的安装包路径 / 大小 / SHA256。</p>
+        <div class="field"><label>配置 JSON</label><textarea id="cfg-json" rows="22" spellcheck="false" style="width:100%;font-family:ui-monospace,Menlo,monospace;font-size:12px"></textarea></div>
+        <p id="cfg-msg" class="muted"></p>
+      </div>
+    </section>
+
+    <!-- 获客 / 分享 -->
+    <section class="panel" id="panel-insight">
+      <div class="row" id="insight-stats"></div>
+      <div class="card">
+        <div class="row" style="justify-content:space-between">
+          <h2 style="margin:0">近 30 天访问趋势</h2>
+          <div class="row"><select id="insight-days"><option value="7">7 天</option><option value="30" selected>30 天</option><option value="90">90 天</option></select><button class="ghost" id="insight-refresh">刷新</button></div>
+        </div>
+        <div class="table-wrap"><table id="insight-daily"><thead><tr><th>日期</th><th>访问次数</th></tr></thead><tbody></tbody></table></div>
+      </div>
+      <div class="card"><h2>按分享方式</h2><div class="table-wrap"><table id="insight-modes"><thead><tr><th>方式</th><th>访问次数</th></tr></thead><tbody></tbody></table></div></div>
+      <div class="card"><h2>来源</h2><div class="table-wrap"><table id="insight-refs"><thead><tr><th>来源</th><th>访问次数</th></tr></thead><tbody></tbody></table></div></div>
+      <div class="card"><h2>分享记录</h2><div class="table-wrap"><table id="insight-shares"><thead><tr><th>时间</th><th>类型</th><th>方式</th><th>房源</th><th>摘要</th><th>操作人</th><th>有效期至</th><th>状态</th></tr></thead><tbody></tbody></table></div></div>
+    </section>
   </div>
 </div>
 
@@ -303,6 +336,8 @@ document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('on'));
   document.querySelectorAll('.panel').forEach(x=>x.classList.remove('on'));
   b.classList.add('on');$('panel-'+b.dataset.tab).classList.add('on');
+  if(b.dataset.tab==='config')loadConfig();
+  if(b.dataset.tab==='insight')loadInsight();
 });
 
 // ---------- 弹窗 / 通知范围 ----------
@@ -626,6 +661,49 @@ function houseDelete(key){
     async()=>{const r=await api(`/admin/api/house/houses/${encodeURIComponent(key)}/delete`,
       {method:'POST',body:JSON.stringify({notifyScope:pickScope()})});closeModal();if(r.ok){loadHouses()}else{alert('失败：'+(r.detail||r.error))}});
 }
+
+// ---------- 远程配置 ----------
+async function loadConfig(){
+  $('cfg-msg').textContent='加载中...';
+  try{
+    const d=await api('/admin/api/config');
+    $('cfg-json').value=JSON.stringify(d.config||{},null,2);
+    $('cfg-msg').textContent='已加载服务器配置';
+  }catch(e){$('cfg-msg').textContent='加载失败：'+e.message}
+}
+$('cfg-load').onclick=loadConfig;
+$('cfg-save').onclick=async()=>{
+  let obj;
+  try{obj=JSON.parse($('cfg-json').value||'{}')}catch(e){$('cfg-msg').textContent='JSON 格式错误：'+e.message;return}
+  if(typeof obj!=='object'||Array.isArray(obj)){$('cfg-msg').textContent='配置必须是 JSON 对象';return}
+  const r=await api('/admin/api/config',{method:'PUT',body:JSON.stringify(obj)});
+  if(r.ok){$('cfg-json').value=JSON.stringify(r.config||{},null,2);$('cfg-msg').textContent='已保存并生效'}
+  else{$('cfg-msg').textContent='保存失败：'+(r.error||'')}
+};
+
+// ---------- 获客 / 分享 ----------
+async function loadInsight(){
+  const days=$('insight-days').value||30;
+  const [st,sh]=await Promise.all([api('/admin/api/share-stats?days='+days),api('/admin/api/share-records')]);
+  if(!st.ok)return;
+  $('insight-stats').innerHTML=`
+    <div class="stat"><div class="n">${st.visits}</div><div class="l">访问次数</div></div>
+    <div class="stat"><div class="n">${st.visitors}</div><div class="l">访客数</div></div>
+    <div class="stat"><div class="n">${st.shares}</div><div class="l">新建分享</div></div>`;
+  $('insight-daily').querySelector('tbody').innerHTML=(st.daily||[]).map(x=>`<tr><td>${x.date}</td><td>${x.visits}</td></tr>`).join('')||'<tr><td colspan="2" class="muted">暂无数据</td></tr>';
+  $('insight-modes').querySelector('tbody').innerHTML=(st.modes||[]).map(x=>`<tr><td>${esc(x.mode)}</td><td>${x.visits}</td></tr>`).join('')||'<tr><td colspan="2" class="muted">暂无数据</td></tr>';
+  $('insight-refs').querySelector('tbody').innerHTML=(st.refs||[]).map(x=>`<tr><td>${esc(x.ref)}</td><td>${x.visits}</td></tr>`).join('')||'<tr><td colspan="2" class="muted">暂无数据</td></tr>';
+  $('insight-shares').querySelector('tbody').innerHTML=(sh.records||[]).map(r=>{
+    const exp=r.expiresAt?new Date(r.expiresAt*1000).toLocaleString():'长期';
+    const kind={single:'单房',collection:'合集',list:'选房页'}[r.kind]||r.kind;
+    return `<tr><td>${esc((r.ts||'').replace('T',' ').slice(0,16))}</td><td>${esc(kind)}</td>
+      <td>${r.mode==='full'?'完整':'脱敏'}</td><td>${esc(r.roomKey||(r.roomKeys||[]).join('、')||'—')}</td>
+      <td>${esc(r.summary||'')}</td><td>${esc(r.operator||'')}</td><td>${exp}</td>
+      <td>${r.revoked?'<span class="tag r">已失效</span>':'<span class="tag g">有效</span>'}</td></tr>`;
+  }).join('')||'<tr><td colspan="8" class="muted">暂无分享记录</td></tr>';
+}
+$('insight-refresh').onclick=loadInsight;
+$('insight-days').onchange=loadInsight;
 
 boot();
 </script>

@@ -13,9 +13,9 @@ sys.path.insert(0, str(HERE))
 import house_store as hs_mod  # noqa: E402
 
 
-def make_house(room_key="1-2059", price=1100, status="available"):
+def make_house(room_key="1-2059", price=1100, status="available", layout="单间"):
     return {"roomKey": room_key, "roomNo": room_key, "tower": 1, "landlord": "康",
-            "layout": "单间", "price": price, "password": "", "remark": "",
+            "layout": layout, "price": price, "password": "", "remark": "",
             "status": status, "media": []}
 
 
@@ -81,12 +81,64 @@ class NativeStoreTests(unittest.TestCase):
         self.assertIsNone(self.store.public_single("1-202"))
         self.assertIsNone(self.store.public_single("1-404"))
 
-    def test_h5_page_renders(self):
+    def _render_single(self, mode):
         import h5_page
-        html = h5_page.page_html()
-        self.assertIn("/api/public/rooms", html)
-        self.assertIn("roomKey", html)
-        self.assertIn("拨打电话", html)
+        self.store.upsert_house(make_house("1-2059", price=1100), operator="t")
+        self.store.media.save_share_asset("1-2059", "cover.jpg", b"cover")
+        self.store.media.save_house_media("1-2059", "1-2059-a.jpg", b"img")
+        self.store.upsert_house({"roomKey":"1-2059","roomNo":"1-2059","tower":1,
+                                 "landlord":"康","layout":"单间","price":1100,
+                                 "password":"1234","remark":"全屋定制",
+                                 "status":"available",
+                                 "media":[{"fileName":"1-2059-a.jpg","kind":"image"}]}, operator="t")
+        class H:
+            headers = {"Host": "114.132.93.85:8082", "X-Forwarded-Proto": "http"}
+        return h5_page.render_single(self.store, H(), "tok", "1-2059", mode)
+
+    def test_h5_masked_hides_internal(self):
+        html = self._render_single("masked")
+        self.assertIn("米兰公馆", html)
+        self.assertIn("单间", html)
+        self.assertNotIn("1100", html)
+        self.assertNotIn("1234", html)
+        self.assertNotIn("全屋定制", html)
+
+    def test_h5_full_shows_details(self):
+        html = self._render_single("full")
+        self.assertIn("1-2059", html)
+        self.assertIn("1100", html)
+        self.assertIn("1234", html)
+
+    def test_h5_og_and_token_media(self):
+        html = self._render_single("masked")
+        self.assertIn('property="og:title"', html)
+        self.assertIn('property="og:image"', html)
+        self.assertIn("/api/public/media/share/1-2059/cover.jpg?t=tok", html)
+
+    def test_h5_collection_and_list(self):
+        import h5_page
+        for key, price, layout in (("1-101", 900, "单间"), ("1-102", 1300, "一房一厅")):
+            self.store.upsert_house(make_house(key, price=price, layout=layout), operator="t")
+        class H:
+            headers = {"Host": "114.132.93.85:8082", "X-Forwarded-Proto": "http"}
+        col = h5_page.render_collection(self.store, H(), "tok", ["1-101", "1-102"], "masked")
+        self.assertIn("单间", col)
+        self.assertIn("一房一厅", col)
+        self.assertNotIn("900", col)
+        rooms = h5_page.render_list(self.store, H(), "tok")
+        self.assertIn("米兰公馆 · 在租房源", rooms)
+        self.assertIn("单间", rooms)
+        self.assertNotIn("康", rooms)
+
+    def test_share_token_roundtrip(self):
+        from share_auth import ShareSigner
+        signer = ShareSigner(Path(self.tmp.name) / "secret")
+        exp = signer.expires(2)
+        token = signer.sign(1, exp)
+        self.assertEqual(signer.verify(token)["sid"], 1)
+        self.assertEqual(signer.verify(token + "x"), None)
+        expired = signer.sign(1, int(__import__("time").time()) - 1)
+        self.assertEqual(signer.verify(expired), None)
 
     def test_media_stream_same_name_does_not_overwrite(self):
         import io

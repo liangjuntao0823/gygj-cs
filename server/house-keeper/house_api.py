@@ -47,6 +47,41 @@ def _bearer(handler: Any) -> str:
     return h[7:].strip() if h.startswith("Bearer ") else ""
 
 
+_RATE_LOCK = threading.Lock()
+_RATE_BUCKETS: dict[str, list[float]] = {}
+
+
+def _client_ip(handler: Any) -> str:
+    forwarded = (handler.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+    if forwarded:
+        return forwarded
+    return str((getattr(handler, "client_address", None) or ("",))[0])
+
+
+def _rate_limit(handler: Any, bucket: str, limit: int, window: float = 60.0) -> bool:
+    """固定窗口限流；返回 True 表示放行。只用于公开接口，防止被刷。"""
+    key = f"{bucket}:{_client_ip(handler)}"
+    now = time.monotonic()
+    with _RATE_LOCK:
+        items = [t for t in _RATE_BUCKETS.get(key, []) if now - t < window]
+        if len(items) >= limit:
+            _RATE_BUCKETS[key] = items
+            return False
+        items.append(now)
+        _RATE_BUCKETS[key] = items
+    return True
+
+
+def _ip_hash(handler: Any) -> str:
+    import hashlib
+    return hashlib.sha256(("gy-share:" + _client_ip(handler)).encode("utf-8")).hexdigest()[:32]
+
+
+def _share_token(handler: Any, q: dict[str, str] | None = None) -> tuple[str, dict[str, Any] | None]:
+    token = str((q or _q(handler)).get("t") or "")
+    return token, None
+
+
 _DELIVER_LOCK = threading.Lock()
 
 
@@ -158,14 +193,90 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
             return False
         return True
 
+    def public_record() -> tuple[str, dict[str, Any] | None]:
+        """校验签名 + 数据库记录状态；返回 (token, record)。"""
+        token = str(_q(handler).get("t") or "")
+        payload = store.share_signer.verify(token)
+        if not payload:
+            return token, None
+        rec = store.share_record_by_token(token)
+        if not rec or rec.get("revoked"):
+            return token, None
+        if int(rec.get("expiresAt") or 0) and int(rec["expiresAt"]) < int(time.time()):
+            return token, None
+        return token, rec
+
+    def public_denied(message: str = "分享链接已失效，请联系房东重新获取。") -> bool:
+        import h5_page
+        return send_file(410, h5_page.tpl.simple_error("分享链接已失效", message).encode("utf-8"),
+                         "text/html; charset=utf-8")
+
+    def room_allowed(rec: dict[str, Any], room_key: str) -> bool:
+        kind = rec.get("kind") or "single"
+        if kind == "list":
+            return True
+        if kind == "single":
+            return room_key == (rec.get("roomKey") or "")
+        return room_key in (rec.get("roomKeys") or [])
+
     try:
-        # ---- 公开只读：脱敏房源 + 媒体（访客无 token，H5/分享页用）----
+        # ---- 公开只读：签名分享（H5 / 媒体 / 名片 / 埋点）----
+        if path == f"{PUBLIC_PREFIX}/h5" and method == "GET":
+            if not _rate_limit(handler, "h5", 120):
+                return send(429, {"ok": False, "error": "too_many_requests"})
+            import h5_page
+            token, rec = public_record()
+            if not rec:
+                return public_denied()
+            q = _q(handler)
+            wm = None
+            try:
+                import json as _json
+                raw_wm = q.get("wm") or ""
+                if raw_wm:
+                    wm = _json.loads(raw_wm)
+            except Exception:
+                wm = None
+            kind = rec.get("kind") or "single"
+            mode = "full" if rec.get("mode") == "full" else "masked"
+            if kind == "list":
+                room_key = str(q.get("roomKey") or "").strip()
+                page = (h5_page.render_single(store, handler, token, room_key, "masked", wm)
+                        if room_key else h5_page.render_list(store, handler, token, "masked", wm))
+            elif kind == "collection":
+                page = h5_page.render_collection(store, handler, token, rec.get("roomKeys") or [], mode, wm)
+            else:
+                page = h5_page.render_single(store, handler, token, rec.get("roomKey") or "", mode, wm)
+            body = page.encode("utf-8")
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/html; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.send_header("Cache-Control", "no-store, max-age=0")
+            handler.end_headers()
+            try:
+                handler.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return True
+
         if path == f"{PUBLIC_PREFIX}/rooms" and method == "GET":
-            return send(200, {"ok": True, "rooms": store.public_rooms()})
+            if not _rate_limit(handler, "rooms", 120):
+                return send(429, {"ok": False, "error": "too_many_requests"})
+            token, rec = public_record()
+            if not rec:
+                return send(410, {"ok": False, "error": "link_expired"})
+            mode = "full" if rec.get("mode") == "full" else "masked"
+            return send(200, {"ok": True, "mode": mode, "rooms": store.public_rooms(mode=mode) if mode == "full" else store.public_rooms(mode="masked")})
 
         if path.startswith(f"{PUBLIC_PREFIX}/rooms/") and method == "GET":
+            if not _rate_limit(handler, "single", 180):
+                return send(429, {"ok": False, "error": "too_many_requests"})
             key = urllib.parse.unquote(path[len(f"{PUBLIC_PREFIX}/rooms/"):].strip("/"))
-            doc = store.public_single(key)
+            token, rec = public_record()
+            if not rec or not room_allowed(rec, key):
+                return send(410, {"ok": False, "error": "link_expired"})
+            mode = "full" if rec.get("mode") == "full" else "masked"
+            doc = store.public_single(key, mode=mode)
             return send(200 if doc else 404, doc or {"ok": False, "error": "not_found"})
 
         # b29：公开在线更新块。检查更新只依赖这份非敏感信息，不再受房屋库授权 token 影响。
@@ -176,22 +287,70 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
             return send(200, {"ok": True, **public_cfg})
 
         if path == f"{PUBLIC_PREFIX}/profile" and method == "GET":
+            token, rec = public_record()
+            if not rec:
+                return send(410, {"ok": False, "error": "link_expired"})
             prof = store.profile_get()
             return send(200, {"ok": True, "profile": {
                 "name": prof.get("name", ""), "phone": prof.get("phone", ""),
                 "qrPath": prof.get("qrPath", "")}})
 
-        if path in (f"{PUBLIC_PREFIX}/h5", f"{PUBLIC_PREFIX}/h5/") and method == "GET":
-            import h5_page
-            return send_file(200, h5_page.page_html().encode("utf-8"),
-                             "text/html; charset=utf-8")
+        if path == f"{PUBLIC_PREFIX}/track" and method == "GET":
+            if not _rate_limit(handler, "track", 180):
+                return send(429, {"ok": False, "error": "too_many_requests"})
+            token, rec = public_record()
+            if rec:
+                q = _q(handler)
+                room = str(q.get("room") or "")[:120]
+                mode = str(q.get("mode") or rec.get("mode") or "")[:20]
+                store.share_visit_add(
+                    share_id=int(rec.get("id") or 0), room_key=room, mode=mode,
+                    ref=str(q.get("ref") or ""), visitor=str(q.get("visitor") or ""),
+                    ip_hash=_ip_hash(handler), ua=str(handler.headers.get("User-Agent") or ""))
+            gif = (b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04"
+                   b"\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;")
+            handler.send_response(200)
+            handler.send_header("Content-Type", "image/gif")
+            handler.send_header("Content-Length", str(len(gif)))
+            handler.send_header("Cache-Control", "no-store")
+            handler.end_headers()
+            try:
+                handler.wfile.write(gif)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return True
 
         if path.startswith(f"{PUBLIC_PREFIX}/media/") and method == "GET":
+            if not _rate_limit(handler, "media", 900):
+                return send(429, {"ok": False, "error": "too_many_requests"})
             rel = urllib.parse.unquote(path[len(f"{PUBLIC_PREFIX}/media/"):])
+            token, rec = public_record()
+            if not rec:
+                return send(410, {"ok": False, "error": "link_expired"})
+            segs = [s for s in rel.replace("\\", "/").split("/") if s]
+            if segs[:1] == ["houses"] and len(segs) >= 3:
+                if not room_allowed(rec, segs[1]):
+                    return send(403, {"ok": False, "error": "forbidden"})
+            elif segs[:1] == ["share"] and len(segs) >= 3:
+                if not room_allowed(rec, segs[1]):
+                    return send(403, {"ok": False, "error": "forbidden"})
+            elif segs[:1] == ["profile"]:
+                pass
+            else:
+                return send(403, {"ok": False, "error": "forbidden"})
             data = store.media.read_rel(rel)
             if data is None:
                 return send(404, {"ok": False, "error": "not_found"})
-            return send_file(200, data, store.media.guess_content_type(rel))
+            handler.send_response(200)
+            handler.send_header("Content-Type", store.media.guess_content_type(rel))
+            handler.send_header("Content-Length", str(len(data)))
+            handler.send_header("Cache-Control", "public, max-age=86400")
+            handler.end_headers()
+            try:
+                handler.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return True
 
         if path == f"{PREFIX}/health" and method == "GET":
             return send(200, {"ok": True, "service": "house-keeper", **store.stats()})
@@ -207,7 +366,7 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
                 return True
             return send(200, {"ok": True, **store.stats()})
 
-        # ---- 名片（姓名 / 电话；二维码图片走媒体通道）----
+        # ---- 名片（姓名 / 电话；二维码图片落服务器）----
         if path == f"{PREFIX}/profile" and method == "GET":
             if not auth_house():
                 return True
@@ -225,11 +384,132 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
                 qr_path=str(body.get("qrPath") or ""))
             return send(200, {"ok": True, "profile": prof})
 
-        # ---- 分享记录 ----
+        if path == f"{PREFIX}/profile/qrcode" and method == "POST":
+            if not auth_house():
+                return True
+            raw = read_raw(8 * 1024 * 1024)
+            if raw is None:
+                return send(400, {"ok": False, "error": "bad_or_too_large"})
+            file_name = urllib.parse.unquote(handler.headers.get("X-File-Name") or "qrcode.jpg")
+            try:
+                rel = store.media.save_qrcode(file_name, raw)
+            except ValueError as e:
+                return send(400, {"ok": False, "error": str(e)})
+            prof = store.profile_set(
+                name=store.profile_get().get("name", ""),
+                phone=store.profile_get().get("phone", ""), qr_path=rel)
+            return send(200, {"ok": True, "qrPath": rel, "profile": prof})
+
+        # ---- 分享资源（400px 封面 / 视频首帧），客户端生成后上传 ----
+        if path == f"{PREFIX}/share-asset" and method == "POST":
+            if not auth_house():
+                return True
+            q = _q(handler)
+            room_key = str(q.get("roomKey") or "")
+            file_name = urllib.parse.unquote(str(q.get("filename") or ""))
+            if not room_key or not file_name:
+                return send(400, {"ok": False, "error": "roomKey_filename_required"})
+            raw = read_raw(12 * 1024 * 1024)
+            if raw is None:
+                return send(400, {"ok": False, "error": "bad_or_too_large"})
+            try:
+                rel = store.media.save_share_asset(room_key, file_name, raw)
+            except ValueError as e:
+                return send(400, {"ok": False, "error": str(e)})
+            return send(200, {"ok": True, "objectKey": rel})
+
+        # ---- 在线更新安装包（上传后自动算大小/SHA256）----
+        if path == f"{PREFIX}/release" and method == "POST":
+            if not auth_house():
+                return True
+            import hashlib
+            file_name = urllib.parse.unquote(handler.headers.get("X-File-Name") or "app.ipa")
+            raw = read_raw(300 * 1024 * 1024)
+            if raw is None:
+                return send(400, {"ok": False, "error": "bad_or_too_large"})
+            safe = store.media.save_release(file_name, raw)
+            return send(200, {"ok": True, "fileName": safe,
+                              "size": len(raw),
+                              "sha256": hashlib.sha256(raw).hexdigest(),
+                              "url": f"{PUBLIC_PREFIX}/release/{urllib.parse.quote(safe)}"})
+
+        if path.startswith(f"{PUBLIC_PREFIX}/release/") and method == "GET":
+            name = urllib.parse.unquote(path[len(f"{PUBLIC_PREFIX}/release/"):])
+            data = store.media.read_release(name)
+            if data is None:
+                return send(404, {"ok": False, "error": "not_found"})
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/octet-stream")
+            handler.send_header("Content-Length", str(len(data)))
+            handler.send_header("Content-Disposition", f'attachment; filename="{name}"')
+            handler.send_header("Cache-Control", "no-store")
+            handler.end_headers()
+            try:
+                handler.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return True
+
+        # ---- 分享创建 / 记录 / 获客统计 ----
+        if path == f"{PREFIX}/share/create" and method == "POST":
+            if not auth_house():
+                return True
+            body = handler._read_json()
+            if not isinstance(body, dict):
+                return send(400, {"ok": False, "error": "bad_json"})
+            kind = str(body.get("kind") or "single")
+            if kind not in ("single", "collection", "list"):
+                return send(400, {"ok": False, "error": "bad_kind"})
+            mode = "full" if str(body.get("mode") or "masked") == "full" else "masked"
+            keys = [str(x) for x in (body.get("roomKeys") or []) if str(x)]
+            if kind == "single" and not keys:
+                keys = [str(body.get("roomKey") or "")]
+            keys = [k for k in keys if k]
+            if kind in ("single", "collection") and not keys:
+                return send(400, {"ok": False, "error": "room_keys_required"})
+            days = int(body.get("expiryDays") or (2 if kind == "list" else 3650))
+            profile = store.profile_get()
+            name = str(body.get("name") or profile.get("name") or "梁涛")
+            phone = str(body.get("phone") or profile.get("phone") or "13288251132")
+            summary = str(body.get("summary") or "")
+            if not summary:
+                if kind == "single":
+                    summary = f"单房分享 · {keys[0]}"
+                elif kind == "collection":
+                    summary = f"合集分享 · {len(keys)}套"
+                else:
+                    summary = "公开选房页"
+            rec = store.share_records_add(
+                room_key=keys[0] if len(keys) == 1 else "",
+                channel=str(body.get("channel") or "链接"),
+                summary=summary,
+                operator=str(body.get("operator") or "App"),
+                kind=kind, mode=mode, room_keys=keys,
+                name=name, phone=phone, revoke_list=(kind == "list"))
+            exp = store.share_signer.expires(days)
+            token = store.share_signer.sign(int(rec["id"]), exp)
+            origin = (handler.headers.get("X-Public-Origin") or "").rstrip("/")
+            if not origin:
+                proto = (handler.headers.get("X-Forwarded-Proto") or "http").split(",")[0].strip()
+                host = handler.headers.get("Host") or ""
+                origin = f"{proto}://{host}".rstrip("/")
+            url = f"{origin}/api/public/h5?t={urllib.parse.quote(token)}&v={int(time.time())}"
+            wm = body.get("watermark")
+            if isinstance(wm, dict) and wm:
+                import json as _json
+                url += "&wm=" + urllib.parse.quote(_json.dumps(wm, ensure_ascii=False))
+            rec = store.share_record_finalize(int(rec["id"]), token, url, exp)
+            return send(200, {"ok": True, "share": rec, "url": url})
+
         if path == f"{PREFIX}/share-records" and method == "GET":
             if not auth_house():
                 return True
-            return send(200, {"ok": True, "records": store.share_records_list()})
+            q = _q(handler)
+            try:
+                limit = int(q.get("limit") or 200)
+            except ValueError:
+                limit = 200
+            return send(200, {"ok": True, "records": store.share_records_list(limit)})
 
         if path == f"{PREFIX}/share-records" and method == "POST":
             if not auth_house():
@@ -241,6 +521,16 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
                 summary=str(body.get("summary") or ""),
                 operator=str(body.get("operator") or "未知用户"))
             return send(200, {"ok": True, "record": rec})
+
+        if path == f"{PREFIX}/share-stats" and method == "GET":
+            if not auth_house():
+                return True
+            q = _q(handler)
+            try:
+                days = int(q.get("days") or 30)
+            except ValueError:
+                days = 30
+            return send(200, {"ok": True, **store.share_stats(days)})
 
         # ---- 远程配置 / 在线更新块（服务器权威，本地可改后回写）----
         if path == f"{PREFIX}/config" and method == "GET":

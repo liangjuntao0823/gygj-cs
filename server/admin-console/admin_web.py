@@ -240,6 +240,31 @@ def route_request(handler: Any, method: str, path: str, admin: Any) -> bool:
         _send_json(handler, 200 if res.get("ok") else 400, res)
         return True
 
+    # ---- 远程配置 / 获客分析 / 分享记录（后台与 App 同源）----
+    if path == PREFIX + "/api/config" and method == "GET":
+        _send_json(handler, 200, admin.house.config_get())
+        return True
+    if path == PREFIX + "/api/config" and method == "PUT":
+        body = _read_body(handler)
+        _send_json(handler, 200, admin.house.config_set(body))
+        return True
+    if path == PREFIX + "/api/share-stats" and method == "GET":
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query)
+        try:
+            days = int((q.get("days") or ["30"])[0])
+        except ValueError:
+            days = 30
+        _send_json(handler, 200, admin.house.share_stats(days))
+        return True
+    if path == PREFIX + "/api/share-records" and method == "GET":
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query)
+        try:
+            limit = int((q.get("limit") or ["200"])[0])
+        except ValueError:
+            limit = 200
+        _send_json(handler, 200, admin.house.share_records(limit))
+        return True
+
     # ---- 服务器管理 ----
     if path == PREFIX + "/api/sys/overview" and method == "GET":
         _send_json(handler, 200, {"ok": True, "overview": admin.sys.overview()})

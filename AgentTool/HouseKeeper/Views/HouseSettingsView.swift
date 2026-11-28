@@ -350,8 +350,18 @@ struct ShareProfileView: View {
         return p.isEmpty ? "未设置电话" : p
     }
 
-    /// 二维码只存本机 QrcodeStore，不上传服务器。
-    private func syncQRToCloud(clear: Bool) {}
+    /// 二维码上传服务器 profile/qrcode.<ext>，供 H5 名片长按识别；清除时同步清空服务器引用。
+    private func syncQRToCloud(clear: Bool) {
+        guard HouseServerMode.ready else { return }
+        Task {
+            let profile = ShareProfileStore.load()
+            if clear {
+                try? await HouseRemoteClient.shared.putProfile(name: profile.name, phone: profile.phone, qrPath: "")
+            } else {
+                _ = await ShareAssetUploader.ensureQRCode()
+            }
+        }
+    }
 
     var body: some View {
         Form {
@@ -412,7 +422,7 @@ struct ShareProfileView: View {
                 .padding(.top, 4)
             }
 
-            Section(header: Text("名片信息"), footer: Text("姓名、电话只保存在本机钥匙串，不上传服务器。分享链接会把这两项放进链接参数，访客打开时由页面直接显示；服务器不保存姓名和电话。修改并保存后，重新复制/分享链接才会带上新名片，旧链接保持原样。")) {
+            Section(header: Text("名片信息"), footer: Text("姓名、电话保存在本机钥匙串，同时作为分享名片快照写入服务器分享记录；H5 页面由服务器直接显示，微信卡片描述也使用这份名片。修改并保存后，新生成的链接才带新名片，旧链接保持原样。")) {
                 TextField("姓名（只存本机）", text: $shareName)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
@@ -428,7 +438,7 @@ struct ShareProfileView: View {
             }
 
             // 微信二维码只保存在本机，不上传服务器；服务器 H5 不展示二维码。
-            Section(header: Text("微信二维码"), footer: Text("二维码只保存在本机，不上传服务器。服务器分享页不展示二维码；需要发二维码时，请在微信里直接发送这张图片。")) {
+            Section(header: Text("微信二维码"), footer: Text("二维码会压缩为 400px 方形 JPEG 后上传服务器，分享 H5 名片区可直接长按识别；清除后服务器分享页也不再显示。")) {
                 PhotosPicker(selection: $qrPickerItem, matching: .images) {
                     Label(qrImage == nil ? "选择二维码图片" : "更换二维码图片", systemImage: "qrcode")
                 }
@@ -483,7 +493,14 @@ struct ShareProfileView: View {
     }
 
     /// 姓名/电话只存本机钥匙串，不上传服务器。
-    private func syncProfileToCloud(name: String, phone: String) {}
+    private func syncProfileToCloud(name: String, phone: String) {
+        guard HouseServerMode.ready else { return }
+        Task {
+            let existingQR = (try? await HouseRemoteClient.shared.fetchProfile())?["qrPath"] as? String ?? ""
+            try? await HouseRemoteClient.shared.putProfile(name: name, phone: phone, qrPath: existingQR)
+            _ = await ShareAssetUploader.ensureQRCode()
+        }
+    }
 
     /// 保存分享名片信息（姓名/电话）到钥匙串
     private func saveShareProfile() {
@@ -513,7 +530,7 @@ struct ShareProfileView: View {
 /// 选房链接页：生成「公开选房 H5」链接（云函数 ?act=rooms&u=<用户名>），
 /// 复制/分享给租客即可实时查看所有待租房源；改房源、改名片、换二维码后租客刷新即最新。
 struct RoomsShareView: View {
-    @State private var serverLink = ""
+    @State private var serverLink = UserDefaults.standard.string(forKey: "roomsShare.listURL") ?? ""
     @State private var linkTip: String?
     @State private var copiedTip: String?
 
@@ -578,19 +595,27 @@ struct RoomsShareView: View {
         }
     }
 
-    /// 选房页由服务器本地托管静态壳，长期有效，房源/名片刷新即最新；旧对象存储 H5 壳上传链路已下线。
+    /// 选房页由服务器按签名链路实时渲染：每次重新生成都撤销旧 list 链接，按设置页有效期生效。
     private func refreshLink() async {
-        if HouseServerMode.ready {
-            if let h5 = HouseRemoteClient.h5URL() {
-                serverLink = h5.absoluteString
-                linkTip = "链接长期有效；房源、名片或二维码更新后，租客刷新页面即为最新"
-            } else {
-                serverLink = ""
-                linkTip = "尚未接入服务器：请到「云端配置」检查服务器地址或账号绑定"
-            }
+        guard HouseServerMode.ready else {
+            serverLink = ""
+            linkTip = "尚未接入服务器：请到「云端配置」检查服务器地址或账号绑定"
             return
         }
-        serverLink = ""
-        linkTip = "尚未接入服务器：请到「云端配置」检查服务器地址或账号绑定"
+        let days = max(1, UserDefaults.standard.integer(forKey: "roomsLinkExpiryDays") == 0
+                       ? 2 : UserDefaults.standard.integer(forKey: "roomsLinkExpiryDays"))
+        _ = await ShareAssetUploader.ensureQRCode()
+        do {
+            let url = try await HouseRemoteClient.shared.createShare(
+                kind: "list", roomKeys: [], mode: "masked",
+                expiryDays: days, watermark: ShareAssetUploader.watermarkDict(),
+                summary: "公开选房页")
+            serverLink = url.absoluteString
+            UserDefaults.standard.set(serverLink, forKey: "roomsShare.listURL")
+            linkTip = "链接有效期 \(days) 天；重新生成后旧链接立即失效"
+        } catch {
+            serverLink = ""
+            linkTip = "生成选房链接失败：\(error.localizedDescription)"
+        }
     }
 }

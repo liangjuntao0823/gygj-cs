@@ -1,125 +1,192 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-公寓管家 · 公开分享 H5 静态壳（服务器本地托管，不依赖 COS / 旧云函数）
-=====================================================================
-单页应用：
-  - `/api/public/h5?roomKey=<房号>`  → 单房卡片（户型 / 租金 / 实拍图文视频 / 名片）
-  - `/api/public/h5`                → 公开选房列表（全部待租房源，脱敏）
-数据走免鉴权公开接口：`/api/public/rooms[?roomKey=]`；姓名/电话只从分享链接参数读取，
-媒体走 `/api/public/media/<objectKey>`。页面不含房号 / 房东 / 备注等内部信息。
+"""服务端分享页渲染：单房 / 合集 / 公开选房列表。
+
+H5 由服务端直接输出完整 HTML（微信不执行 JS），媒体与二维码走带签名的
+/api/public/media 路由；og:title / og:description / og:image 用于微信卡片。
 """
 
-HTML = r"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>房源信息</title>
-<style>
-:root{--bg:#f5f6f8;--card:#fff;--ink:#1c1c1e;--sub:#8a8a8e;--line:#ececec;--brand:#2f6fed;--price:#e8543f;--radius:14px}
-*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
-body{background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",sans-serif;padding-bottom:48px}
-.wrap{max-width:640px;margin:0 auto;padding:14px}
-.topbar{position:sticky;top:0;background:rgba(245,246,248,.92);backdrop-filter:blur(8px);padding:12px 14px;display:flex;align-items:center;gap:8px;z-index:5}
-.topbar a{color:var(--brand);text-decoration:none;font-size:16px}
-.topbar h1{font-size:17px;font-weight:600}
-.card{background:var(--card);border-radius:var(--radius);padding:16px;margin-bottom:14px;box-shadow:0 1px 4px rgba(0,0,0,.05)}
-.meta-row{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
-.layout{font-size:20px;font-weight:700}
-.tower{color:var(--sub);font-size:14px}
-.price{font-size:22px;font-weight:700;color:var(--price);margin-left:auto}
-.price small{font-size:13px;font-weight:400;color:var(--sub)}
-.media-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:14px}
-.media-grid figure{border-radius:10px;overflow:hidden;background:#eee;aspect-ratio:4/3}
-.media-grid img,.media-grid video{width:100%;height:100%;object-fit:cover;display:block}
-.badge{display:inline-block;background:#eef3ff;color:var(--brand);font-size:12px;padding:3px 8px;border-radius:6px;margin-left:6px}
-.profile{display:flex;align-items:center;gap:14px;margin-top:4px}
-.profile .who{flex:1}
-.profile .name{font-size:17px;font-weight:600}
-.profile .phone{color:var(--sub);font-size:15px;margin-top:4px}
-.actions{display:flex;gap:10px;margin-top:14px}
-.btn{flex:1;text-align:center;text-decoration:none;border-radius:12px;padding:13px 0;font-size:16px;font-weight:600}
-.btn.call{background:var(--brand);color:#fff}
-.btn.copy{background:#fff;color:var(--brand);border:1px solid var(--brand)}
-.room-item{display:flex;gap:12px;align-items:center;padding:13px 16px;text-decoration:none;color:var(--ink);background:var(--card);border-radius:var(--radius);margin-bottom:12px;box-shadow:0 1px 4px rgba(0,0,0,.05)}
-.room-item .thumb{width:72px;height:72px;border-radius:10px;background:#eee;object-fit:cover;flex:none}
-.room-item .info{flex:1;min-width:0}
-.room-item .info .t{font-size:16px;font-weight:600}
-.room-item .info .s{color:var(--sub);font-size:13px;margin-top:5px}
-.room-item .p{color:var(--price);font-weight:700}
-.empty{text-align:center;color:var(--sub);padding:60px 20px}
-.loading{text-align:center;color:var(--sub);padding:40px}
-</style>
-</head>
-<body>
-<div class="topbar"><a id="back" href="/api/public/h5" style="display:none">‹ 返回</a><h1 id="title">房源信息</h1></div>
-<div class="wrap" id="app"><div class="loading">加载中…</div></div>
-<script>
-function qs(k){var p=new URLSearchParams(location.search);return p.get(k)||""}
-function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
-function mediaUrl(rel){return "/api/public/media/"+encodeURIComponent(rel)}
-function withProfile(href){var n=qs("n"),p=qs("p");if(!n&&!p){return href}return href+(href.indexOf("?")>=0?"&":"?")+"n="+encodeURIComponent(n)+"&p="+encodeURIComponent(p)}
-function mediaTag(m){
-  var url=mediaUrl(m.objectKey||m.fileName||"");
-  if(m.kind==="video"){return '<video src="'+url+'" preload="none" controls playsinline></video>'}
-  return '<img src="'+url+'" alt="" loading="lazy">';
-}
-function localProfile(){
-  // 姓名/电话只随分享链接参数传入，服务器不保存；二维码不上服务器，页面不展示
-  return {name:qs("n"), phone:qs("p")};
-}
-function profileHTML(p){
-  p=p||{};
-  if(!p.name && !p.phone){return ""}
-  var who='<div class="who"><div class="name">'+esc(p.name||"房东")+'</div>'+(p.phone?'<div class="phone">'+esc(p.phone)+'</div>':"")+'</div>';
-  var call=p.phone?'<a class="btn call" href="tel:'+esc(p.phone)+'">拨打电话</a>':"";
-  return '<div class="card"><div class="profile">'+who+'</div>'+(call?'<div class="actions">'+call+'</div>':"")+'</div>';
-}
-async function getJSON(u){var r=await fetch(u);if(r.status===404)return null;if(!r.ok)throw new Error("http "+r.status);return r.json()}
+from __future__ import annotations
 
-async function renderSingle(key){
-  document.getElementById("back").style.display="";
-  document.getElementById("title").textContent="房源详情";
-  var app=document.getElementById("app");
-  try{
-    var d=await getJSON("/api/public/rooms/"+encodeURIComponent(key));
-    // 单房接口直接返回房源对象（没有 ok 字段）；不能再用 !d.ok 判断，否则永远显示“暂不可见”。
-    if(!d || d.ok===false || !d.roomKey){app.innerHTML='<div class="empty">该房源暂不可见</div>';return}
-    var h='<div class="card"><div class="meta-row"><span class="layout">'+esc(d.layout||"户型")+'</span>'+
-      '<span class="tower">'+esc((d.tower||"")+" "+(d.roomNo||""))+'</span>'+
-      '<span class="price">¥'+esc(d.price||"")+'<small> /月</small></span></div>';
-    if(d.media&&d.media.length){h+='<div class="media-grid">'+d.media.map(function(m){return "<figure>"+mediaTag(m)+"</figure>"}).join("")+"</div>"}
-    h+="</div>"+profileHTML(localProfile());
-    app.innerHTML=h;
-  }catch(e){app.innerHTML='<div class="empty">加载失败，请稍后再试</div>'}
-}
+import json
+import time
+import urllib.parse
+from typing import Any
 
-async function renderList(){
-  document.getElementById("back").style.display="none";
-  document.getElementById("title").textContent="在租房源";
-  var app=document.getElementById("app");
-  try{
-    var d=await getJSON("/api/public/rooms");
-    var rooms=d.rooms||[];
-    if(!rooms.length){app.innerHTML='<div class="empty">暂无可看房源</div>';return}
-    var h=rooms.map(function(r){
-      var thumb=r.media&&r.media.length?'<img class="thumb" src="'+mediaUrl((r.media.find(function(m){return m.kind!=="video"})||r.media[0]).objectKey)+'">':"";
-      return '<a class="room-item" href="'+esc(withProfile("/api/public/h5?roomKey="+encodeURIComponent(r.roomKey)))+'">'+thumb+
-        '<div class="info"><div class="t">'+esc(r.layout||"户型")+'</div><div class="s">'+esc((r.tower||"")+" "+(r.roomNo||""))+'</div></div>'+
-        '<div class="p">¥'+esc(r.price||"")+'</div></a>';
-    }).join("");
-    app.innerHTML=h+profileHTML(localProfile());
-  }catch(e){app.innerHTML='<div class="empty">加载失败，请稍后再试</div>'}
-}
-
-var key=qs("roomKey");
-if(key){renderSingle(key)}else{renderList()}
-</script>
-</body>
-</html>
-"""
+import h5_templates as tpl
 
 
-def page_html() -> str:
-    return HTML
+def _origin(handler: Any) -> str:
+    proto = (handler.headers.get("X-Forwarded-Proto") or "http").split(",")[0].strip()
+    host = (handler.headers.get("X-Forwarded-Host") or handler.headers.get("Host") or "")
+    return f"{proto}://{host}".rstrip("/")
+
+
+def media_url(origin: str, rel: str, token: str) -> str:
+    return f"{origin}/api/public/media/{urllib.parse.quote(rel)}?t={urllib.parse.quote(token)}"
+
+
+def page_url(origin: str, token: str) -> str:
+    return f"{origin}/api/public/h5?t={urllib.parse.quote(token)}&v={int(time.time())}"
+
+
+def _display_room_no(tower: int, room_no: str) -> str:
+    prefix = "2-" if int(tower or 1) == 2 else "1-"
+    raw = str(room_no or "")
+    for p in ("1-", "2-"):
+        if raw.startswith(p):
+            raw = raw[2:]
+    return prefix + raw
+
+
+def _layout_title(layout: str, room_no: str) -> str:
+    suffix = "".join(ch for ch in str(room_no or "") if not ch.isdigit() and ch not in "- . /")
+    title = layout or "房源"
+    if suffix and ("上" not in title and "下" not in title) and not title.endswith(suffix):
+        title += " · " + suffix
+    return title
+
+
+def _watermark_html(wm: dict[str, Any] | None) -> str:
+    if not isinstance(wm, dict) or not wm.get("enabled"):
+        return ""
+    text = str(wm.get("text") or "").strip()
+    if not text:
+        return ""
+    position = str(wm.get("position") or "bottomRight")
+    x = max(0, int(wm.get("offsetX") or 0))
+    y = max(0, int(wm.get("offsetY") or 0))
+    placement = {
+        "bottomRight": f"right:{x}px;bottom:{y}px;",
+        "bottomLeft": f"left:{x}px;bottom:{y}px;",
+        "topRight": f"right:{x}px;top:{y}px;",
+        "topLeft": f"left:{x}px;top:{y}px;",
+    }.get(position, f"right:{x}px;bottom:{y}px;")
+    opacity = max(0.0, min(1.0, float(wm.get("opacity") or 0.5)))
+    size = max(8, min(48, int(wm.get("fontSize") or 14)))
+    return (f'<div class="wm" style="position:absolute;{placement}color:rgba(255,255,255,{opacity});'
+            f'font-size:{size}px;font-weight:500;line-height:1;text-shadow:0 1px 2px rgba(0,0,0,.35);'
+            f'pointer-events:none;user-select:none;z-index:2;max-width:70%;overflow:hidden;'
+            f'text-overflow:ellipsis;white-space:nowrap;">{tpl.esc(text)}</div>')
+
+
+def _track_script(origin: str, token: str, room: str, mode: str) -> str:
+    room_js = json.dumps(room, ensure_ascii=False)
+    mode_js = json.dumps(mode, ensure_ascii=False)
+    base = json.dumps(f"{origin}/api/public/track?t={urllib.parse.quote(token)}", ensure_ascii=False)
+    return f'''<script>(function(){{try{{var u={base};var k='gy_tk_'+encodeURIComponent({room_js})+'_'+encodeURIComponent({mode_js});var now=Date.now(),last=0;try{{last=parseInt(localStorage.getItem(k)||'0',10)||0;}}catch(e){{}}if(now-last<30000)return;try{{localStorage.setItem(k,String(now));}}catch(e){{}}var r=(document.referrer||'').slice(0,120);var img=new Image();img.src=u+'&room='+encodeURIComponent({room_js})+'&mode='+encodeURIComponent({mode_js})+'&ref='+encodeURIComponent(r);}}catch(e){{}}}})();</script>'''
+
+
+def _room_view(store: Any, origin: str, token: str, room_key: str, mode: str) -> dict[str, Any] | None:
+    doc = store.public_single(room_key, mode=mode)
+    if not doc:
+        return None
+    rk = doc["roomKey"]
+    media = sorted(doc.get("media") or [],
+                   key=lambda m: (0 if m["kind"] == "video" else 1, m.get("sortOrder", 0)))
+    images = [m for m in media if m["kind"] != "video"]
+    videos = [m for m in media if m["kind"] == "video"]
+    image_urls = [media_url(origin, m["objectKey"], token) for m in images]
+    video_tags = []
+    for m in videos:
+        video_url = media_url(origin, m["objectKey"], token)
+        thumb_rel = store.media.find_share_asset(rk, m["fileName"] + ".vthumb.jpg")
+        thumb_url = media_url(origin, thumb_rel, token) if thumb_rel else video_url
+        video_tags.append(tpl.video_tag(video_url, thumb_url))
+    cover_rel = store.media.find_share_asset(rk, "cover.jpg")
+    if not cover_rel and images:
+        cover_rel = images[0]["objectKey"]
+    cover = media_url(origin, cover_rel, token) if cover_rel else ""
+    display = _display_room_no(doc.get("tower", 1), doc.get("roomNo", "")) if mode == "full" else ""
+    return {
+        "roomKey": rk,
+        "displayRoomNo": display,
+        "layout": doc.get("layout") or "房源",
+        "title": _layout_title(doc.get("layout") or "房源", doc.get("roomNo", "")),
+        "price": int(doc.get("price") or 0),
+        "priceText": f"¥{int(doc.get('price') or 0)}",
+        "landlord": doc.get("landlord") or "",
+        "password": doc.get("password") or "",
+        "remark": doc.get("remark") or "",
+        "video_tags": video_tags,
+        "image_urls": image_urls,
+        "cover_url": cover,
+    }
+
+
+def _qr(store: Any, origin: str, token: str) -> str:
+    profile = store.profile_get()
+    rel = profile.get("qrPath") or ""
+    if rel and store.media.read_rel(rel):
+        return media_url(origin, rel, token)
+    return ""
+
+
+def render_single(store: Any, handler: Any, token: str, room_key: str,
+                  mode: str, wm: dict[str, Any] | None = None) -> str:
+    origin = _origin(handler)
+    profile = store.profile_get()
+    name = profile.get("name") or "梁涛"
+    phone = profile.get("phone") or "13288251132"
+    room = _room_view(store, origin, token, room_key, mode)
+    if not room:
+        return tpl.simple_error("该房源暂不可见", "房源已出租或已下架，请联系房东获取最新房源。")
+    share_url = page_url(origin, token)
+    wm_html = _watermark_html(wm)
+    track = _track_script(origin, token, room_key, mode)
+    if mode == "full":
+        desc = (f"{room['priceText']} · {room['landlord']}\n{name}-{phone}"
+                if room["landlord"] else f"{room['priceText']}\n{name}-{phone}")
+        title = f"{room['displayRoomNo']} · {room['title']}"
+        return tpl.full_single(title, desc, room, name, phone, room["video_tags"],
+                               room["image_urls"], room["cover_url"], _qr(store, origin, token),
+                               share_url, wm_html, track)
+    desc = f"利保米兰公馆\n{name}-{phone}"
+    return tpl.masked_single(room["title"], desc, name, phone, room["video_tags"],
+                             room["image_urls"], room["cover_url"], _qr(store, origin, token),
+                             share_url, wm_html, track)
+
+
+def render_collection(store: Any, handler: Any, token: str,
+                      room_keys: list[str], mode: str,
+                      wm: dict[str, Any] | None = None) -> str:
+    origin = _origin(handler)
+    profile = store.profile_get()
+    name = profile.get("name") or "梁涛"
+    phone = profile.get("phone") or "13288251132"
+    rooms = []
+    for rk in room_keys:
+        room = _room_view(store, origin, token, rk, mode)
+        if room:
+            rooms.append(room)
+    if not rooms:
+        return tpl.simple_error("该分享暂不可见", "房源已出租或已下架，请联系房东获取最新房源。")
+    share_url = page_url(origin, token)
+    cover = rooms[0]["cover_url"]
+    track = _track_script(origin, token, "collection", mode)
+    return tpl.collection(rooms, mode, name, phone, cover, _qr(store, origin, token),
+                          share_url, _watermark_html(wm), track)
+
+
+def render_list(store: Any, handler: Any, token: str, mode: str = "masked",
+                wm: dict[str, Any] | None = None) -> str:
+    origin = _origin(handler)
+    profile = store.profile_get()
+    name = profile.get("name") or "梁涛"
+    phone = profile.get("phone") or "13288251132"
+    rooms = []
+    for doc in store.public_rooms(mode="masked"):
+        rk = doc["roomKey"]
+        cover_rel = store.media.find_share_asset(rk, "cover.jpg")
+        if not cover_rel:
+            first_img = next((m for m in doc.get("media") or [] if m["kind"] != "video"), None)
+            cover_rel = first_img["objectKey"] if first_img else ""
+        rooms.append({
+            "roomKey": rk, "layout": doc.get("layout") or "房源",
+            "cover_url": media_url(origin, cover_rel, token) if cover_rel else "",
+            "share_url": f"{page_url(origin, token)}&roomKey={urllib.parse.quote(rk)}",
+        })
+    cover = rooms[0]["cover_url"] if rooms else ""
+    track = _track_script(origin, token, "rooms", "rooms")
+    return tpl.rooms_list(rooms, name, phone, _qr(store, origin, token),
+                          page_url(origin, token), cover, _watermark_html(wm), track)

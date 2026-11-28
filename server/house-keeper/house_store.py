@@ -122,7 +122,27 @@ CREATE TABLE IF NOT EXISTS share_records (
   ts TEXT NOT NULL,
   channel TEXT NOT NULL DEFAULT '',
   summary TEXT NOT NULL DEFAULT '',
-  operator TEXT NOT NULL DEFAULT ''
+  operator TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL DEFAULT 'single',
+  mode TEXT NOT NULL DEFAULT 'masked',
+  room_keys TEXT NOT NULL DEFAULT '[]',
+  token TEXT NOT NULL DEFAULT '',
+  url TEXT NOT NULL DEFAULT '',
+  name TEXT NOT NULL DEFAULT '',
+  phone TEXT NOT NULL DEFAULT '',
+  expires_at INTEGER NOT NULL DEFAULT 0,
+  revoked INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS share_visits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  share_id INTEGER NOT NULL DEFAULT 0,
+  room_key TEXT NOT NULL DEFAULT '',
+  mode TEXT NOT NULL DEFAULT '',
+  ref TEXT NOT NULL DEFAULT '',
+  visitor TEXT NOT NULL DEFAULT '',
+  ip_hash TEXT NOT NULL DEFAULT '',
+  ua TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS ops (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -206,6 +226,8 @@ class HouseStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.media = ms.MediaStore(media_root or (self.path.parent / "media"))
         self.backups = bs.BackupStore(backup_root or (self.path.parent / "backups"))
+        from share_auth import ShareSigner
+        self.share_signer = ShareSigner(self.path.parent / "share_secret")
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -213,6 +235,7 @@ class HouseStore:
         self._conn.execute("PRAGMA foreign_keys=ON;")
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            self._migrate_share_schema()
             self._conn.commit()
         try:
             self.path.chmod(0o600)
@@ -222,6 +245,29 @@ class HouseStore:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    def _migrate_share_schema(self) -> None:
+        """老库平滑升级：share_records 补字段，不改已有记录。"""
+        columns = {
+            "kind": "TEXT NOT NULL DEFAULT 'single'",
+            "mode": "TEXT NOT NULL DEFAULT 'masked'",
+            "room_keys": "TEXT NOT NULL DEFAULT '[]'",
+            "token": "TEXT NOT NULL DEFAULT ''",
+            "url": "TEXT NOT NULL DEFAULT ''",
+            "name": "TEXT NOT NULL DEFAULT ''",
+            "phone": "TEXT NOT NULL DEFAULT ''",
+            "expires_at": "INTEGER NOT NULL DEFAULT 0",
+            "revoked": "INTEGER NOT NULL DEFAULT 0",
+        }
+        existing = {r["name"] for r in self._conn.execute(
+            "PRAGMA table_info(share_records)").fetchall()}
+        for name, ddl in columns.items():
+            if name not in existing:
+                self._conn.execute(f"ALTER TABLE share_records ADD COLUMN {name} {ddl}")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_share_token ON share_records(token)")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_share_visit_ts ON share_visits(ts)")
 
     # ------------------------------------------------------------------
     # 读取
@@ -1068,31 +1114,135 @@ class HouseStore:
             return True
 
     def share_records_add(self, room_key: str, channel: str, summary: str,
-                          operator: str) -> dict[str, Any]:
+                          operator: str, *, kind: str = "single",
+                          mode: str = "masked", room_keys: list[str] | None = None,
+                          token: str = "", url: str = "", name: str = "",
+                          phone: str = "", expires_at: int = 0,
+                          revoke_list: bool = False) -> dict[str, Any]:
+        if revoke_list and kind == "list":
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE share_records SET revoked=1 WHERE kind='list' AND revoked=0")
+                self._conn.commit()
+        rk_json = json.dumps(room_keys or [], ensure_ascii=False)
         with self._lock:
             cur = self._conn.execute(
-                "INSERT INTO share_records (room_key,ts,channel,summary,operator) "
-                "VALUES (?,?,?,?,?)",
-                (room_key, iso(now_local()), channel, summary, operator))
+                "INSERT INTO share_records "
+                "(room_key,ts,channel,summary,operator,kind,mode,room_keys,token,url,name,phone,expires_at,revoked) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                (room_key, iso(now_local()), channel, summary, operator,
+                 kind, mode, rk_json, token, url, name, phone, int(expires_at)))
             self._conn.commit()
             rec = {"id": cur.lastrowid, "roomKey": room_key,
                    "ts": iso(now_local()), "channel": channel,
-                   "summary": summary, "operator": operator}
+                   "summary": summary, "operator": operator,
+                   "kind": kind, "mode": mode, "roomKeys": room_keys or [],
+                   "token": token, "url": url, "name": name, "phone": phone,
+                   "expiresAt": int(expires_at), "revoked": False}
         return rec
 
+    def share_record_finalize(self, share_id: int, token: str, url: str,
+                              expires_at: int) -> dict[str, Any] | None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE share_records SET token=?,url=?,expires_at=? WHERE id=?",
+                (token, url, int(expires_at), int(share_id)))
+            self._conn.commit()
+        return self.share_record_get(share_id)
+
+    def share_record_get(self, share_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM share_records WHERE id=?", (int(share_id),)).fetchone()
+        return self._share_row(row) if row else None
+
+    def share_record_by_token(self, token: str) -> dict[str, Any] | None:
+        if not token:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM share_records WHERE token=?", (token,)).fetchone()
+        return self._share_row(row) if row else None
+
     def share_records_list(self, limit: int = 200) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit or 200), 500))
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id,room_key,ts,channel,summary,operator FROM share_records "
-                "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-        return [{"id": r["id"], "roomKey": r["room_key"], "ts": r["ts"],
-                 "channel": r["channel"], "summary": r["summary"],
-                 "operator": r["operator"]} for r in rows]
+                "SELECT * FROM share_records ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [self._share_row(r) for r in rows]
+
+    def share_records_revoke_all(self, kind: str = "list") -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE share_records SET revoked=1 WHERE kind=? AND revoked=0", (kind,))
+            self._conn.commit()
+            return int(cur.rowcount or 0)
+
+    def share_visit_add(self, share_id: int, room_key: str, mode: str,
+                        ref: str, visitor: str, ip_hash: str, ua: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO share_visits (ts,share_id,room_key,mode,ref,visitor,ip_hash,ua) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (iso(now_local()), int(share_id or 0), room_key[:120], mode[:20],
+                 ref[:160], visitor[:60], ip_hash[:64], ua[:160]))
+            self._conn.commit()
+
+    def share_stats(self, days: int = 30) -> dict[str, Any]:
+        """获客分析：按天、分享方式、来源、房源汇总；不含原始 IP。"""
+        days = max(1, min(int(days or 30), 365))
+        since = (now_local() - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00+08:00")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ts,share_id,room_key,mode,ref,visitor FROM share_visits "
+                "WHERE ts>=? ORDER BY id DESC", (since,)).fetchall()
+            share_count = self._conn.execute(
+                "SELECT COUNT(*) c FROM share_records WHERE ts>=?", (since,)).fetchone()["c"]
+        daily: dict[str, int] = {}
+        modes: dict[str, int] = {}
+        rooms: dict[str, int] = {}
+        refs: dict[str, int] = {}
+        visitors: set[str] = set()
+        for r in rows:
+            day = str(r["ts"])[:10]
+            daily[day] = daily.get(day, 0) + 1
+            modes[r["mode"] or "unknown"] = modes.get(r["mode"] or "unknown", 0) + 1
+            if r["room_key"]:
+                rooms[r["room_key"]] = rooms.get(r["room_key"], 0) + 1
+            ref = (r["ref"] or "").split("?")[0][:80] or "直接打开/无来源"
+            refs[ref] = refs.get(ref, 0) + 1
+            if r["visitor"]:
+                visitors.add(str(r["visitor"]))
+        return {
+            "days": days,
+            "visits": len(rows),
+            "visitors": len(visitors),
+            "shares": int(share_count),
+            "daily": [{"date": k, "visits": v} for k, v in sorted(daily.items())],
+            "modes": [{"mode": k, "visits": v} for k, v in sorted(modes.items(), key=lambda x: -x[1])],
+            "rooms": [{"roomKey": k, "visits": v} for k, v in sorted(rooms.items(), key=lambda x: -x[1])][:30],
+            "refs": [{"ref": k, "visits": v} for k, v in sorted(refs.items(), key=lambda x: -x[1])][:30],
+        }
+
+    def _share_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            room_keys = json.loads(row["room_keys"] or "[]")
+        except Exception:
+            room_keys = []
+        return {
+            "id": row["id"], "roomKey": row["room_key"], "ts": row["ts"],
+            "channel": row["channel"], "summary": row["summary"],
+            "operator": row["operator"], "kind": row["kind"],
+            "mode": row["mode"], "roomKeys": room_keys,
+            "token": row["token"], "url": row["url"],
+            "name": row["name"], "phone": row["phone"],
+            "expiresAt": row["expires_at"], "revoked": bool(row["revoked"]),
+        }
 
     # ------------------------------------------------------------------
     # 公开选房（脱敏，免鉴权；H5 / 公开链接用）
     # ------------------------------------------------------------------
-    def public_rooms(self) -> list[dict[str, Any]]:
+    def public_rooms(self, mode: str = "masked") -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT room_key,room_no,tower,layout,price,status FROM houses "
@@ -1102,31 +1252,40 @@ class HouseStore:
             out = []
             for r in rows:
                 media = media_map.get(r["room_key"], [])
-                out.append({
-                    "roomKey": r["room_key"], "roomNo": r["room_no"],
-                    "tower": r["tower"], "layout": r["layout"],
-                    "price": r["price"], "status": r["status"],
+                item = {
+                    "roomKey": r["room_key"], "layout": r["layout"],
+                    "status": r["status"],
                     "media": [{"objectKey": m["objectKey"], "fileName": m["fileName"],
                                "kind": m["kind"], "sortOrder": m["sortOrder"]}
                               for m in media],
-                })
+                }
+                if mode == "full":
+                    item.update({"roomNo": r["room_no"], "tower": r["tower"],
+                                 "price": r["price"]})
+                out.append(item)
         return out
 
-    def public_single(self, room_key: str) -> dict[str, Any] | None:
-        """公开只读单房（脱敏，免鉴权；单房分享 H5 用）。仅待租、未删。"""
+    def public_single(self, room_key: str, mode: str = "masked") -> dict[str, Any] | None:
+        """公开只读单房；masked 不含房号/租金/房东/密码/备注，full 全量。仅待租、未删。"""
         with self._lock:
             row = self._conn.execute(
-                "SELECT room_key,room_no,tower,layout,price,status FROM houses "
+                "SELECT room_key,room_no,tower,layout,price,password,remark,landlord,status FROM houses "
                 "WHERE room_key=? AND is_deleted=0 AND status='available'",
                 (room_key,)).fetchone()
             if row is None:
                 return None
             media = self._media(self._conn, row["room_key"])
-            return {
-                "roomKey": row["room_key"], "roomNo": row["room_no"],
-                "tower": row["tower"], "layout": row["layout"],
-                "price": row["price"], "status": row["status"],
+            item = {
+                "roomKey": row["room_key"], "layout": row["layout"],
+                "status": row["status"],
                 "media": [{"objectKey": m["objectKey"], "fileName": m["fileName"],
                            "kind": m["kind"], "sortOrder": m["sortOrder"]}
                           for m in media],
             }
+            if mode == "full":
+                item.update({
+                    "roomNo": row["room_no"], "tower": row["tower"],
+                    "price": row["price"], "password": row["password"],
+                    "remark": row["remark"], "landlord": row["landlord"],
+                })
+            return item

@@ -1626,20 +1626,35 @@ struct HouseListView: View {
             name: profile.name,
             phone: profile.phone
         )
-        // 服务器模式：App 内分享——本地媒体 + 服务器 H5 链接 + 纯文字，直接系统面板
+        // 服务器模式：只发一个带签名的 H5 链接
         if HouseServerMode.ready {
-            let urls: [URL] = files.compactMap { f in
-                let u = MediaStore.url(for: f.name, roomKey: roomKey)
-                return FileManager.default.fileExists(atPath: u.path) ? u : nil
+            isGenerating = true
+            generateTip = "正在生成分享链接…"
+            generateProgress = 0.35
+            Task {
+                await ShareAssetUploader.prepare(roomKeys: [roomKey], mediaByRoom: [files])
+                _ = await ShareAssetUploader.ensureQRCode()
+                do {
+                    let url = try await HouseRemoteClient.shared.createShare(
+                        kind: "single", roomKeys: [roomKey], mode: mode.rawValue,
+                        expiryDays: 3650, watermark: ShareAssetUploader.watermarkDict(),
+                        summary: info.shareText(mode: mode))
+                    await MainActor.run {
+                        isGenerating = false
+                        shareQueue = [[url]]
+                        shareIndex = 0
+                        presentShareStep([url])
+                        singleShareHouse = nil
+                    }
+                } catch {
+                    await MainActor.run {
+                        isGenerating = false
+                        infoMessage = error.localizedDescription
+                        showInfoAlert = true
+                        singleShareHouse = nil
+                    }
+                }
             }
-            var items: [Any] = urls
-            if let h5 = HouseRemoteClient.h5URL(roomKey: roomKey) { items.append(h5) }
-            items.append(info.shareText)
-            shareQueue = [items]
-            shareIndex = 0
-            presentShareStep(items)
-            singleShareHouse = nil
-            Task { try? await HouseRepository.shared.addShareRecord(roomKey: roomKey, channel: "app内分享", summary: info.shareText) }
             return
         }
         // 旧桶卡片链接已下线：未接入服务器回退本地媒体 + 纯文字系统分享
@@ -1680,41 +1695,44 @@ struct HouseListView: View {
             return a.roomNo < b.roomNo
         }
 
-        // 服务器模式：App 内分享——每套一批（本地媒体 + 该套纯文字），依次弹系统面板；不生成合集 H5 链接
+        // 服务器模式：合集=一个带签名的 H5 链接（一次发给好友，点开看 N 套）
         if HouseServerMode.ready {
-            var batches: [[Any]] = []
-            var records: [(roomKey: String, summary: String)] = []
-            for house in sortedShareable {
-                let roomKey = house.mediaRoomKey
-                let profile = ShareProfileStore.load()
-                let info = ShareHouseInfo(
-                    displayRoomNo: house.displayRoomNo,
-                    towerLabel: house.towerLabel,
-                    layout: house.layout,
-                    statusLabel: house.status.label,
-                    priceText: house.priceText,
-                    landlord: house.landlord,
-                    password: house.password,
-                    remark: house.remark,
-                    name: profile.name,
-                    phone: profile.phone
-                )
-                let urls = house.mediaItems.compactMap { item -> URL? in
-                    let u = MediaStore.url(for: item.fileName, roomKey: roomKey)
-                    return FileManager.default.fileExists(atPath: u.path) ? u : nil
-                }
-                var batch: [Any] = urls
-                if let h5 = HouseRemoteClient.h5URL() { batch.append(h5) }
-                batch.append(info.shareText)
-                batches.append(batch)
-                records.append((roomKey, info.shareText))
+            isGenerating = true
+            generateTip = "正在生成合集链接…"
+            generateProgress = 0.35
+            let roomKeys = sortedShareable.map { $0.mediaRoomKey }
+            let mediaByRoom = sortedShareable.map { h in
+                h.mediaItems.map { ShareMediaFile(name: $0.fileName, kind: $0.kind) }
             }
-            shareQueue = batches
-            shareIndex = 0
-            presentShareStep(batches[0])
+            let summaries = sortedShareable.map { h in
+                ShareHouseInfo(
+                    displayRoomNo: h.displayRoomNo, towerLabel: h.towerLabel,
+                    layout: h.layout, statusLabel: h.status.label,
+                    priceText: h.priceText, landlord: h.landlord,
+                    password: h.password, remark: h.remark,
+                    name: ShareProfileStore.load().name, phone: ShareProfileStore.load().phone
+                ).shareText(mode: mode)
+            }
             Task {
-                for rec in records {
-                    try? await HouseRepository.shared.addShareRecord(roomKey: rec.roomKey, channel: "app内分享", summary: rec.summary)
+                await ShareAssetUploader.prepare(roomKeys: roomKeys, mediaByRoom: mediaByRoom)
+                _ = await ShareAssetUploader.ensureQRCode()
+                do {
+                    let url = try await HouseRemoteClient.shared.createShare(
+                        kind: "collection", roomKeys: roomKeys, mode: mode.rawValue,
+                        expiryDays: 3650, watermark: ShareAssetUploader.watermarkDict(),
+                        summary: "合集分享 · \(roomKeys.count)套\n" + summaries.joined(separator: "\n"))
+                    await MainActor.run {
+                        isGenerating = false
+                        shareQueue = [[url]]
+                        shareIndex = 0
+                        presentShareStep([url])
+                    }
+                } catch {
+                    await MainActor.run {
+                        isGenerating = false
+                        infoMessage = error.localizedDescription
+                        showInfoAlert = true
+                    }
                 }
             }
             return

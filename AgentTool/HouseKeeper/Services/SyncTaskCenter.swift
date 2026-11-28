@@ -143,6 +143,8 @@ struct HouseUploadRollback: Codable, Equatable {
     var removed: [HouseUploadMediaRef]
     /// 本次账本事件 id（撤回时从 pending 与正式账本移除）
     var ledgerEventIds: [String]
+    /// 本次删除媒体的本机暂存区 id（撤回时还原；成功后清掉）
+    var stashID: String? = nil
 }
 
 // MARK: - v2.52 上传任务句柄登记（取消按钮靠它真正中断 Task）
@@ -374,11 +376,93 @@ func begin(id: UUID,
                           room: item.roomKeys.first ?? "", cloud: false)
     }
 
-    /// 「彻底取消」：旧链的本地+云端全量撤回随旧桶下线；历史任务这里仅删除任务条目，不再回滚改动。
+    /// 「彻底取消」：有回滚载荷的新任务按场景真撤回；旧任务没有快照，只删条目并留痕说明。
     func revoke(id: UUID, houseContext: ModelContext?) {
         guard let idx = failed.firstIndex(where: { $0.id == id }) else { return }
+        let item = failed[idx]
+        guard let rollback = item.rollback else {
+            purge(id: id)
+            BackupLogStore.log(category: "任务", action: "删除旧任务记录", result: "成功",
+                               detail: "「\(item.title)」是历史任务，没有改动前快照，只能删除任务记录；房源未被改动",
+                               room: item.roomKeys.first ?? "", cloud: false)
+            return
+        }
         failed.remove(at: idx)
         persist()
+        Task { @MainActor in
+            let ok = await Self.performRollback(rollback)
+            BackupLogStore.log(category: "任务", action: "撤回本次改动", result: ok ? "成功" : "部分失败",
+                               detail: ok
+                                 ? "已把「\(item.title)」的本次改动撤回：本机与服务器都恢复到保存前"
+                                 : "「\(item.title)」已尽量撤回；服务器不可达或部分媒体已被替换，请刷新房源核对",
+                               room: rollback.roomKey, cloud: true)
+            NotificationCenter.default.post(name: NSNotification.Name("HouseStoreChanged"), object: nil)
+        }
+    }
+
+    /// 按场景撤回：newHouse 整套删除；rename 恢复旧房号并重建服务器旧记录；plainEdit 恢复字段并删新增媒体。
+    private static func performRollback(_ rb: HouseUploadRollback) async -> Bool {
+        var ok = true
+        let repo = HouseRepository.shared
+        switch rb.scene {
+        case .newHouse:
+            if let house = repo.fetch(roomKey: rb.roomKey) {
+                repo.delete(house)
+                try? repo.save()
+            }
+            MediaStore.deleteHouseDirectory(roomKey: rb.roomKey)
+            do { try await repo.deleteRemote(rb.roomKey) } catch { ok = false }
+            HouseLedgerStore.purgeEventsLocal(roomKey: rb.roomKey, eventIds: Set(rb.ledgerEventIds))
+        case .rename:
+            MediaStore.migrateHouseDirectory(from: rb.roomKey, to: rb.oldRoomKey)
+            if let house = repo.fetch(roomKey: rb.roomKey), let before = rb.before {
+                apply(before, to: house)
+                try? repo.save()
+                do {
+                    _ = try await repo.push(house)
+                    try await repo.deleteRemote(rb.roomKey)
+                } catch { ok = false }
+            }
+            HouseLedgerStore.purgeEventsLocal(roomKey: rb.oldRoomKey, eventIds: Set(rb.ledgerEventIds))
+        case .plainEdit:
+            if let house = repo.fetch(roomKey: rb.roomKey) {
+                if let before = rb.before { apply(before, to: house) }
+                for ref in rb.added {
+                    if let item = house.mediaItems.first(where: { $0.fileName == ref.fileName }) {
+                        repo.delete(item)
+                    }
+                    MediaStore.delete(fileName: ref.fileName, roomKey: rb.roomKey)
+                    try? await HouseRemoteClient.shared.deleteMedia(roomKey: rb.roomKey, fileName: ref.fileName)
+                }
+                if let stashID = rb.stashID {
+                    for ref in rb.removed {
+                        if MediaStore.restoreFromRollback(fileName: ref.fileName, roomKey: rb.roomKey, stashID: stashID) {
+                            let item = MediaItem(fileName: ref.fileName, kind: ref.kind)
+                            item.house = house
+                            repo.insert(item)
+                        }
+                    }
+                    MediaStore.clearRollbackStash(stashID)
+                }
+                try? repo.save()
+                do { _ = try await repo.push(house) } catch { ok = false }
+            }
+            HouseLedgerStore.purgeEventsLocal(roomKey: rb.roomKey, eventIds: Set(rb.ledgerEventIds))
+        }
+        HouseLedgerStore.removePendingEvents(roomKey: rb.roomKey, eventIds: Set(rb.ledgerEventIds))
+        return ok
+    }
+
+    private static func apply(_ before: HouseUploadBeforeSnapshot, to house: House) {
+        house.roomNo = before.roomNo
+        house.tower = before.tower
+        house.landlord = before.landlord
+        house.layout = before.layout
+        house.price = before.price
+        house.password = before.password
+        house.remark = before.remark
+        house.statusRaw = before.statusRaw
+        house.updatedAt = Date()
     }
 
     // MARK: 临时进度（总刷新 / 整次同步，不进任务中心）

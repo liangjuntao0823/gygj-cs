@@ -255,8 +255,8 @@ struct SettingsView: View {
             } label: {
                 Label {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("重建全部分享链接")
-                        Text("清掉云端旧分享页后逐间重建；已经发出去的旧链接会立即失效")
+                        Text("刷新全部分享素材")
+                        Text("重传每套封面/视频首帧与二维码；旧链接继续有效，打开即最新")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -871,6 +871,8 @@ struct SettingsView: View {
                                 subtitle: notifyHub.isBound
                                     ? "\(notifyHub.username.isEmpty ? "已绑定" : notifyHub.username) · \(notifyHub.devices.count) 台设备 · 电表通知\(notifyHub.channelEnabled && notifyHub.meterModuleEnabled ? "开" : "关")"
                                     : "未绑定 · 电表告警 / 将来到期收租通知") { CloudPushSettingsView() }
+                    settingsRow("后台与运营", icon: "chart.bar.xaxis",
+                                subtitle: "远程配置 · 获客分析 · 分享记录 · 后台密码") { AdminOpsSettingsPage() }
                     settingsRow("存储与清理", icon: "internaldrive",
                                 subtitle: "数据文件夹 · AI 产物 · 下载的安装包 · 服务器孤儿媒体") { StorageSettingsPage() }
                     // v2.51：电梯码（全屏展示 + 更换 + 一键打开方式）
@@ -960,14 +962,14 @@ struct SettingsView: View {
             }
             // v1.6：房源分享缓存刷新（二级确认，防止误触导致全部链接失效）
             // v1.54：升级为「全量重建」——云端旧分享页全部删除（旧链接立即失效），并给每间房重新生成最新 H5
-            .confirmationDialog("重建全部房源分享链接", isPresented: $showHouseCacheConfirm, titleVisibility: .visible) {
-                Button("清空并重建全部", role: .destructive) {
+            .confirmationDialog("刷新全部房源分享素材", isPresented: $showHouseCacheConfirm, titleVisibility: .visible) {
+                Button("刷新全部", role: .none) {
                     ShareCacheStore.clearAll()
                     rebuildAllShareH5()
                 }
                 Button("取消", role: .cancel) {}
             } message: {
-                Text("将重建全部房源的分享链接：云端旧分享页全部删除（旧链接立即失效），并为每间房重新生成最新 H5。确定继续吗？")
+                Text("将重新上传每套的 400px 封面、640px 视频首帧和二维码到服务器；已经发出去的分享链接不会失效，打开就是最新素材。")
             }
             .alert("重建全部分享链接", isPresented: Binding(
                 get: { houseCacheTip != nil },
@@ -998,8 +1000,20 @@ struct SettingsView: View {
             houseCacheTip = "数据容器不可用，请重启 App 后重试"
             return
         }
-        // 新架构 App 内分享不生成 H5 分享链接，旧桶遮罩分享重建已下线
-        houseCacheTip = "当前为 App 内分享，不生成 H5 分享链接"
+        // 新架构 H5 由服务器按签名实时渲染，无需重建页面；这里刷新每套的分享封面/视频首帧与二维码，
+        // 已经发出去的旧链接继续有效，打开即看到最新图片和名片。
+        let houses = HouseRepository.shared.fetchAllSorted().filter { !$0.mediaItems.isEmpty }
+        let keys = houses.map { $0.mediaRoomKey }
+        let media = houses.map { h in
+            h.mediaItems.map { ShareMediaFile(name: $0.fileName, kind: $0.kind) }
+        }
+        Task {
+            await ShareAssetUploader.prepare(roomKeys: keys, mediaByRoom: media)
+            _ = await ShareAssetUploader.ensureQRCode()
+            await MainActor.run {
+                houseCacheTip = keys.isEmpty ? "本机还没有带照片/视频的房源" : "已刷新 \(keys.count) 套的分享封面/首帧与二维码；旧链接继续有效"
+            }
+        }
     }
 
     // v1.75：离线重建房源——无需联网，从本机 media 账本（每套 info.json）重建/刷新房源记录
@@ -2196,14 +2210,14 @@ struct ShareSettingsPage: View {
         } message: {
             Text(showMessage)
         }
-        .confirmationDialog("重建全部房源分享链接", isPresented: $showHouseCacheConfirm, titleVisibility: .visible) {
-            Button("清空并重建全部", role: .destructive) {
+        .confirmationDialog("刷新全部房源分享素材", isPresented: $showHouseCacheConfirm, titleVisibility: .visible) {
+            Button("刷新全部", role: .none) {
                 ShareCacheStore.clearAll()
                 rebuildAllShareH5()
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("将重建全部房源的分享链接：云端旧分享页全部删除（旧链接立即失效），并为每间房重新生成最新 H5。确定继续吗？")
+            Text("将重新上传每套的 400px 封面、640px 视频首帧和二维码到服务器；已经发出去的分享链接不会失效，打开就是最新素材。")
         }
         .alert("重建全部分享链接", isPresented: Binding(
             get: { houseCacheTip != nil },
@@ -2220,8 +2234,20 @@ struct ShareSettingsPage: View {
             houseCacheTip = "数据容器不可用，请重启 App 后重试"
             return
         }
-        // 新架构 App 内分享不生成 H5 分享链接，旧桶遮罩分享重建已下线
-        houseCacheTip = "当前为 App 内分享，不生成 H5 分享链接"
+        // 新架构 H5 由服务器按签名实时渲染，无需重建页面；这里刷新每套的分享封面/视频首帧与二维码，
+        // 已经发出去的旧链接继续有效，打开即看到最新图片和名片。
+        let houses = HouseRepository.shared.fetchAllSorted().filter { !$0.mediaItems.isEmpty }
+        let keys = houses.map { $0.mediaRoomKey }
+        let media = houses.map { h in
+            h.mediaItems.map { ShareMediaFile(name: $0.fileName, kind: $0.kind) }
+        }
+        Task {
+            await ShareAssetUploader.prepare(roomKeys: keys, mediaByRoom: media)
+            _ = await ShareAssetUploader.ensureQRCode()
+            await MainActor.run {
+                houseCacheTip = keys.isEmpty ? "本机还没有带照片/视频的房源" : "已刷新 \(keys.count) 套的分享封面/首帧与二维码；旧链接继续有效"
+            }
+        }
     }
 }
 
@@ -3153,5 +3179,242 @@ struct ElevatorCodeSettingsPage: View {
         } message: {
             Text(alertText ?? "")
         }
+    }
+}
+
+// MARK: - b30：App 内后台管理（远程配置 / 获客分析 / 分享记录 / 改后台密码）
+
+struct ShareInsightView: View {
+    @State private var days = 30
+    @State private var stats: [String: Any] = [:]
+    @State private var loading = false
+    @State private var tip = ""
+
+    var body: some View {
+        Form {
+            Section {
+                Picker("统计范围", selection: $days) {
+                    Text("近 7 天").tag(7)
+                    Text("近 30 天").tag(30)
+                    Text("近 90 天").tag(90)
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: days) { _, _ in Task { await load() } }
+            }
+            Section("概览") {
+                metricRow("访问量", stats["visits"])
+                metricRow("访客数", stats["visitors"])
+                metricRow("生成分享", stats["shares"])
+            }
+            listSection("按天", key: "daily", nameKey: "date", countKey: "visits", title: "日期")
+            listSection("分享方式", key: "modes", nameKey: "mode", countKey: "visits", title: "方式")
+            listSection("房源热度", key: "rooms", nameKey: "roomKey", countKey: "visits", title: "房号")
+            listSection("访问来源", key: "refs", nameKey: "ref", countKey: "visits", title: "来源")
+            if loading { Section { ProgressView() } }
+            if !tip.isEmpty { Section { Text(tip).font(.footnote).foregroundStyle(.secondary) } }
+        }
+        .navigationTitle("获客分析")
+        .onAppear { Task { await load() } }
+    }
+
+    private func metricRow(_ title: String, _ value: Any?) -> some View {
+        HStack { Text(title); Spacer(); Text("\(intValue(value))").bold() }
+    }
+
+    private func listSection(_ title: String, key: String, nameKey: String,
+                             countKey: String, title column: String) -> some View {
+        let rows = (stats[key] as? [[String: Any]]) ?? []
+        return Section(title) {
+            if rows.isEmpty {
+                Text("暂无数据").font(.footnote).foregroundStyle(.secondary)
+            } else {
+                ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                    HStack {
+                        Text("\(row[nameKey] as? String ?? "-")").font(.footnote)
+                        Spacer()
+                        Text("\(intValue(row[countKey])) 次").font(.footnote).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+    private func intValue(_ any: Any?) -> Int {
+        if let i = any as? Int { return i }
+        if let n = any as? NSNumber { return n.intValue }
+        if let s = any as? String { return Int(s) ?? 0 }
+        return 0
+    }
+
+    private func load() async {
+        guard HouseServerMode.ready else { tip = "未连接服务器"; return }
+        loading = true
+        defer { loading = false }
+        do {
+            stats = try await HouseRemoteClient.shared.fetchShareStats(days: days)
+            tip = "统计从新版分享上线后开始累计；不含访客原始 IP。"
+        } catch {
+            tip = "加载失败：\(error.localizedDescription)"
+        }
+    }
+}
+
+struct ShareRecordsView: View {
+    @State private var records: [[String: Any]] = []
+    @State private var loading = false
+    @State private var tip = ""
+
+    var body: some View {
+        List {
+            if records.isEmpty, !loading {
+                Text("还没有分享记录").foregroundStyle(.secondary)
+            }
+            ForEach(Array(records.enumerated()), id: \.offset) { _, r in
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text(kindLabel(r["kind"] as? String ?? ""))
+                            .font(.footnote).bold()
+                        Text(r["mode"] as? String == "full" ? "完整版" : "隐藏版")
+                            .font(.caption2).foregroundStyle(.secondary)
+                        Spacer()
+                        if r["revoked"] as? Bool == true {
+                            Text("已失效").font(.caption2).foregroundStyle(.red)
+                        }
+                    }
+                    Text(roomsText(r)).font(.caption2).foregroundStyle(.secondary)
+                    if let url = r["url"] as? String, !url.isEmpty {
+                        Text(url).font(.caption2).lineLimit(1).textSelection(.enabled)
+                    }
+                    Text("\(r["ts"] as? String ?? "") · 到期 \(r["expiresAt"] as? String ?? "-")")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            if loading { ProgressView() }
+            if !tip.isEmpty { Text(tip).font(.footnote).foregroundStyle(.secondary) }
+        }
+        .navigationTitle("分享记录")
+        .onAppear { Task { await load() } }
+    }
+
+    private func kindLabel(_ kind: String) -> String {
+        switch kind {
+        case "collection": return "合集"
+        case "list": return "公开选房页"
+        default: return "单房"
+        }
+    }
+
+    private func roomsText(_ r: [String: Any]) -> String {
+        if let keys = r["roomKeys"] as? [String], !keys.isEmpty {
+            return keys.joined(separator: "、")
+        }
+        return r["roomKey"] as? String ?? "-"
+    }
+
+    private func load() async {
+        guard HouseServerMode.ready else { tip = "未连接服务器"; return }
+        loading = true
+        defer { loading = false }
+        do { records = try await HouseRemoteClient.shared.fetchShareRecords() }
+        catch { tip = "加载失败：\(error.localizedDescription)" }
+    }
+}
+
+struct AdminPasswordView: View {
+    @State private var current = ""
+    @State private var newPassword = ""
+    @State private var confirm = ""
+    @State private var saving = false
+    @State private var tip = ""
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        Form {
+            Section {
+                SecureField("当前后台密码", text: $current)
+                SecureField("新密码", text: $newPassword)
+                SecureField("再次输入新密码", text: $confirm)
+            } footer: {
+                Text("改的是网页管理后台（/admin）的密码，初始为 admin/admin。App 登录只用于验证身份，不改服务器授权码。")
+            }
+            Section {
+                Button {
+                    Task { await save() }
+                } label: {
+                    Label(saving ? "正在修改…" : "修改后台密码", systemImage: "key.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .disabled(saving || current.isEmpty || newPassword.isEmpty)
+            }
+            if !tip.isEmpty { Section { Text(tip) } }
+        }
+        .navigationTitle("后台密码")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func save() async {
+        guard newPassword == confirm else { tip = "两次输入的新密码不一致"; return }
+        guard newPassword.count >= 4 else { tip = "新密码至少 4 位"; return }
+        guard HouseServerMode.ready else { tip = "未连接服务器"; return }
+        saving = true; defer { saving = false }
+        do {
+            try await HouseRemoteClient.shared.adminChangePassword(current: current, newPassword: newPassword)
+            tip = "后台密码已更新 ✅ 请用新密码登录网页后台。"
+            current = ""; newPassword = ""; confirm = ""
+        } catch { tip = error.localizedDescription }
+    }
+}
+
+
+struct AdminOpsSettingsPage: View {
+    var body: some View {
+        List {
+            NavigationLink {
+                RemoteConfigAdminView()
+            } label: {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("远程配置")
+                        Text("公告 · 功能开关 · 数值参数 · 提示文案 · 在线更新 · AI 模型 · 版本记录")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                } icon: { Image(systemName: "slider.horizontal.3") }
+            }
+            NavigationLink {
+                ShareInsightView()
+            } label: {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("获客分析")
+                        Text("访问量 · 访客数 · 分享数 · 来源与房源热度")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                } icon: { Image(systemName: "chart.line.uptrend.xyaxis") }
+            }
+            NavigationLink {
+                ShareRecordsView()
+            } label: {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("分享记录")
+                        Text("单房 / 合集 / 公开选房页的链接、有效期与失效状态")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                } icon: { Image(systemName: "link.badge.plus") }
+            }
+            NavigationLink {
+                AdminPasswordView()
+            } label: {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("后台密码")
+                        Text("修改网页管理后台 admin 的登录密码")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                } icon: { Image(systemName: "key.fill") }
+            }
+        }
+        .navigationTitle("后台与运营")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }

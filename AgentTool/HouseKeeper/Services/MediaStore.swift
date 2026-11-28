@@ -264,6 +264,41 @@ enum MediaStore {
         }
     }
 
+    /// 任务撤回：删除媒体前先复制一份到本机暂存区（成功后清掉，失败撤回时还原）
+    @discardableResult
+    static func stashForRollback(fileName: String, roomKey: String, stashID: String) -> Bool {
+        guard !fileName.isEmpty, !roomKey.isEmpty, !stashID.isEmpty else { return false }
+        let src = houseDirectory(roomKey: roomKey).appendingPathComponent(fileName)
+        guard FileManager.default.fileExists(atPath: src.path) else { return false }
+        let dir = DataRoot.url().appendingPathComponent("rollback", isDirectory: true)
+            .appendingPathComponent(stashID, isDirectory: true)
+            .appendingPathComponent(roomKey, isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dst = dir.appendingPathComponent(fileName)
+        try? FileManager.default.removeItem(at: dst)
+        do { try FileManager.default.copyItem(at: src, to: dst); return true } catch { return false }
+    }
+
+    /// 撤回时把暂存文件还原回房号目录
+    @discardableResult
+    static func restoreFromRollback(fileName: String, roomKey: String, stashID: String) -> Bool {
+        let src = DataRoot.url().appendingPathComponent("rollback", isDirectory: true)
+            .appendingPathComponent(stashID, isDirectory: true)
+            .appendingPathComponent(roomKey, isDirectory: true)
+            .appendingPathComponent(fileName)
+        guard FileManager.default.fileExists(atPath: src.path) else { return false }
+        let dst = houseDirectory(roomKey: roomKey).appendingPathComponent(fileName)
+        try? FileManager.default.removeItem(at: dst)
+        do { try FileManager.default.copyItem(at: src, to: dst); return true } catch { return false }
+    }
+
+    static func clearRollbackStash(_ stashID: String) {
+        guard !stashID.isEmpty else { return }
+        let dir = DataRoot.url().appendingPathComponent("rollback", isDirectory: true)
+            .appendingPathComponent(stashID, isDirectory: true)
+        try? FileManager.default.removeItem(at: dir)
+    }
+
     /// 房号变更时，把旧房号目录整体迁移到新房号目录（编辑房号后媒体不丢失）
     static func migrateHouseDirectory(from oldKey: String, to newKey: String) {
         guard oldKey != newKey, !oldKey.isEmpty, !newKey.isEmpty else { return }

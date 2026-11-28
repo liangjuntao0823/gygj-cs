@@ -197,6 +197,32 @@ class MediaStore:
         if target.is_dir():
             shutil.rmtree(target, ignore_errors=True)
 
+    # ---- 分享资源（封面 / 视频首帧 / 海报）----
+    def share_path(self, room_key: str, file_name: str) -> Path:
+        rk = safe_room_key(room_key) or "_shared"
+        fn = safe_file_name(file_name)
+        return self.root / "share" / rk / fn
+
+    def save_share_asset(self, room_key: str, file_name: str, data: bytes) -> str:
+        fn = safe_file_name(file_name)
+        if _ext(fn) not in SHARE_EXTS:
+            raise ValueError("unsupported share extension")
+        path = self.share_path(room_key, fn)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return f"share/{safe_room_key(room_key) or '_shared'}/{fn}"
+
+    def read_share_asset(self, room_key: str, file_name: str) -> bytes | None:
+        path = self.share_path(room_key, file_name)
+        if not path.is_file():
+            return None
+        return path.read_bytes()
+
+    def find_share_asset(self, room_key: str, file_name: str) -> str:
+        """返回已存在的分享资源相对路径；不存在返回空串。"""
+        rel = f"share/{safe_room_key(room_key) or '_shared'}/{safe_file_name(file_name)}"
+        return rel if self._resolve(rel).is_file() else ""
+
     def iter_house_files(self) -> list[tuple[str, int, float]]:
         """列出 houses/ 下全部文件（相对路径、字节数、mtime），供孤儿媒体扫描。"""
         root = self.root / "houses"

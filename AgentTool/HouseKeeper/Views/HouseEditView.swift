@@ -815,9 +815,14 @@ struct HouseEditView: View {
         }
 
         // 数据库已落盘，再做文件操作（此时即使文件操作出错，账本已正确，可下次对账修复）
+        let rollbackStashID = isEditing && HouseServerMode.ready && !removedMediaItems.isEmpty
+            ? UUID().uuidString : nil
         if let house {
             let rk = originalRoomKey.isEmpty ? house.mediaRoomKey : originalRoomKey
             for old in removedMediaItems {
+                if let rollbackStashID {
+                    MediaStore.stashForRollback(fileName: old.fileName, roomKey: rk, stashID: rollbackStashID)
+                }
                 MediaStore.delete(fileName: old.fileName, roomKey: rk)
             }
             if !removedMediaItems.isEmpty {
@@ -965,9 +970,31 @@ struct HouseEditView: View {
             }
         }
         if HouseServerMode.ready {
+            let scene: HouseUploadRollback.Scene = {
+                switch cloudPushKind {
+                case .newHouse: return .newHouse
+                case .rename: return .rename
+                case .plainEdit: return .plainEdit
+                }
+            }()
+            let beforeSnapshot = before.map { b in
+                HouseUploadBeforeSnapshot(roomNo: b.roomNo, tower: b.tower,
+                    landlord: b.landlord, layout: b.layout, price: b.price,
+                    password: b.password, remark: b.remark,
+                    statusRaw: (b.status == .rented ? "rented" : "available"))
+            }
+            let addedRefs = target.mediaItems.filter { addedMedia.contains($0.fileName) }
+                .map { HouseUploadMediaRef(fileName: $0.fileName, kind: $0.kind) }
+            let removedRefs = removedMediaItems.map {
+                HouseUploadMediaRef(fileName: $0.fileName, kind: $0.kind) }
+            let rollback = HouseUploadRollback(
+                scene: scene, roomKey: target.mediaRoomKey,
+                oldRoomKey: (scene == .rename ? oldRoomKeyForPurge : ""),
+                before: beforeSnapshot, added: addedRefs,
+                removed: removedRefs, ledgerEventIds: ledgerEventIds, stashID: rollbackStashID)
             launchServerPush(target: target, mediaSnapshots: mediaSnapshots,
                              kind: cloudPushKind, oldRoomKey: oldRoomKeyForPurge,
-                             opAction: opAction, opDetail: opDetail)
+                             opAction: opAction, opDetail: opDetail, rollback: rollback)
             NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
             dismiss()
             return
@@ -1008,7 +1035,8 @@ struct HouseEditView: View {
     /// 本机沿用现有本地通知文案；服务器再向其他接入设备广播。
     private func launchServerPush(target: House, mediaSnapshots: [MediaUploadSnapshot],
                                   kind: CloudPushKind, oldRoomKey: String,
-                                  opAction: String, opDetail: String) {
+                                  opAction: String, opDetail: String,
+                                  rollback: HouseUploadRollback? = nil) {
         let taskID = UUID()
         let logRoomKey = target.mediaRoomKey
         if !mediaSnapshots.isEmpty {
@@ -1017,7 +1045,15 @@ struct HouseEditView: View {
                     id: taskID, kind: .media, title: "上传媒体",
                     roomKeys: [target.mediaRoomKey], total: mediaSnapshots.count,
                     note: "准备上传", files: mediaSnapshots.map { $0.fileName },
-                    isHouseUpload: true, rollback: nil)
+                    isHouseUpload: true, rollback: rollback)
+            }
+        }
+        if mediaSnapshots.isEmpty, let rollback {
+            Task { @MainActor in
+                SyncTaskCenter.shared.begin(
+                    id: taskID, kind: .pushUp, title: "上传房源改动",
+                    roomKeys: [logRoomKey], total: 1,
+                    note: "准备上传", files: [], isHouseUpload: true, rollback: rollback)
             }
         }
         let work = Task {
@@ -1087,8 +1123,9 @@ struct HouseEditView: View {
                                            room: remote.roomKey, cloud: true)
                     }
                 }
+                if let rollback?.stashID { MediaStore.clearRollbackStash(rollback.stashID) }
                 await MainActor.run {
-                    if !mediaSnapshots.isEmpty { SyncTaskCenter.shared.discard(id: taskID) }
+                    SyncTaskCenter.shared.discard(id: taskID)
                     let roomKey = remote.roomKey
                     switch kind {
                     case .newHouse:
@@ -1118,7 +1155,8 @@ struct HouseEditView: View {
                                    detail: failureDetail,
                                    room: logRoomKey, cloud: false)
                 await MainActor.run {
-                    if !mediaSnapshots.isEmpty { SyncTaskCenter.shared.discard(id: taskID) }
+                    // 有 rollback 的任务保留在失败区，允许「撤回本次改动」
+                    if mediaSnapshots.isEmpty, rollback == nil { SyncTaskCenter.shared.discard(id: taskID) }
                     if let api = error as? HouseAPIError, api.fieldConflict {
                         // 同字段冲突不挂自动补传（否则每轮都撞同一冲突），只保留本机改动并给明细
                         let lines = api.fieldConflicts.map { c in
