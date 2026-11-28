@@ -326,16 +326,17 @@ final class UpdateDownloader: ObservableObject {
     @Published private(set) var localURL: URL?
 
     private var task: URLSessionDownloadTask?
-    private var timer: Timer?
     private var pendingURLs: [URL] = []
     private var activeUpdate: UpdateCenter.Available?
     private var lastFailure = ""
-    private let session: URLSession = {
+    private let progressDelegate = UpdateDownloadProgressDelegate()
+    private lazy var session: URLSession = {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
         cfg.timeoutIntervalForRequest = 120
         cfg.timeoutIntervalForResource = 300
-        return URLSession(configuration: cfg)
+        return URLSession(configuration: cfg, delegate: progressDelegate,
+                          delegateQueue: nil)
     }()
 
     var isBusy: Bool {
@@ -396,27 +397,25 @@ final class UpdateDownloader: ObservableObject {
         req.cachePolicy = .reloadIgnoringLocalCacheData
         req.timeoutInterval = 120
         req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
-        let t = session.downloadTask(with: req) { [weak self] tmp, resp, err in
+        // didWriteData 比 task.progress 轮询可靠：小包/快网下后者经常一直是 0，完成才跳到 100%。
+        progressDelegate.expect(Int64(update.sizeBytes))
+        progressDelegate.onProgress = { [weak self] fraction in
+            Task { @MainActor in
+                guard let self, case .downloading = self.phase else { return }
+                self.progress = min(max(fraction, 0), 1)
+            }
+        }
+        progressDelegate.onFinish = { [weak self] tmp, resp, err in
             Task { @MainActor in
                 self?.finish(tmp: tmp, response: resp, error: err, update: update)
             }
         }
+        let t = session.downloadTask(with: req)
         task = t
         t.resume()
-
-        timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
-            let p = t.progress.fractionCompleted
-            Task { @MainActor in
-                guard let self else { return }
-                if case .downloading = self.phase { self.progress = p }
-            }
-        }
     }
 
     private func finish(tmp: URL?, response: URLResponse?, error: Error?, update: UpdateCenter.Available) {
-        timer?.invalidate()
-        timer = nil
         task = nil
 
         if let error {
@@ -481,6 +480,57 @@ final class UpdateDownloader: ObservableObject {
             beginNextDownload()
         } else {
             phase = .failed(message)
+        }
+    }
+}
+
+/// URLSessionDownloadDelegate 版进度：didWriteData 按字节回调，避免 10MB 包在快网下
+/// task.progress 仍为 0、完成时直接跳到 100%。临时文件在 didFinish 里先复制，防被系统回收。
+private final class UpdateDownloadProgressDelegate: NSObject, URLSessionDownloadDelegate {
+    var onProgress: ((Double) -> Void)?
+    var onFinish: ((URL?, URLResponse?, Error?) -> Void)?
+
+    private var expectedBytes: Int64 = 0
+    private var finishedURL: URL?
+    private var copyError: Error?
+    private var response: URLResponse?
+
+    func expect(_ bytes: Int64) {
+        expectedBytes = max(bytes, 0)
+        finishedURL = nil
+        copyError = nil
+        response = nil
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didWriteData bytesWritten: Int64,
+                    totalBytesWritten: Int64,
+                    totalBytesExpectedToWrite: Int64) {
+        let total = totalBytesExpectedToWrite > 0 ? totalBytesExpectedToWrite : expectedBytes
+        guard total > 0 else { return }
+        onProgress?(min(max(Double(totalBytesWritten) / Double(total), 0), 1))
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didFinishDownloadingTo location: URL) {
+        response = downloadTask.response
+        let name = downloadTask.currentRequest?.url?.lastPathComponent ?? "update.ipa"
+        let dst = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString + "-" + name)
+        do {
+            try FileManager.default.copyItem(at: location, to: dst)
+            finishedURL = dst
+        } catch {
+            copyError = error
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    didCompleteWithError error: Error?) {
+        let err = error ?? copyError
+        onFinish?(finishedURL, response, err)
+        if err != nil, let finishedURL {
+            try? FileManager.default.removeItem(at: finishedURL)
         }
     }
 }
