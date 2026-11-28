@@ -270,7 +270,14 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
             if not rec:
                 return send(410, {"ok": False, "error": "link_expired"})
             mode = "full" if rec.get("mode") == "full" else "masked"
-            return send(200, {"ok": True, "mode": mode, "rooms": store.public_rooms(mode=mode) if mode == "full" else store.public_rooms(mode="masked")})
+            docs = store.public_rooms(mode=mode)
+            # 单房/合集链接只能看到本次分享允许的房号，禁止拿一条单房链接枚举全部房源。
+            if str(rec.get("kind") or "single") != "list":
+                allowed = set(str(k) for k in (rec.get("roomKeys") or []) if str(k))
+                if rec.get("roomKey"):
+                    allowed.add(str(rec["roomKey"]))
+                docs = [d for d in docs if str(d.get("roomKey") or "") in allowed]
+            return send(200, {"ok": True, "mode": mode, "rooms": docs})
 
         if path.startswith(f"{PUBLIC_PREFIX}/rooms/") and method == "GET":
             if not _rate_limit(handler, "single", 180):
