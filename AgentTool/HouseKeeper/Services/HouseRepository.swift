@@ -46,12 +46,12 @@ final class HouseRepository {
 
     // MARK: - 本地写（视图落库统一入口）
 
-    func insert(_ house: House) {
-        context?.insert(house)
+    func insert<T: PersistentModel>(_ model: T) {
+        context?.insert(model)
     }
 
-    func delete(_ house: House) {
-        context?.delete(house)
+    func delete<T: PersistentModel>(_ model: T) {
+        context?.delete(model)
     }
 
     func save() throws {
