@@ -317,6 +317,9 @@ final class UpdateCenter: ObservableObject {
 /// 安装包下载器：服务器媒体取（优先）或直链下载 → 存到 Documents/Updates/ → 可选 sha256 校验
 @MainActor
 final class UpdateDownloader: ObservableObject {
+    /// 更新详情页可能被「稍后」关闭或从设置页重新进入；下载器和已下载文件必须跨页面保留。
+    static let shared = UpdateDownloader()
+
     enum Phase: Equatable {
         case idle, downloading, verifying, ready, failed(String)
     }
@@ -343,6 +346,35 @@ final class UpdateDownloader: ObservableObject {
         if case .downloading = phase { return true }
         if case .verifying = phase { return true }
         return false
+    }
+
+    /// 重新进入详情页时优先复用已下载好的包；文件被清理/不完整才重新下载。
+    func restoreIfDownloaded(_ update: UpdateCenter.Available) {
+        guard !isBusy else { return }
+        let name = update.objectKey.isEmpty
+            ? "公寓管家\(update.version).ipa"
+            : (update.objectKey as NSString).lastPathComponent
+        let dest = Self.downloadsDirectory().appendingPathComponent(name)
+        if case .ready = phase, localURL?.lastPathComponent == name { return }
+        if case .ready = phase {
+            phase = .idle
+            progress = 0
+            localURL = nil
+        }
+        guard FileManager.default.fileExists(atPath: dest.path) else { return }
+        let actualSize = (try? dest.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        if update.sizeBytes > 0, actualSize != update.sizeBytes { return }
+        if !update.sha256.isEmpty, let data = try? Data(contentsOf: dest) {
+            let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            if hash.lowercased() != update.sha256.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+                return
+            }
+        }
+        localURL = dest
+        progress = 1
+        receivedBytes = Int64(actualSize)
+        expectedBytes = Int64(update.sizeBytes)
+        phase = .ready
     }
 
     func start(_ update: UpdateCenter.Available) {
@@ -390,8 +422,12 @@ final class UpdateDownloader: ObservableObject {
             return
         }
         let url = pendingURLs.removeFirst()
+        progressTimer?.invalidate()
+        progressTimer = nil
         phase = .downloading
         progress = 0
+        receivedBytes = 0
+        expectedBytes = Int64(update.sizeBytes)
 
         var req = URLRequest(url: url)
         req.cachePolicy = .reloadIgnoringLocalCacheData
@@ -399,10 +435,9 @@ final class UpdateDownloader: ObservableObject {
         req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
         // didWriteData 比 task.progress 轮询可靠：小包/快网下后者经常一直是 0，完成才跳到 100%。
         progressDelegate.expect(Int64(update.sizeBytes))
-        progressDelegate.onProgress = { [weak self] fraction in
+        progressDelegate.onProgress = { [weak self] received, total in
             Task { @MainActor in
-                guard let self, case .downloading = self.phase else { return }
-                self.progress = min(max(fraction, 0), 1)
+                self?.applyProgress(received: received, total: total)
             }
         }
         progressDelegate.onFinish = { [weak self] tmp, resp, err in
@@ -413,9 +448,33 @@ final class UpdateDownloader: ObservableObject {
         let t = session.downloadTask(with: req)
         task = t
         t.resume()
+
+        // 双保险：delegate 的 didWriteData 在部分 iOS/网络栈组合下可能不回调，
+        // 再用 task.countOfBytesReceived 每 0.1 秒取一次；两者取较大值，进度不会停在 0。
+        progressTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self, weak t] _ in
+            guard let self, let t else { return }
+            let got = t.countOfBytesReceived
+            let total = t.countOfBytesExpectedToReceive > 0
+                ? t.countOfBytesExpectedToReceive : self.expectedBytes
+            Task { @MainActor in
+                self.applyProgress(received: got, total: total)
+            }
+        }
+    }
+
+    private func applyProgress(received: Int64, total: Int64) {
+        guard case .downloading = phase else { return }
+        let got = max(received, 0)
+        let expected = total > 0 ? total : expectedBytes
+        guard expected > 0 else { return }
+        receivedBytes = max(receivedBytes, got)
+        expectedBytes = expected
+        progress = min(max(Double(receivedBytes) / Double(expected), 0), 1)
     }
 
     private func finish(tmp: URL?, response: URLResponse?, error: Error?, update: UpdateCenter.Available) {
+        progressTimer?.invalidate()
+        progressTimer = nil
         task = nil
 
         if let error {
@@ -470,6 +529,8 @@ final class UpdateDownloader: ObservableObject {
         activeUpdate = nil
         localURL = dest
         progress = 1
+        receivedBytes = Int64(actualSize)
+        expectedBytes = Int64(update.sizeBytes)
         phase = .ready
     }
 
@@ -487,7 +548,7 @@ final class UpdateDownloader: ObservableObject {
 /// URLSessionDownloadDelegate 版进度：didWriteData 按字节回调，避免 10MB 包在快网下
 /// task.progress 仍为 0、完成时直接跳到 100%。临时文件在 didFinish 里先复制，防被系统回收。
 private final class UpdateDownloadProgressDelegate: NSObject, URLSessionDownloadDelegate {
-    var onProgress: ((Double) -> Void)?
+    var onProgress: ((Int64, Int64) -> Void)?
     var onFinish: ((URL?, URLResponse?, Error?) -> Void)?
 
     private var expectedBytes: Int64 = 0
@@ -508,7 +569,7 @@ private final class UpdateDownloadProgressDelegate: NSObject, URLSessionDownload
                     totalBytesExpectedToWrite: Int64) {
         let total = totalBytesExpectedToWrite > 0 ? totalBytesExpectedToWrite : expectedBytes
         guard total > 0 else { return }
-        onProgress?(min(max(Double(totalBytesWritten) / Double(total), 0), 1))
+        onProgress?(max(totalBytesWritten, 0), total)
     }
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,

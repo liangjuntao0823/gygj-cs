@@ -1728,12 +1728,19 @@ struct UpdateDetailView: View {
     let update: UpdateCenter.Available
 
     @Environment(\.dismiss) private var dismiss
-    @StateObject private var downloader = UpdateDownloader()
+    @ObservedObject private var downloader = UpdateDownloader.shared
     @State private var showShareSheet = false
 
     private var sizeText: String {
         guard update.sizeBytes > 0 else { return "—" }
         return String(format: "%.1f MB", Double(update.sizeBytes) / 1_048_576)
+    }
+
+    private var downloadByteText: String {
+        let got = String(format: "%.1f MB", Double(downloader.receivedBytes) / 1_048_576)
+        guard downloader.expectedBytes > 0 else { return "已下载 \(got)" }
+        let total = String(format: "%.1f MB", Double(downloader.expectedBytes) / 1_048_576)
+        return "已下载 \(got) / \(total)"
     }
 
     private var primaryTitle: String {
@@ -1804,6 +1811,9 @@ struct UpdateDetailView: View {
                     if case .downloading = downloader.phase {
                         ProgressView(value: min(max(downloader.progress, 0), 1))
                             .tint(AppTheme.primary)
+                        Text(downloadByteText)
+                            .font(.system(size: 12))
+                            .foregroundColor(.themeText3)
                     }
                     if case let .failed(msg) = downloader.phase {
                         Text(msg)
@@ -1871,6 +1881,7 @@ struct UpdateDetailView: View {
             .background(AppTheme.background)
             .navigationTitle("发现新版本")
             .navigationBarTitleDisplayMode(.inline)
+            .onAppear { downloader.restoreIfDownloaded(update) }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("稍后") { dismiss() }
