@@ -295,10 +295,10 @@ final class UpdateCenter: ObservableObject {
 
     private func runCheck(showPopup: Bool) async {
         checkState = .checking
-        var ok = await RemoteConfig.refresh()
-        // b29：房源库授权失效时 /api/house/config 会 401，但“检查更新”本身不敏感，
-        // 再走公开更新块兜底，避免把“令牌过期”误报成“连不上云端”。
-        if !ok { ok = await RemoteConfig.refreshPublicUpdate() }
+        // b32：检查更新先走公开更新块。它不依赖房源库授权，令牌过期/未绑定时
+        // 也能真实判断有没有新版本；公开块失败才回退到需要授权的完整配置接口。
+        var ok = await RemoteConfig.refreshPublicUpdate()
+        if !ok { ok = await RemoteConfig.refresh() }
         failureDetail = ok ? nil : (RemoteConfig.lastRefreshError ?? "网络请求超时")
         evaluate()
         if available != nil {

@@ -1014,6 +1014,13 @@ struct HouseEditView: View {
                 oldRoomKey: (scene == .rename ? oldRoomKeyForPurge : ""),
                 before: beforeSnapshot, added: addedRefs,
                 removed: removedRefs, ledgerEventIds: ledgerEventIds, stashID: rollbackStashID)
+            // b32：点保存但什么都没改（无字段、无新增媒体、无删除媒体）时不再发一次空推送，
+            // 避免无意义地涨服务器 revision；新增房源和改名不适用。
+            if !isNewHouse && changedFieldKeys.isEmpty && mediaSnapshots.isEmpty && removedMediaItems.isEmpty {
+                NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
+                dismiss()
+                return
+            }
             launchServerPush(target: target, mediaSnapshots: mediaSnapshots,
                              kind: cloudPushKind, oldRoomKey: oldRoomKeyForPurge,
                              opAction: opAction, opDetail: opDetail, rollback: rollback,

@@ -1401,7 +1401,7 @@ struct HouseListView: View {
     @discardableResult
     /// 服务器模式同步：先补传本机改动，再把服务器清单应用到本地；
     /// 整次动作挂任务中心持久任务，媒体回补另挂“下载服务器媒体”任务并驱动卡片进度。
-    private func runServerSync(retryTaskID: UUID? = nil) async -> CloudPullRunOutcome {
+    private func runServerSync(retryTaskID: UUID? = nil, deep: Bool = false) async -> CloudPullRunOutcome {
         let taskID: UUID
         if let retryTaskID {
             taskID = retryTaskID
@@ -1417,7 +1417,7 @@ struct HouseListView: View {
             // 本机改动由任务中心逐套确认上传，避免刷新动作顺带把本地房源推到服务器。
             syncCenter.advance(id: taskID, done: 0, note: "正在拉取服务器房源")
             let preview = try? await HouseRepository.shared.preview()
-            let result = try await HouseRepository.shared.pull(reportMediaTask: true)
+            let result = try await HouseRepository.shared.pull(reportMediaTask: true, deep: deep)
             let hidden = HouseRepository.shared.hiddenCloudCount()
             let pending = HouseRepository.shared.pendingKeys().count
             var tail = (hidden > 0 ? "；\(hidden) 套仅删本地，仍保持隐藏" : "")
@@ -1499,7 +1499,7 @@ struct HouseListView: View {
         defer { DispatchQueue.main.async { CloudDetectActivity.shared.endManualSync() } }
         // 服务器模式：房源读写走 8082 house-keeper 权威接口，短路旧对象存储直连链路
         if HouseServerMode.ready {
-            return await runServerSync(retryTaskID: retryTaskID)
+            return await runServerSync(retryTaskID: retryTaskID, deep: deep)
         }
         // 旧对象存储直连兜底链路已下线：未连接服务器时仅返回失败，本地数据可离线查看
         return .failed("服务器未连接，请检查网络后重试")

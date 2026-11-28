@@ -472,7 +472,13 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
             handler.send_response(200)
             handler.send_header("Content-Type", "application/octet-stream")
             handler.send_header("Content-Length", str(len(data)))
-            handler.send_header("Content-Disposition", f'attachment; filename="{name}"')
+            # b32：文件名可能含中文；http.server 的 header 只接受 latin-1，直接用中文会抛 UnicodeEncodeError。
+            # 同时给 ASCII 兜底名和 RFC 5987 的 filename*，浏览器/下载器优先用 UTF-8 原名。
+            ascii_name = name.encode("ascii", "ignore").decode("ascii").strip() or "app.ipa"
+            quoted_name = urllib.parse.quote(name, safe="")
+            handler.send_header(
+                "Content-Disposition",
+                f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quoted_name}")
             handler.send_header("Cache-Control", "no-store")
             handler.end_headers()
             try:

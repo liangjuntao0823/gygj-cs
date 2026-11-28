@@ -151,14 +151,29 @@ final class HouseSyncEngine: ObservableObject {
     /// - Parameter reportMediaTask: 手动总刷新传 true，把媒体回补挂进任务中心；
     ///   自动对账传 false，不占任务中心，但卡片进度仍然显示。
     @discardableResult
-    func pull(context: ModelContext, reportMediaTask: Bool = false) async throws -> HousePullResult {
+    func pull(context: ModelContext, reportMediaTask: Bool = false, deep: Bool = false) async throws -> HousePullResult {
         // 全量清单：便于识别「曾同步过、但服务器已硬删」的本地孤儿房并一并清除；
         // 纯本地离线未提交的房（revMap 无记录）不会被误删。
         let list = try await HouseRemoteClient.shared.listHouses(since: nil)
-        setTop(list.topRevision)
+        var remoteHouses = list.houses
+        var topRevision = list.topRevision
+        if deep {
+            // b32：长按深度刷新 = 逐套再取一次权威详情，不用清单里的摘要直接落库。
+            // 房源数量级很小，逐套 GET 能抓到“清单生成后又被别的设备改过”的竞态；
+            // GET 返回 404 说明这期间服务器已删掉，直接省略，后面按服务器删除处理。
+            var verified: [RemoteHouse] = []
+            for item in list.houses {
+                if let latest = try await HouseRemoteClient.shared.getHouse(item.roomKey) {
+                    verified.append(latest)
+                    topRevision = max(topRevision, latest.revision)
+                }
+            }
+            remoteHouses = verified
+        }
+        setTop(topRevision)
         // 不能因为服务器为空就提前 return：后台硬删最后一套房后，本地 revMap 里仍有
         // 该房记录，必须走一次空清单对账，才能把本地孤儿/“双端”徽章清掉。
-        let changed = try applyRemote(list.houses, context: context)
+        let changed = try applyRemote(remoteHouses, context: context)
         // 元数据落盘后立刻通知列表重建卡片；媒体回补在卡片已经显示之后进行。
         NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
         // 记录对账完成后，把本地磁盘缺失的媒体从服务器回补落盘（已存在自动跳过）

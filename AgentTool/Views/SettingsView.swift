@@ -706,6 +706,9 @@ struct SettingsView: View {
             )) {
                 Label("启动时自动检查更新", systemImage: "arrow.triangle.2.circlepath")
             }
+            Text("关闭后只是不在启动时自动查版本；上面的「检查更新」仍可手动使用。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
             HStack {
                 Label("开发者", systemImage: "person")
                 Spacer()

@@ -93,12 +93,13 @@ final class HouseRepository {
         try await HouseSyncEngine.shared.pushHousesBatch(houses)
     }
 
-    func pull(reportMediaTask: Bool = false) async throws -> HousePullResult {
+    func pull(reportMediaTask: Bool = false, deep: Bool = false) async throws -> HousePullResult {
         guard let context = requireContext() else {
             return HousePullResult(changed: 0, mediaTotal: 0, mediaDownloaded: 0,
                                    mediaFailed: 0, mediaTaskID: nil)
         }
-        return try await HouseSyncEngine.shared.pull(context: context, reportMediaTask: reportMediaTask)
+        return try await HouseSyncEngine.shared.pull(context: context, reportMediaTask: reportMediaTask,
+                                                     deep: deep)
     }
 
     func preview() async throws -> HouseChangePreview {

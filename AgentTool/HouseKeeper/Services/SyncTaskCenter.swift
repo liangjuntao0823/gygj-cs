@@ -1380,8 +1380,17 @@ struct TaskCenterView: View {
                 let key = h.mediaRoomKey
                 guard !h.isTrashed, !pending.contains(key) else { continue }
                 if let r = remoteByKey[key], !r.trashed {
-                    let remoteNames = Set((r.media ?? []).map { $0.fileName })
-                    let missing = h.mediaItems.filter { !remoteNames.contains($0.fileName) }
+                    // b32：按本地映射后的文件名比对，避免服务器把 .mov 统一成 .mp4 后
+                    // 同一份视频被误判成“本地多出、缺媒体”。
+                    let remoteNames = Set((r.media ?? []).map {
+                        MediaNaming.canonicalKey(
+                            HouseSyncEngine.localFileName(objectKey: $0.objectKey,
+                                                          kind: $0.kind,
+                                                          roomKey: r.roomKey))
+                    })
+                    let missing = h.mediaItems.filter {
+                        !remoteNames.contains(MediaNaming.canonicalKey($0.fileName))
+                    }
                     if !missing.isEmpty {
                         result.append(LocalHouseSyncCandidate(
                             roomKey: key, kind: .mediaGap,
