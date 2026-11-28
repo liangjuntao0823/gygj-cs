@@ -1123,7 +1123,7 @@ struct HouseEditView: View {
                                            room: remote.roomKey, cloud: true)
                     }
                 }
-                if let rollback?.stashID { MediaStore.clearRollbackStash(rollback.stashID) }
+                if let stashID = rollback?.stashID { MediaStore.clearRollbackStash(stashID) }
                 await MainActor.run {
                     SyncTaskCenter.shared.discard(id: taskID)
                     let roomKey = remote.roomKey
