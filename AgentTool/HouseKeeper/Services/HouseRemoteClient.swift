@@ -810,8 +810,9 @@ final class HouseRemoteClient {
         req.timeoutInterval = timeout
         req.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
         req.httpBody = try JSONSerialization.data(withJSONObject: ["username": username, "password": password])
-        let (data, http) = try await URLSession.shared.data(for: req)
-        guard http.statusCode == 200,
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse,
+              http.statusCode == 200,
               let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               json["ok"] as? Bool == true,
               let token = json["token"] as? String else {
@@ -833,7 +834,10 @@ final class HouseRemoteClient {
         req.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
         req.setValue("admin_session=\(session)", forHTTPHeaderField: "Cookie")
         req.httpBody = try JSONSerialization.data(withJSONObject: ["newPassword": newPassword])
-        let (data, http) = try await URLSession.shared.data(for: req)
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse else {
+            throw HouseAPIError(message: "服务器无响应")
+        }
         let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         guard http.statusCode == 200, (json?["ok"] as? Bool) == true else {
             let err = (json?["error"] as? String) ?? "服务器 \(http.statusCode)"
