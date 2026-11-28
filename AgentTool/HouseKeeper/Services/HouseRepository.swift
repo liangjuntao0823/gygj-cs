@@ -60,8 +60,10 @@ final class HouseRepository {
 
     // MARK: - 待补传登记
 
-    func markPending(_ roomKey: String, action: String = "", detail: String = "") {
-        HousePendingUploader.shared.markPending(roomKey, action: action, detail: detail)
+    func markPending(_ roomKey: String, action: String = "", detail: String = "",
+                     changedFields: Set<String>? = nil) {
+        HousePendingUploader.shared.markPending(roomKey, action: action, detail: detail,
+                                                changedFields: changedFields)
     }
 
     func clearPending(_ roomKey: String) {
