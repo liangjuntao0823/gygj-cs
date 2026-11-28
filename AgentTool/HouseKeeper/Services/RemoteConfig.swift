@@ -326,9 +326,12 @@ final class UpdateDownloader: ObservableObject {
 
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var progress: Double = 0
+    @Published private(set) var receivedBytes: Int64 = 0
+    @Published private(set) var expectedBytes: Int64 = 0
     @Published private(set) var localURL: URL?
 
     private var task: URLSessionDownloadTask?
+    private var progressTimer: Timer?
     private var pendingURLs: [URL] = []
     private var activeUpdate: UpdateCenter.Available?
     private var lastFailure = ""
