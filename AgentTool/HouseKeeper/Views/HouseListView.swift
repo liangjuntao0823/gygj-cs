@@ -113,8 +113,8 @@ struct HouseListView: View {
     @State private var selectedHouseIDs = Set<UUID>()
     // v2.17：队列元素从「卡片链接」扩展为任意分享素材（卡片 = [URL]，只分享视频 = [AVAsset]）
     @State private var shareQueue: [[Any]] = []
-    /// v2.29：分享面板回到 SwiftUI sheet 呈现（与 2.17 一致，实测 2.17 视频分享可用）
-    @State private var currentShareStep: ShareStep? = nil
+    // b29：分享面板改用 SharePresenter 从最顶层控制器直呈。
+    // 旧版挂在 SwiftUI .sheet 里，微信分享扩展拿不到有效呈现上下文，表现为“跳微信后什么都没发出去”。
     // v2.17：多选逐套分享时，一套发完询问「继续下一套 / 结束」
     @State private var showContinueShare = false
     // v2.17：保存类操作的轻提示（与工作台/成交板块一致的底部小胶囊，不弹遮罩、不占屏）
@@ -344,17 +344,8 @@ struct HouseListView: View {
                     }
                 }
             }
-            // v2.29：分享面板走 sheet（与 2.17 可用版本一致）；面板关闭后再问「继续/结束」
-            .sheet(item: $currentShareStep, onDismiss: {
-                if !shareQueue.isEmpty, shareIndex < shareQueue.count - 1 {
-                    remainingShareCount = shareQueue.count - shareIndex - 1
-                    showContinueShare = true
-                } else if !shareQueue.isEmpty {
-                    exitMultiSelect()
-                }
-            }) { step in
-                HouseShareSheet(items: step.items)
-            }
+            // b29：分享由 SharePresenter 直接 present，不再挂 .sheet。
+            // 旧的 .sheet 包裹会让微信扩展拿不到 present 上下文，出现“跳微信后无内容”。
             .sheet(isPresented: $showAdd, onDismiss: {
                 autoImportNext = false
             }) {
@@ -498,11 +489,11 @@ struct HouseListView: View {
         .onAppear {
             reloadHouses()
             // 服务器模式：进页面静默增量拉取权威库（小 JSON，失败不打扰、不打断操作）
-            if HouseServerMode.ready, let ctx = houseModelContext {
+            if HouseServerMode.ready {
                 Task {
                     // 进页先补传离线未提交的改动，再全量对账权威库（弱网改动不丢）
-                    _ = await HousePendingUploader.shared.flush(context: ctx)
-                    let result = try? await HouseSyncEngine.shared.pull(context: ctx)
+                    _ = await HouseRepository.shared.flushPending()
+                    let result = try? await HouseRepository.shared.pull()
                     if result?.didChangeStore == true {
                         reloadHouses()
                     }
@@ -536,8 +527,8 @@ struct HouseListView: View {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 45 * 1_000_000_000)
                 guard !Task.isCancelled else { break }
-                guard let ctx = houseModelContext, !isSyncing else { continue }
-                if let result = try? await HouseSyncEngine.shared.pull(context: ctx), result.didChangeStore {
+                guard !isSyncing else { continue }
+                if let result = try? await HouseRepository.shared.pull(), result.didChangeStore {
                     reloadHouses()
                 }
             }
@@ -573,16 +564,14 @@ struct HouseListView: View {
     /// v1.9：isDeleted 为可选属性，SwiftData #Predicate 对「可选 Bool」在 iOS 17 会触发翻译崩溃（点进房源板块闪退的根因），
     /// 改为全量拉取 + 内存过滤（房源数量级小，性能无影响）
     private func reloadHouses() {
-        guard let ctx = houseModelContext else { return }
-        let descriptor = FetchDescriptor<House>(sortBy: [SortDescriptor(\House.createdAt, order: .reverse)])
-        let all = (try? ctx.fetch(descriptor)) ?? []
+        let all = HouseRepository.shared.fetchAllSorted()
         // v1.70：强制从持久层重载每个房源对象（含 mediaItems 关系）——修复「批量恢复媒体后
         // 卡片仍显示无实拍图/不显示缩略图，必须重启才正常」：SwiftData 同一上下文里插入媒体后，
         // 已缓存对象的 to-many 关系不会自动刷新，列表重新 fetch 拿到的仍是同一实例、关系为旧缓存。
         // v1.70：提交挂起变更（含媒体关系插入），确保批量恢复/编辑后重新 fetch 拿到最新关系——
         // 此前列表重新 fetch 返回同一对象实例、mediaItems 关系为旧缓存，缩略图不显示需重启。
         // 注：ModelContext 无 CoreData 式 refresh API，用 processPendingChanges 强制同步变更。
-        ctx.processPendingChanges()
+        HouseRepository.shared.processPendingChanges()
         houses = all.filter { !$0.isTrashed }
         // v1.71：存量无前缀媒体目录自动归一迁移（media/2059/ → media/1-2059/），幂等；修复
         // v1.69 前编辑页新图落盘无前缀目录导致的上传失败、云端断媒体、刷新缺媒体死循环。
@@ -1041,7 +1030,21 @@ struct HouseListView: View {
 
     /// v2.26：分享面板从顶层直呈，面板关闭后按队列决定「继续下一套 / 结束」
     private func presentShareStep(_ items: [Any]) {
-        currentShareStep = ShareStep(items: items)
+        // b29：从最顶层控制器直呈系统分享面板（微信扩展需要这个上下文；
+        // 旧 .sheet 方案会让微信“跳过去但收不到内容”）。
+        SharePresenter.present(items: items) {
+            handleSharePanelClosed()
+        }
+    }
+
+    /// 系统分享面板关闭后：多选队列还有下一套就询问继续，最后一套结束多选。
+    private func handleSharePanelClosed() {
+        if !shareQueue.isEmpty, shareIndex < shareQueue.count - 1 {
+            remainingShareCount = shareQueue.count - shareIndex - 1
+            showContinueShare = true
+        } else if !shareQueue.isEmpty {
+            exitMultiSelect()
+        }
     }
 
     private func exitMultiSelect() {
@@ -1070,10 +1073,6 @@ struct HouseListView: View {
     /// 现在：先云后本，云端删成功的房立即清本地（界面马上见效）；云端删失败的房本地保留，
     /// 挂任务中心标注「云端环节失败」，retryCloudDelete 重试成功后自动清掉本地残留。
     private func startDelete(both: Bool) {
-        guard let ctx = houseModelContext else {
-            showToast(RemoteConfig.tip("containerUnavailable", "数据容器不可用，无法删除"), isError: true)
-            return
-        }
         // 先把房号目录取成值，删完对象就失效了
         var keys: [String] = []
         var rooms: [String] = []
@@ -1098,10 +1097,10 @@ struct HouseListView: View {
                 MediaStore.deleteHouseDirectory(roomKey: h.mediaRoomKey)
                 SyncFailStore.clear(h.mediaRoomKey)
                 UnreadCloudHouseStore.clear(h.mediaRoomKey)
-                ctx.delete(h)
+                HouseRepository.shared.delete(h)
             }
             do {
-                try ctx.save()
+                try HouseRepository.shared.save()
             } catch {
                 showToast(RemoteConfig.tip("deleteFail", "删除失败：{error}").replacingOccurrences(of: "{error}", with: error.localizedDescription), isError: true)
                 return
@@ -1123,7 +1122,7 @@ struct HouseListView: View {
 
         // 服务器模式：双端删除走服务器硬删（永久，不进回收站），逐套同步
         if HouseServerMode.ready {
-            runServerDelete(keys: keys, ctx: ctx)
+            runServerDelete(keys: keys)
             return
         }
 
@@ -1132,10 +1131,10 @@ struct HouseListView: View {
             MediaStore.deleteHouseDirectory(roomKey: h.mediaRoomKey)
             SyncFailStore.clear(h.mediaRoomKey)
             UnreadCloudHouseStore.clear(h.mediaRoomKey)
-            ctx.delete(h)
+            HouseRepository.shared.delete(h)
         }
         do {
-            try ctx.save()
+            try HouseRepository.shared.save()
         } catch {
             showToast(RemoteConfig.tip("deleteFail", "删除失败：{error}").replacingOccurrences(of: "{error}", with: error.localizedDescription), isError: true)
             return
@@ -1152,7 +1151,7 @@ struct HouseListView: View {
     /// 界面马上见效；云端失败的房本地保留（同步不会把它拉回来，因为云端已删/在删），挂任务中心
     /// 「删云端」任务标注失败环节，retryCloudDelete 成功后自动清掉本地残留。
     /// 服务器模式双端硬删：逐套删服务器权威库，成功一套删一套本地；不进回收站；失败的房本地保留可重试
-    private func runServerDelete(keys: [String], ctx: ModelContext) {
+    private func runServerDelete(keys: [String]) {
         deleteTotal = keys.count
         deleteDone = 0
         deleteRunning = true
@@ -1166,7 +1165,7 @@ struct HouseListView: View {
                 await MainActor.run { deleteCurrentRoom = key }
                 if let h = houses.first(where: { $0.mediaRoomKey == key }) {
                     do {
-                        try await HouseSyncEngine.shared.pushDelete(h)
+                        try await HouseRepository.shared.pushDelete(h)
                         HouseLocalDeletionStore.remove(key)
                         BackupLogStore.log(category: "房源", action: "删除双端房源", result: "成功",
                                            detail: "服务器与本地永久删除，不可恢复",
@@ -1190,9 +1189,9 @@ struct HouseListView: View {
                     SyncFailStore.clear(h.mediaRoomKey)
                     UnreadCloudHouseStore.clear(h.mediaRoomKey)
                     HouseMediaUploadQueue.removeRoom(h.mediaRoomKey)
-                    ctx.delete(h)
+                    HouseRepository.shared.delete(h)
                 }
-                try? ctx.save()
+                try? HouseRepository.shared.save()
                 deleteRunning = false
                 deleteCurrentRoom = ""
                 deleteTarget = nil
@@ -1239,12 +1238,11 @@ struct HouseListView: View {
     /// 默认列表筛选口径为「待租」，切换为已租后该房源从当前列表消失；已租筛选下左滑可一键改回待租。
     /// v1.19：切换时刷新最后更新时间，并把新状态同步到云端账本（共享房源）。
     private func toggleHouseStatus(_ house: House) {
-        guard let ctx = houseModelContext else { return }
         let oldStatus = house.status
         let roomKey = house.mediaRoomKey
         house.status = (house.status == .rented) ? .available : .rented
         house.lastUpdatedAt = Date()
-        try? ctx.save()
+        try? HouseRepository.shared.save()
         // v2.45：账本事件
         HouseLedgerStore.append(
             roomKey: roomKey,
@@ -1265,9 +1263,14 @@ struct HouseListView: View {
             let roomNo = house.displayRoomNo
             Task {
                 do {
-                    _ = try await HouseSyncEngine.shared.pushHouse(house)
-                    BackupLogStore.log(category: "房源", action: action, result: "成功",
-                                       detail: changeText, room: roomKey, cloud: true)
+                    _ = try await HouseRepository.shared.push(house)
+                    if HousePendingRegistry.change(for: roomKey) != nil {
+                        // 之前失败过：把那条“待同步”收口成成功，不再叠加第二条成功日志
+                        HouseRepository.shared.completePending(roomKey, remoteKey: roomKey)
+                    } else {
+                        BackupLogStore.log(category: "房源", action: action, result: "成功",
+                                           detail: changeText, room: roomKey, cloud: true)
+                    }
                     await MainActor.run {
                         HouseActionNotifier.shared.send(
                             key: "status.\(roomKey)",
@@ -1275,11 +1278,11 @@ struct HouseListView: View {
                             body: "\(roomNo) 已改为\(house.status.label)，服务器已更新")
                     }
                 } catch {
-                    BackupLogStore.log(category: "房源", action: action, result: "失败",
-                                       detail: "服务器更新失败：\(error.localizedDescription)",
-                                       room: roomKey, cloud: true)
+                    BackupLogStore.log(category: "房源", action: action, result: "待同步",
+                                       detail: "\(changeText)；服务器更新失败，已存本机待补传（\(error.localizedDescription)）",
+                                       room: roomKey, cloud: false)
                     await MainActor.run {
-                        HousePendingUploader.shared.markPending(roomKey)
+                        HouseRepository.shared.markPending(roomKey, action: action, detail: changeText)
                         HouseActionNotifier.shared.send(
                             key: "statusfail.\(roomKey)",
                             title: "状态同步失败",
@@ -1386,7 +1389,7 @@ struct HouseListView: View {
     @discardableResult
     /// 服务器模式同步：先补传本机改动，再把服务器清单应用到本地；
     /// 整次动作挂任务中心持久任务，媒体回补另挂“下载服务器媒体”任务并驱动卡片进度。
-    private func runServerSync(context ctx: ModelContext, retryTaskID: UUID? = nil) async -> CloudPullRunOutcome {
+    private func runServerSync(retryTaskID: UUID? = nil) async -> CloudPullRunOutcome {
         let taskID: UUID
         if let retryTaskID {
             taskID = retryTaskID
@@ -1399,11 +1402,11 @@ struct HouseListView: View {
         }
         do {
             // 先补传本地离线写，再拉取服务器全量清单对账，保证两端最终一致
-            _ = await HousePendingUploader.shared.flush(context: ctx)
+            _ = await HouseRepository.shared.flushPending()
             syncCenter.advance(id: taskID, done: 0, note: "正在拉取服务器房源")
-            let result = try await HouseSyncEngine.shared.pull(context: ctx, reportMediaTask: true)
-            let hidden = HouseSyncEngine.shared.hiddenCloudCount
-            let pending = HousePendingUploader.shared.pendingKeys.count
+            let result = try await HouseRepository.shared.pull(reportMediaTask: true)
+            let hidden = HouseRepository.shared.hiddenCloudCount()
+            let pending = HouseRepository.shared.pendingKeys().count
             var tail = (hidden > 0 ? "；\(hidden) 套仅删本地，仍保持隐藏" : "")
                 + (pending > 0 ? "；\(pending) 套本机改动未同步，已保留本地，请点重试" : "")
             if let mediaNote = result.mediaNote {
@@ -1436,16 +1439,10 @@ struct HouseListView: View {
             return
         }
         let hidden = HouseLocalDeletionStore.count()
-        guard let ctx = houseModelContext else {
-            refreshPrompt = hidden > 0
-                ? .hidden(count: hidden, deep: deep, summary: nil)
-                : .confirm(deep: deep, summary: "数据容器不可用，暂时无法预览服务器变化。仍可尝试同步。")
-            return
-        }
         isSyncing = true
         Task {
             do {
-                let preview = try await HouseSyncEngine.shared.preview(context: ctx)
+                let preview = try await HouseRepository.shared.preview()
                 await MainActor.run {
                     isSyncing = false
                     if hidden > 0 {
@@ -1482,8 +1479,8 @@ struct HouseListView: View {
         await MainActor.run { CloudDetectActivity.shared.beginManualSync() }
         defer { DispatchQueue.main.async { CloudDetectActivity.shared.endManualSync() } }
         // 服务器模式：房源读写走 8082 house-keeper 权威接口，短路旧对象存储直连链路
-        if HouseServerMode.ready, let ctx = houseModelContext {
-            return await runServerSync(context: ctx, retryTaskID: retryTaskID)
+        if HouseServerMode.ready {
+            return await runServerSync(retryTaskID: retryTaskID)
         }
         // 旧对象存储直连兜底链路已下线：未连接服务器时仅返回失败，本地数据可离线查看
         return .failed("服务器未连接，请检查网络后重试")
@@ -1494,7 +1491,7 @@ struct HouseListView: View {
 
     /// 批量已租：选中的待租房源全部标为已租（已租的保持不变），完成后自动退出多选
     private func batchSetRented() {
-        guard !selectedHouseIDs.isEmpty, let ctx = houseModelContext else { return }
+        guard !selectedHouseIDs.isEmpty else { return }
         var changed = 0
         var rentedHouses: [House] = []
         for house in houses where selectedHouseIDs.contains(house.id) && house.status == .available {
@@ -1510,7 +1507,7 @@ struct HouseListView: View {
             rentedHouses.append(house)
             changed += 1
         }
-        try? ctx.save()
+        try? HouseRepository.shared.save()
         // v2.24：批量已租也要推云端（此前只改本地，下次同步被云端旧状态回滚回去）
         // 服务器模式：逐套推服务器权威库，失败入待补传；旧对象存储链路仅在非服务器模式走
         if HouseServerMode.ready, !rentedHouses.isEmpty {
@@ -1522,7 +1519,7 @@ struct HouseListView: View {
                     let roomKey = house.mediaRoomKey
                     let roomNo = house.displayRoomNo
                     do {
-                        _ = try await HouseSyncEngine.shared.pushHouse(house)
+                        _ = try await HouseRepository.shared.push(house)
                         BackupLogStore.log(category: "房源", action: "批量标记已租", result: "成功",
                                            detail: "状态：\(HouseStatus.available.label) → \(HouseStatus.rented.label)",
                                            room: roomKey, cloud: true)
@@ -1531,7 +1528,10 @@ struct HouseListView: View {
                         BackupLogStore.log(category: "房源", action: "批量标记已租", result: "失败",
                                            detail: "服务器更新失败：\(error.localizedDescription)",
                                            room: roomKey, cloud: true)
-                        await MainActor.run { HousePendingUploader.shared.markPending(roomKey) }
+                        await MainActor.run {
+                            HouseRepository.shared.markPending(roomKey, action: "批量标记已租",
+                                                              detail: "状态：\(HouseStatus.available.label) → \(HouseStatus.rented.label)")
+                        }
                         failRooms.append(roomNo)
                     }
                 }
@@ -1639,7 +1639,7 @@ struct HouseListView: View {
             shareIndex = 0
             presentShareStep(items)
             singleShareHouse = nil
-            Task { try? await HouseRemoteClient.shared.addShareRecord(roomKey: roomKey, channel: "app内分享", summary: info.shareText) }
+            Task { try? await HouseRepository.shared.addShareRecord(roomKey: roomKey, channel: "app内分享", summary: info.shareText) }
             return
         }
         // 旧桶卡片链接已下线：未接入服务器回退本地媒体 + 纯文字系统分享
@@ -1714,7 +1714,7 @@ struct HouseListView: View {
             presentShareStep(batches[0])
             Task {
                 for rec in records {
-                    try? await HouseRemoteClient.shared.addShareRecord(roomKey: rec.roomKey, channel: "app内分享", summary: rec.summary)
+                    try? await HouseRepository.shared.addShareRecord(roomKey: rec.roomKey, channel: "app内分享", summary: rec.summary)
                 }
             }
             return

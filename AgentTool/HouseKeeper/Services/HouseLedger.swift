@@ -350,7 +350,7 @@ enum HouseLedgerStore {
         var failed = false
         for ev in pending {
             do {
-                try await HouseRemoteClient.shared.appendLedger(roomKey: roomKey, event: ev)
+                try await HouseRepository.shared.appendLedger(roomKey: roomKey, event: ev)
                 uploaded.append(ev)
             } catch {
                 failed = true

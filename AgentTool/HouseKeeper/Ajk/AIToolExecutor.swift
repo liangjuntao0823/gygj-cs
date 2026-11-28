@@ -592,7 +592,7 @@ struct AIToolExecutor {
                 // v2.37（#3）：动本地目录前先校验新 key 云端没被别的房占用；占用或网络拿不准就回滚改动、不保存不迁移
                 if HouseServerMode.ready {
                     do {
-                        if let occupied = try await HouseRemoteClient.shared.getHouse(newRoomKey) {
+                        if let occupied = try await HouseRepository.shared.getHouse(newRoomKey) {
                             house.roomNo = originalRoomNo
                             house.tower = originalTower
                             return "目标房号 \(occupied.roomNo) 已存在，不能改过去，已取消本次修改"
@@ -620,7 +620,7 @@ struct AIToolExecutor {
                 if HouseServerMode.ready {
                     do {
                         // 服务器硬删旧 key：后端级联移除账本与磁盘媒体
-                        try await HouseRemoteClient.shared.delete(oldRoomKey)
+                        try await HouseRepository.shared.deleteRemote(oldRoomKey)
                     } catch {
                         BackupLogStore.log(category: "房源", action: "AI改房号清理旧目录", result: "失败",
                                           detail: "\(oldRoomKey)：\(error.localizedDescription)", cloud: false)
@@ -668,7 +668,7 @@ struct AIToolExecutor {
             SyncFailStore.clear(roomKey)
             UnreadCloudHouseStore.clear(roomKey)
             if HouseServerMode.ready {
-                try? await HouseRemoteClient.shared.delete(roomKey)
+                try? await HouseRepository.shared.deleteRemote(roomKey)
             }
             logAI(category: "房源", action: "彻底删除", result: "成功", detail: label + "（本地 + 云端）")
             return "已彻底删除房源 \(label)：本地照片视频、数据库记录、云端目录一并清除，不可恢复，时间 \(dateText(Date()))"
@@ -696,7 +696,7 @@ struct AIToolExecutor {
         // 服务器模式：走服务器权威库（HouseSyncEngine.pushHouse），不进旧对象存储账本链路
         if HouseServerMode.ready {
             do {
-                _ = try await HouseSyncEngine.shared.pushHouse(house)
+                _ = try await HouseRepository.shared.push(house)
                 house.cloudStatus = .both
                 try? houseModelContext?.save()
                 SyncFailStore.clear(house.mediaRoomKey)

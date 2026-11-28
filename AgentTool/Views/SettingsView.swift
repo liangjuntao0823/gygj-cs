@@ -107,7 +107,9 @@ struct SettingsView: View {
     private func updateStatusText() -> String {
         switch updateCenter.checkState {
         case .checking: return "检查中…"
-        case .failed: return "连不上云端"
+        case .failed:
+            if let d = updateCenter.failureDetail, !d.isEmpty { return "检查失败：\(d)" }
+            return "连不上云端"
         case .upToDate: return "已是最新"
         case .idle: return updateCenter.available == nil ? "" : "有新版本"
         }
@@ -1242,6 +1244,14 @@ struct VersionHistoryView: View {
     @State private var cloudFailed = false
     @State private var didLoadCloud = false
     let versions: [(version: String, date: String, changes: [String])] = [
+        ("v1.0-b29", "2026-11-28", [
+            "修复：名片保存后返回再进被清空——保存后回读钥匙串校验，进页面同时刷新姓名/电话，不再只刷新二维码",
+            "修复：隐藏版 H5 分享跳微信无内容——分享面板改为从最顶层控制器直呈，不再套在 SwiftUI sheet 内",
+            "修复：设置页“检查更新”误报连不上云端——增加公开在线更新接口兜底，并显示真实失败原因",
+            "修复：离线待同步日志写明具体改动（如“修改备注 空 改 测试”），补传成功后就地收口为一条成功日志；任务中心“上传房源改动”卡片显示改了什么",
+            "新增：设置 > 账号与云端显示服务器磁盘已用/剩余/房源媒体占用，可手动刷新",
+            "重构：房源视图与任务中心统一走 HouseRepository 仓库层，数据读写和服务器同步不再各写一套",
+        ]),
         ("v2.72", "2026-11-22", [
             "修复：【首期晚于当前月的房源，首期打勾后卡片仍挂「待收」、工作台还催上一月】——未收判定和应收期全部改为直接读取收租计划（月度收租记录），计划没覆盖的月份不再被当成欠租：首期之前不催租，首期已交、下期尚远显示已收；同时对齐桌面小组件未收计数、本地推送提醒、AI 欠租清单和导出表的本月状态，口径与收租计划一致",
             "修复：【账单带附加费时首次弹出的分享面板一片空白，关掉重开第二次才正常】——账单分享面板改为从最顶层控制器直呈（与房源分享视频同一套直呈写法），不再套在刚收起的附加费表单弹层上；账单图仍先压成 JPEG 临时文件再交给系统分享，大图不卡死",
@@ -1947,6 +1957,26 @@ final class FullBackupProgressHub: ObservableObject {
 
 // MARK: 组 1 账号与云端
 struct AccountSettingsPage: View {
+    @State private var storage: RemoteStorageStats?
+    @State private var storageError: String?
+    @State private var loadingStorage = false
+
+    private func loadStorage() async {
+        loadingStorage = true
+        storageError = nil
+        do {
+            storage = try await HouseRepository.shared.fetchStorageStats()
+        } catch {
+            storage = nil
+            storageError = error.localizedDescription
+        }
+        loadingStorage = false
+    }
+
+    private func bytes(_ n: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: n, countStyle: .file)
+    }
+
     var body: some View {
         Form {
             Section {
@@ -1980,6 +2010,50 @@ struct AccountSettingsPage: View {
                         Image(systemName: "server.rack")
                     }
                 }
+                // b29：服务器磁盘用量（已用 / 剩余 / 媒体占用），点整行刷新
+                Button {
+                    Task { await loadStorage() }
+                } label: {
+                    HStack {
+                        Label {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("服务器磁盘")
+                                if let storage, storage.diskTotal > 0 {
+                                    Text("已用 \(bytes(storage.diskUsed)) / 共 \(bytes(storage.diskTotal))")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                    Text("剩余 \(bytes(storage.diskFree))" + (storage.mediaBytes.map { " · 房源媒体 \(bytes($0))" } ?? ""))
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                } else if loadingStorage {
+                                    Text("读取中…")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                } else if let storageError {
+                                    Text("读取失败：\(storageError)")
+                                        .font(.caption2)
+                                        .foregroundStyle(.red)
+                                        .lineLimit(2)
+                                } else {
+                                    Text("点此读取服务器磁盘用量")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        } icon: {
+                            Image(systemName: "internaldrive")
+                        }
+                        Spacer()
+                        if loadingStorage {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
             } header: {
                 Text("账号与云端")
             } footer: {
@@ -1988,6 +2062,7 @@ struct AccountSettingsPage: View {
         }
         .navigationTitle("账号与云端")
         .navigationBarTitleDisplayMode(.inline)
+        .task { await loadStorage() }
     }
 }
 

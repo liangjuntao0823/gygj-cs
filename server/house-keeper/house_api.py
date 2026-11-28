@@ -168,6 +168,13 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
             doc = store.public_single(key)
             return send(200 if doc else 404, doc or {"ok": False, "error": "not_found"})
 
+        # b29：公开在线更新块。检查更新只依赖这份非敏感信息，不再受房屋库授权 token 影响。
+        if path == f"{PUBLIC_PREFIX}/app-update" and method == "GET":
+            app_cfg = store.config_get("app")
+            keys = ("update", "changelog", "minimumVersion")
+            public_cfg = {k: app_cfg[k] for k in keys if k in app_cfg}
+            return send(200, {"ok": True, **public_cfg})
+
         if path == f"{PUBLIC_PREFIX}/profile" and method == "GET":
             prof = store.profile_get()
             return send(200, {"ok": True, "profile": {
@@ -188,6 +195,12 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
 
         if path == f"{PREFIX}/health" and method == "GET":
             return send(200, {"ok": True, "service": "house-keeper", **store.stats()})
+
+        # b29：设置页服务器磁盘用量（鉴权后返回；后台看板早就有同一口径）
+        if path == f"{PREFIX}/storage" and method == "GET":
+            if not auth_house():
+                return True
+            return send(200, {"ok": True, **store.storage_stats()})
 
         if path == f"{PREFIX}/stats" and method == "GET":
             if not auth_house():

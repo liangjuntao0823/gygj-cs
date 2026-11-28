@@ -59,6 +59,8 @@ enum RemoteConfig {
 
     private static var _current = Payload()
     static var current: Payload { _current }
+    /// 最近一次配置/更新拉取的错误原文，设置页用于区分“令牌失效 / 超时 / 网络断”
+    private(set) static var lastRefreshError: String?
 
     /// 配置缓存目录：Documents/Config/（随「备份」体系一起被文件 App 备份）
     private static var cacheDir: URL {
@@ -95,8 +97,37 @@ enum RemoteConfig {
             let p = try JSONDecoder().decode(Payload.self, from: data)
             _current = p
             try? data.write(to: cacheURL, options: .atomic)
+            lastRefreshError = nil
             return true
         } catch {
+            lastRefreshError = error.localizedDescription
+            return false
+        }
+        #else
+        return false
+        #endif
+    }
+
+    /// b29：检查更新的兜底通道。
+    /// /api/house/config 需要房源库授权，令牌过期/权限收紧时会把“只是查更新”误报成“连不上云端”；
+    /// 公开更新块只含非敏感的 update/changelog/minimumVersion，可独立完成检查。
+    @discardableResult
+    static func refreshPublicUpdate() async -> Bool {
+        #if !APP_EXTENSION
+        do {
+            let dict = try await HouseRemoteClient.shared.fetchPublicUpdate()
+            let data = try JSONSerialization.data(withJSONObject: dict)
+            let p = try JSONDecoder().decode(Payload.self, from: data)
+            if let update = p.update { _current.update = update }
+            if let changelog = p.changelog { _current.changelog = changelog }
+            if let minimumVersion = p.minimumVersion { _current.minimumVersion = minimumVersion }
+            if let cached = try? JSONEncoder().encode(_current) {
+                try? cached.write(to: cacheURL, options: .atomic)
+            }
+            lastRefreshError = nil
+            return true
+        } catch {
+            lastRefreshError = error.localizedDescription
             return false
         }
         #else
@@ -160,6 +191,8 @@ final class UpdateCenter: ObservableObject {
     @Published private(set) var available: Available?
     @Published private(set) var checkState: CheckState = .idle
     @Published private(set) var lastCheckedAt: Date?
+    /// 检查失败的原始原因（设置页副标题显示，避免一律归成“连不上云端”）
+    @Published private(set) var failureDetail: String?
     /// v2.22：启动弹窗（只在每次冷启动检查出有新版本时置一次；关掉即清空）
     @Published private(set) var launchPopupVersion: String?
 
@@ -242,7 +275,11 @@ final class UpdateCenter: ObservableObject {
 
     private func runCheck(showPopup: Bool) async {
         checkState = .checking
-        let ok = await RemoteConfig.refresh()
+        var ok = await RemoteConfig.refresh()
+        // b29：房源库授权失效时 /api/house/config 会 401，但“检查更新”本身不敏感，
+        // 再走公开更新块兜底，避免把“令牌过期”误报成“连不上云端”。
+        if !ok { ok = await RemoteConfig.refreshPublicUpdate() }
+        failureDetail = ok ? nil : (RemoteConfig.lastRefreshError ?? "网络请求超时")
         evaluate()
         if available != nil {
             checkState = .idle

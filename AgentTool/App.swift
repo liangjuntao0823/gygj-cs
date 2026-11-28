@@ -93,6 +93,8 @@ struct AgentToolApp: App {
                 }
             }
         }
+        // b29：统一仓库层拿到 HouseStore 主 context；所有视图的房源读写都从这里进。
+        HouseRepository.shared.configure(context: houseContainer.mainContext)
     }
 
     /// v1.8：找回被隔离的主库文件（此前容器初始化失败时自动移入 backup_<时间戳> 的 store 文件）。

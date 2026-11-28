@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import shutil
 import sqlite3
 import threading
 import time
@@ -934,6 +935,44 @@ class HouseStore:
     # ------------------------------------------------------------------
     # 远程配置（app_config：可变配置 / 在线更新块，服务器为权威）
     # ------------------------------------------------------------------
+    def storage_stats(self) -> dict[str, Any]:
+        """磁盘与房源媒体占用；设置页直接读这个口径。
+        磁盘总量取根分区，媒体体积只统计 media/houses（不含备份/二维码）。
+        """
+        try:
+            usage = shutil.disk_usage("/")
+            total, used, free = usage.total, usage.used, usage.free
+            percent = round(used / total * 100, 1) if total else 0.0
+        except OSError:
+            total = used = free = 0
+            percent = 0.0
+        media_bytes = 0
+        media_files = 0
+        houses_root = self.media.root / "houses"
+        try:
+            for item in houses_root.rglob("*"):
+                if item.is_file():
+                    media_files += 1
+                    try:
+                        media_bytes += item.stat().st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        with self._lock:
+            house_count = self._conn.execute(
+                "SELECT COUNT(*) c FROM houses WHERE is_deleted=0").fetchone()["c"]
+        return {
+            "diskTotal": total,
+            "diskUsed": used,
+            "diskFree": free,
+            "diskPercent": percent,
+            "mediaBytes": media_bytes,
+            "mediaFiles": media_files,
+            "mediaRoot": str(self.media.root),
+            "houseCount": house_count,
+        }
+
     def config_get(self, key: str) -> dict[str, Any]:
         with self._lock:
             row = self._conn.execute(

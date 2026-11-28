@@ -258,7 +258,7 @@ struct ServerConfigView: View {
         busy = true
         serverTip = nil
         Task {
-            let result = await HouseRemoteClient.shared.testConnection()
+            let result = await HouseRepository.shared.testConnection()
             busy = false
             serverTip = result.summary
             tipPositive = result.isPositive
@@ -461,7 +461,11 @@ struct ShareProfileView: View {
         .navigationTitle("名片信息")
         .navigationBarTitleDisplayMode(.inline)
         // v1.42：返回本页时重新读本地二维码（与分享水印开关同款修法——init 缓存可能陈旧，onAppear 刷新即显示最新）
+        // b29：姓名/电话也一起回读。此前只在 init 读一次，导航栈复用页面时 @State 会被重置为空。
         .onAppear {
+            let profile = ShareProfileStore.load()
+            shareName = profile.name
+            sharePhone = profile.phone
             if let data = QrcodeStore.loadData() {
                 qrImage = UIImage(data: data)
             } else {
@@ -489,10 +493,17 @@ struct ShareProfileView: View {
             savedTip = "姓名不能为空"
             return
         }
-        var ok = KeychainFix.saveVerified(name, for: KeychainKey.shareName)
-        ok = KeychainFix.saveVerified(phone, for: KeychainKey.sharePhone) && ok
+        var ok = ShareProfileStore.save(name: name, phone: phone)
+        // 回读校验：保存后立刻从同一钥匙串读取，避免“提示成功但下次进页面为空”的假成功。
+        let saved = ShareProfileStore.load()
+        if saved.name != name || saved.phone != phone { ok = false }
         // v1.47：保存后同步云端名片（公开选房页实时生效）
         syncProfileToCloud(name: name, phone: phone)
+        if ok {
+            // 把状态同步成刚落库的值，返回再进也以钥匙串为准
+            shareName = saved.name
+            sharePhone = saved.phone
+        }
         savedTip = ok ? "名片信息已保存 ✅\n姓名：\(name)\n电话：\(phone.isEmpty ? "（未填，分享页不显示电话）" : phone)\n重新复制/分享链接即带上新名片" : "写入本机钥匙串失败，请重新保存一次"
     }
 }
@@ -505,7 +516,6 @@ struct RoomsShareView: View {
     @State private var serverLink = ""
     @State private var linkTip: String?
     @State private var copiedTip: String?
-    @State private var showShareSheet = false
 
     /// v1.49：公开选房链接改为 服务器托管链接（与单房分享 H5 同域名同机制，微信内可正常打开）。
     /// 由云函数 roomsSeed 生成静态壳并上传服务器 users/<用户名>/rooms/index.html 后返回；
@@ -531,7 +541,8 @@ struct RoomsShareView: View {
                         Label("复制链接", systemImage: "doc.on.doc")
                     }
                     Button {
-                        showShareSheet = true
+                        // b29：直呈系统分享面板，微信扩展才拿得到内容
+                        SharePresenter.present(items: [link])
                     } label: {
                         Label("分享给租客", systemImage: "square.and.arrow.up")
                     }
@@ -556,9 +567,6 @@ struct RoomsShareView: View {
             if serverLink.isEmpty {
                 Task { await refreshLink() }
             }
-        }
-        .sheet(isPresented: $showShareSheet) {
-            HouseShareSheet(items: [link])
         }
         .alert("已复制", isPresented: Binding(
             get: { copiedTip != nil },

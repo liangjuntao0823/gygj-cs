@@ -5,22 +5,11 @@ import AVFoundation
 import Photos
 
 struct HouseDetailView: View {
-    /// 房源板块专属 context（独立 HouseStore 容器，由 App 注入）
-    @Environment(\.houseModelContext) private var houseModelContext
     /// v1.17 需求1：主容器 context（DealRecord/Property 等经营数据所在容器）。
     /// 闪退根因：成交/在租/退租的关联查询此前误用了 houseModelContext（HouseStore 只注册 House/MediaItem），
     /// 在独立容器查未注册模型触发 SwiftData 崩溃——必须用主容器查。
     @Environment(\.modelContext) private var mainCtx
     @Environment(\.dismiss) private var dismiss
-
-    /// 当前可用的房源数据上下文（App 内必然已注入；缺失属程序 bug，崩溃前留痕便于定位）
-    private var modelContext: ModelContext {
-        guard let ctx = houseModelContext else {
-            CrashLogCollector.logFatal(title: "HouseDetailView 缺少 houseModelContext 注入", body: "house 房号：\(house.roomNo)")
-            fatalError("houseModelContext 未注入")
-        }
-        return ctx
-    }
 
     let house: House
 
@@ -32,8 +21,7 @@ struct HouseDetailView: View {
     @State private var showShareModePicker = false    // v1.21：分享前先选「脱敏 / 完整」
     @State private var previewRoute: PhotoPreviewRoute? = nil
     @State private var shareItems: [Any] = []
-    /// v2.29：视频/卡片分享统一走 sheet 呈现（与 2.17 一致）
-    @State private var detailShareStep: ShareStep? = nil
+    // b29：分享改用 SharePresenter 直呈（旧 .sheet 会让微信扩展拿不到 presentedViewController）
     // v2.26：视频逐个发送队列（微信扩展单次只认 1 个视频，多视频塞一个面板会整条失败）
     @State private var videoShareQueue: [[Any]] = []
     @State private var videoShareIndex = 0
@@ -184,18 +172,6 @@ struct HouseDetailView: View {
                         Button("编辑") { showEdit = true }
                     }
                 }
-            }
-            // v2.29：分享面板走 sheet（2.17 可用版本的做法），关闭后问「继续发送下一个」
-            .sheet(item: $detailShareStep, onDismiss: {
-                if !videoShareQueue.isEmpty, videoShareIndex < videoShareQueue.count - 1 {
-                    videoShareRemaining = videoShareQueue.count - videoShareIndex - 1
-                    showContinueVideoShare = true
-                } else if !videoShareQueue.isEmpty {
-                    videoShareQueue = []
-                    videoShareIndex = 0
-                }
-            }) { step in
-                HouseShareSheet(items: step.items)
             }
             .sheet(isPresented: $showEdit) {
                 HouseEditView(house: house)
@@ -766,7 +742,7 @@ struct HouseDetailView: View {
     private func purgeLocalHouse() {
         let roomKey = house.mediaRoomKey
         let displayNo = house.displayRoomNo
-        let deleted = HouseSyncEngine.shared.purgeLocalHouses([roomKey], context: modelContext)
+        let deleted = HouseRepository.shared.purgeLocal([roomKey])
         if deleted > 0 {
             deleteResultMessage = "已按服务器为准删除本机房源（\(displayNo)）"
         } else {
@@ -783,7 +759,7 @@ struct HouseDetailView: View {
         house.updatedAt = Date()
         // v1.19：切换状态也刷新最后更新时间并同步云端
         house.lastUpdatedAt = Date()
-        try? modelContext.save()
+        try? HouseRepository.shared.save()
         LocalHouseLedger.save(house)
         // v2.45：状态变化写账本（状态没变不写）
         if oldStatus != newStatus {
@@ -800,8 +776,10 @@ struct HouseDetailView: View {
             // 服务器模式：状态切换直接推服务器权威库，不走旧 COS 账本链路；失败入待补传队列
             Task {
                 do {
-                    _ = try await HouseSyncEngine.shared.pushHouse(house)
-                    if oldStatus != newStatus {
+                    _ = try await HouseRepository.shared.push(house)
+                    if HousePendingRegistry.change(for: roomKey) != nil {
+                        HouseRepository.shared.completePending(roomKey, remoteKey: roomKey)
+                    } else if oldStatus != newStatus {
                         BackupLogStore.log(category: "房源", action: "切换状态", result: "成功",
                                            detail: statusDetail, room: roomKey, cloud: true)
                     }
@@ -813,12 +791,12 @@ struct HouseDetailView: View {
                     }
                 } catch {
                     if oldStatus != newStatus {
-                        BackupLogStore.log(category: "房源", action: "切换状态", result: "失败",
-                                           detail: "服务器更新失败：\(error.localizedDescription)",
-                                           room: roomKey, cloud: true)
+                        BackupLogStore.log(category: "房源", action: "切换状态", result: "待同步",
+                                           detail: "\(statusDetail)；服务器更新失败，已存本机待补传（\(error.localizedDescription)）",
+                                           room: roomKey, cloud: false)
                     }
                     await MainActor.run {
-                        HousePendingUploader.shared.markPending(roomKey)
+                        HouseRepository.shared.markPending(roomKey, action: "切换状态", detail: statusDetail)
                         HouseActionNotifier.shared.send(
                             key: "statusfail.\(roomKey)",
                             title: "状态同步失败",
@@ -859,16 +837,16 @@ struct HouseDetailView: View {
         if HouseServerMode.ready {
             Task {
                 let records = await serverMediaRecords()
-                let download = await HouseRemoteClient.shared.downloadMissingMedia(roomKey: roomKey, records: records)
+                let download = await HouseRepository.shared.downloadMissingMedia(roomKey: roomKey, records: records)
                 let files = download.files
                 await MainActor.run {
                     for f in files {
                         let item = MediaItem(fileName: f.fileName, kind: f.kind)
                         item.house = house
-                        modelContext.insert(item)
+                        HouseRepository.shared.insert(item)
                     }
                     house.cloudStatus = .both
-                    try? modelContext.save()
+                    try? HouseRepository.shared.save()
                     NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
                     isDownloading = false
                     cloudDeleteMessage = files.isEmpty ? "服务器上暂无可下载媒体。" : "已下载 \(files.count) 个媒体到本地，现在可以编辑、分享或一键保存了。"
@@ -894,7 +872,7 @@ struct HouseDetailView: View {
     private func serverMediaRecords() async -> [(fileName: String, kind: String)] {
         let local = house.mediaItems.map { ($0.fileName, $0.kind) }
         guard local.isEmpty, HouseServerMode.ready else { return local }
-        if let remote = try? await HouseRemoteClient.shared.getHouse(house.mediaRoomKey) {
+        if let remote = try? await HouseRepository.shared.getHouse(house.mediaRoomKey) {
             return remote.media?.map { ($0.fileName, $0.kind) } ?? []
         }
         return []
@@ -912,15 +890,15 @@ struct HouseDetailView: View {
         Task {
             if HouseServerMode.ready {
                 let records = house.mediaItems.map { ($0.fileName, $0.kind) }
-                let download = await HouseRemoteClient.shared.downloadMissingMedia(roomKey: roomKey, records: records)
+                let download = await HouseRepository.shared.downloadMissingMedia(roomKey: roomKey, records: records)
                 let files = download.files
                 await MainActor.run {
                     for f in files where !house.mediaItems.contains(where: { $0.fileName == f.fileName }) {
                         let item = MediaItem(fileName: f.fileName, kind: f.kind)
                         item.house = house
-                        modelContext.insert(item)
+                        HouseRepository.shared.insert(item)
                     }
-                    try? modelContext.save()
+                    try? HouseRepository.shared.save()
                     NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
                     isDownloading = false
                 }
@@ -942,16 +920,16 @@ struct HouseDetailView: View {
         Task {
             if HouseServerMode.ready {
                 let records = await serverMediaRecords()
-                let download = await HouseRemoteClient.shared.downloadMissingMedia(roomKey: roomKey, records: records)
+                let download = await HouseRepository.shared.downloadMissingMedia(roomKey: roomKey, records: records)
                 let files = download.files
                 await MainActor.run {
                     for f in files {
                         let item = MediaItem(fileName: f.fileName, kind: f.kind)
                         item.house = house
-                        modelContext.insert(item)
+                        HouseRepository.shared.insert(item)
                     }
                     house.cloudStatus = .both
-                    try? modelContext.save()
+                    try? HouseRepository.shared.save()
                     NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
                     isDownloading = false
                     if files.isEmpty {
@@ -983,7 +961,6 @@ struct HouseDetailView: View {
     private func deleteHouse() {
         // 删除：服务器模式先删服务器权威库、成功后删本机记录；未接入仅删本地。
         // 旧桶文件夹删除编排已下线；服务器模式删除服务器权威库与磁盘媒体。
-        guard let ctx = houseModelContext else { return }
         let roomKey = house.mediaRoomKey
         // 删除事件不能先写“成功”：服务器硬删可能失败，账本文件也会随房源目录被删。
         // 统一在真正删完后写一条云端 ops；失败分支只写失败。
@@ -992,15 +969,15 @@ struct HouseDetailView: View {
             isDeletingCloud = true
             Task {
                 do {
-                    try await HouseSyncEngine.shared.pushDelete(house)
+                    try await HouseRepository.shared.pushDelete(house)
                     HouseLocalDeletionStore.remove(roomKey)
                     await MainActor.run {
                         MediaStore.deleteHouseDirectory(roomKey: roomKey)
                         SyncFailStore.clear(roomKey)
                         UnreadCloudHouseStore.clear(roomKey)
                         HouseMediaUploadQueue.removeRoom(roomKey)
-                        modelContext.delete(house)
-                        try? modelContext.save()
+                        HouseRepository.shared.delete(house)
+                        try? HouseRepository.shared.save()
                         isDeletingCloud = false
                         deleteResultMessage = "已删除服务器与本地房源"
                         BackupLogStore.log(category: "房源", action: "删除双端房源", result: "成功",
@@ -1026,8 +1003,8 @@ struct HouseDetailView: View {
         SyncFailStore.clear(roomKey)
         UnreadCloudHouseStore.clear(roomKey)
         HouseMediaUploadQueue.removeRoom(roomKey)
-        ctx.delete(house)
-        try? ctx.save()
+        HouseRepository.shared.delete(house)
+        try? HouseRepository.shared.save()
         BackupLogStore.log(category: "房源", action: "删除房源", result: "成功",
                            detail: "仅删除本地房源（未接入服务器）", room: roomKey, cloud: true)
         NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
@@ -1106,10 +1083,23 @@ struct HouseDetailView: View {
         showShareModePicker = true
     }
 
+    /// b29：从顶层控制器直呈系统分享面板；微信扩展需要这个上下文。
+    private func presentDetailShare(_ items: [Any]) {
+        SharePresenter.present(items: items) {
+            if !videoShareQueue.isEmpty, videoShareIndex < videoShareQueue.count - 1 {
+                videoShareRemaining = videoShareQueue.count - videoShareIndex - 1
+                showContinueVideoShare = true
+            } else if !videoShareQueue.isEmpty {
+                videoShareQueue = []
+                videoShareIndex = 0
+            }
+        }
+    }
+
     /// v2.26：逐个弹出视频分享面板，发完一个问是否继续
     private func presentDetailVideoBatch() {
         guard videoShareIndex < videoShareQueue.count else { return }
-        detailShareStep = ShareStep(items: videoShareQueue[videoShareIndex])
+        presentDetailShare(videoShareQueue[videoShareIndex])
     }
 
     /// v2.17：只分享视频——不走云端卡片（无需备案域名、无需对象存储配置）。
@@ -1178,8 +1168,8 @@ struct HouseDetailView: View {
             var items: [Any] = urls
             if let h5 = HouseRemoteClient.h5URL(roomKey: roomKey) { items.append(h5) }
             items.append(info.shareText)
-            detailShareStep = ShareStep(items: items)
-            Task { try? await HouseRemoteClient.shared.addShareRecord(roomKey: roomKey, channel: "app内分享", summary: info.shareText) }
+            presentDetailShare(items)
+            Task { try? await HouseRepository.shared.addShareRecord(roomKey: roomKey, channel: "app内分享", summary: info.shareText) }
             return
         }
         // 未接入服务器：旧桶卡片链接已下线，回退本地媒体 + 文字系统分享
@@ -1187,7 +1177,7 @@ struct HouseDetailView: View {
             let u = MediaStore.url(for: f.name, roomKey: roomKey)
             return FileManager.default.fileExists(atPath: u.path) ? u : nil
         }
-        detailShareStep = ShareStep(items: localUrls + [info.shareText])
+        presentDetailShare(localUrls + [info.shareText])
     }
 
     // MARK: - v1.15 需求1：一键保存（全部图片+视频保存到手机相册）

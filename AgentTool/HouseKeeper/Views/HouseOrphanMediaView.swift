@@ -109,7 +109,7 @@ struct HouseOrphanMediaView: View {
         resultText = nil
         defer { loading = false }
         do {
-            let res = try await HouseRemoteClient.shared.listOrphanMedia()
+            let res = try await HouseRepository.shared.listOrphanMedia()
             files = res.files
             totalBytes = res.totalBytes
             minAgeSeconds = res.minAgeSeconds
@@ -126,7 +126,7 @@ struct HouseOrphanMediaView: View {
         resultText = nil
         defer { deleting = false }
         do {
-            let res = try await HouseRemoteClient.shared.deleteOrphanMedia(
+            let res = try await HouseRepository.shared.deleteOrphanMedia(
                 objectKeys: files.map { $0.objectKey }, minAge: minAgeSeconds)
             resultText = "已删除 \(res.deleted.count) 个；跳过 \(res.skipped.count) 个（已引用/太新/已不存在）"
             await scan()

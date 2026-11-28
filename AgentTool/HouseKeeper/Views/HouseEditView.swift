@@ -4,18 +4,7 @@ import PhotosUI
 import UIKit
 
 struct HouseEditView: View {
-    /// 房源板块专属 context（独立 HouseStore 容器，由 App 注入）
-    @Environment(\.houseModelContext) private var houseModelContext
     @Environment(\.dismiss) private var dismiss
-
-    /// 当前可用的房源数据上下文（App 内必然已注入；缺失属程序 bug，崩溃前留痕便于定位）
-    private var modelContext: ModelContext {
-        guard let ctx = houseModelContext else {
-            CrashLogCollector.logFatal(title: "HouseEditView 缺少 houseModelContext 注入", body: "house 房号：\(house?.roomNo ?? "新增")")
-            fatalError("houseModelContext 未注入")
-        }
-        return ctx
-    }
 
     /// 传入房源 = 编辑；nil = 新增
     let house: House?
@@ -67,11 +56,11 @@ struct HouseEditView: View {
 
     // v2.7（P2⑭）：从全量房源取已知房东/户型去重，做输入辅助下拉（不强制，可手动输入新值）
     private var knownLandlords: [String] {
-        let all = (try? modelContext.fetch(FetchDescriptor<House>())) ?? []
+        let all = (try? HouseRepository.shared.fetchAll(includeTrashed: true)) ?? []
         return Array(Set(all.compactMap { $0.landlord.isEmpty ? nil : $0.landlord })).sorted()
     }
     private var knownLayouts: [String] {
-        let all = (try? modelContext.fetch(FetchDescriptor<House>())) ?? []
+        let all = (try? HouseRepository.shared.fetchAll(includeTrashed: true)) ?? []
         return Array(Set(all.compactMap { $0.layout.isEmpty ? nil : $0.layout })).sorted()
     }
 
@@ -475,9 +464,8 @@ struct HouseEditView: View {
     private func duplicateCheck(for rawRoomNo: String, tower: Int = 0) -> House? {
         let clean = normalizedRoom(rawRoomNo)
         guard !clean.isEmpty else { return nil }
-        guard let ctx = houseModelContext else { return nil }
         let effectiveTower = tower > 0 ? tower : self.tower
-        let all = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
+        let all = (try? HouseRepository.shared.fetchAll(includeTrashed: true)) ?? []
         return all.first { other in
             if other.isDeleted == true { return false }
             let isSelf = house.map { other.id == $0.id } ?? false
@@ -561,7 +549,7 @@ struct HouseEditView: View {
             if house == nil, HouseServerMode.ready {
                 let key = computeNewRoomKey()
                 do {
-                    if let remote = try await HouseRemoteClient.shared.getHouse(key) {
+                    if let remote = try await HouseRepository.shared.getHouse(key) {
                         await MainActor.run {
                             let layout = remote.layout.isEmpty ? "户型未填" : remote.layout
                             let status = HouseStatus(rawValue: remote.status)?.label ?? remote.status
@@ -693,7 +681,7 @@ struct HouseEditView: View {
             target = house
         } else {
             target = House()
-            modelContext.insert(target)
+            HouseRepository.shared.insert(target)
         }
 
         // 编辑时：真正删除「已被移除」的旧媒体（文件 + 记录 + 云端对象）
@@ -708,14 +696,14 @@ struct HouseEditView: View {
         // v1.71：编辑前的媒体文件名快照（用于「仅新增才上传」判定；在删除媒体逻辑之前取）
         let originalMediaNames = Set(house?.mediaItems.map { $0.fileName } ?? [])
         // v2.36（#8）：先只算出「被移除媒体」清单，不执行任何文件删除——文件操作一律推迟到
-        // modelContext.save() 成功之后，避免「文件删了、数据库却没存上」的不可逆状态。
+        // HouseRepository.save() 成功之后，避免「文件删了、数据库却没存上」的不可逆状态。
         let removedMediaItems: [MediaItem] = (house?.mediaItems ?? []).filter { old in
             !mediaItems.contains { $0.fileName == old.fileName }
         }
         // 模型改动（先做）：删除 MediaItem 记录 + 清上传队列；文件本身先不动
         for old in removedMediaItems {
             let rk = originalRoomKey.isEmpty ? (house?.mediaRoomKey ?? "") : originalRoomKey
-            modelContext.delete(old)
+            HouseRepository.shared.delete(old)
             HouseMediaUploadQueue.remove(roomKey: rk, fileName: old.fileName)
         }
 
@@ -814,12 +802,12 @@ struct HouseEditView: View {
 
         for item in mediaItems where item.house == nil {
             item.house = target
-            modelContext.insert(item)
+            HouseRepository.shared.insert(item)
         }
 
         // v2.36（#8）：先把数据库存成功（do-catch），失败则提示并返回，绝不碰任何文件
         do {
-            try modelContext.save()
+            try HouseRepository.shared.save()
         } catch {
             errorMessage = "保存失败：\(error.localizedDescription)"
             showError = true
@@ -840,7 +828,7 @@ struct HouseEditView: View {
                         var failed: [(name: String, kind: String, error: String)] = []
                         for item in removed {
                             do {
-                                try await HouseRemoteClient.shared.deleteMedia(roomKey: rk, fileName: item.name)
+                                try await HouseRepository.shared.deleteMedia(roomKey: rk, fileName: item.name)
                                 succeeded.append(item)
                             } catch {
                                 failed.append((name: item.name, kind: item.kind, error: error.localizedDescription))
@@ -985,10 +973,14 @@ struct HouseEditView: View {
             return
         }
         // 未接入服务器：本地落库已在上文完成，挂待补传；绑定令牌后自动补传
-        HousePendingUploader.shared.markPending(target.mediaRoomKey)
+        let offlineChange = opDetail.isEmpty ? (opAction.isEmpty ? "房源改动" : opAction) : opDetail
+        HouseRepository.shared.markPending(target.mediaRoomKey,
+                                             action: opAction.isEmpty ? "上传房源改动" : opAction,
+                                             detail: offlineChange)
         if !opAction.isEmpty {
             BackupLogStore.log(category: "房源", action: opAction, result: "待同步",
-                               detail: "仅存本机（未绑定服务器账号），绑定后自动补传", room: target.mediaRoomKey, cloud: false)
+                               detail: "\(offlineChange)；仅存本机（未绑定服务器账号），绑定后自动补传",
+                               room: target.mediaRoomKey, cloud: false)
         }
         NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
         dismiss()
@@ -1050,7 +1042,7 @@ struct HouseEditView: View {
                                 item.fileName = pair.new
                             }
                         }
-                        try? houseModelContext?.save()
+                        try? HouseRepository.shared.save()
                     }
                 }
             }
@@ -1061,7 +1053,7 @@ struct HouseEditView: View {
                     let failed = Set(uploadResult.failedFiles)
                     return Set(target.mediaItems.map { $0.fileName }).subtracting(failed)
                 }()
-                let remote = try await HouseSyncEngine.shared.pushHouse(
+                let remote = try await HouseRepository.shared.push(
                     target, mediaFileNames: allowedNames)
                 // 新房先有房源、后有账本：append 时的上行会因“房源不存在”失败，
                 // 权威房源落库后立刻补一次账本上行，避免新收房源账本要等下次启动才出现。
@@ -1069,7 +1061,7 @@ struct HouseEditView: View {
                 // 改名：清理服务器上旧房号的记录与磁盘媒体（后端级联删除；失败不阻断，留待对账清理）
                 var renamePurgeError: String?
                 if kind == .rename, !oldRoomKey.isEmpty, oldRoomKey != remote.roomKey {
-                    do { try await HouseRemoteClient.shared.delete(oldRoomKey) }
+                    do { try await HouseRepository.shared.deleteRemote(oldRoomKey) }
                     catch { renamePurgeError = error.localizedDescription }
                 }
                 // 旧正式版规则：服务器推送成功后才落操作日志（本机+云端同一条），
@@ -1112,13 +1104,19 @@ struct HouseEditView: View {
                 }
             } catch {
                 let isFieldConflict = (error as? HouseAPIError)?.fieldConflict == true
+                // b29：待同步日志必须写清“改了什么”。此前只写 error.localizedDescription，
+                // 用户只看到“已断开网络”，完全不知道哪一项没传上去。
+                let changeText = opDetail.isEmpty ? (opAction.isEmpty ? "房源改动" : opAction) : opDetail
+                let failureDetail = isFieldConflict
+                    ? "\(changeText)；同字段冲突，本次未上传，本机内容保留"
+                    : "\(changeText)；已存本机，待补传（\(error.localizedDescription)）"
+                // 失败只先写本机日志，不写云端；补传成功时把这条“待同步”就地改成“成功”，
+                // 这样云端不会出现“待同步 + 成功”两条并列记录。
                 BackupLogStore.log(category: "房源",
                                    action: opAction.isEmpty ? "房源同步" : opAction,
                                    result: isFieldConflict ? "冲突" : "待同步",
-                                   detail: isFieldConflict
-                                       ? "同字段冲突，本次未上传，本机内容保留：\(error.localizedDescription)"
-                                       : "已存本机，待补传：\(error.localizedDescription)",
-                                   room: logRoomKey, cloud: true)
+                                   detail: failureDetail,
+                                   room: logRoomKey, cloud: false)
                 await MainActor.run {
                     if !mediaSnapshots.isEmpty { SyncTaskCenter.shared.discard(id: taskID) }
                     if let api = error as? HouseAPIError, api.fieldConflict {
@@ -1129,10 +1127,13 @@ struct HouseEditView: View {
                         conflictTip = lines.isEmpty
                             ? "服务器已有另一版改动，本次未上传；本机内容已保留。"
                             : "本次未上传，本机内容已保留。冲突字段：\n\(lines)\n\n请按服务器现值决定是否重填，再保存。"
-                        HousePendingUploader.shared.clearPending(logRoomKey)
+                        HouseRepository.shared.clearPending(logRoomKey)
                     } else {
-                        // 标记待补传，联网后自动重试，不丢改动
-                        HousePendingUploader.shared.markPending(logRoomKey)
+                        // 标记待补传，并把“动作 + 字段变化”一并登记，任务中心和补传成功日志都能显示具体改动
+                        HouseRepository.shared.markPending(
+                            logRoomKey,
+                            action: opAction.isEmpty ? "上传房源改动" : opAction,
+                            detail: changeText)
                         HouseActionNotifier.shared.send(
                             key: "fail.\(target.mediaRoomKey)",
                             title: "已存本机",
@@ -1182,7 +1183,7 @@ struct HouseEditView: View {
             do {
                 let data = try Data(contentsOf: url)
                 HouseSyncProgress.shared.updateStage(roomKey: snap.roomKey, direction: .upload, label: "正在上传")
-                let result = try await HouseRemoteClient.shared.uploadMedia(
+                let result = try await HouseRepository.shared.uploadMedia(
                     roomKey: snap.roomKey, fileName: snap.fileName,
                     kind: snap.kind, data: data)
                 // 本地文件名/后缀保持不动（原名原后缀），服务器唯一化/转码后的真实名

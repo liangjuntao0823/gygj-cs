@@ -18,7 +18,7 @@ enum SyncTaskKind: String, Codable, CaseIterable {
     var displayName: String {
         switch self {
         case .cloudPull: return "从云端拉下来"
-        case .pushUp: return "把本机改动传上去"
+        case .pushUp: return "上传房源改动"
         case .media: return "搬媒体"
         case .mediaDownload: return "下载服务器媒体"
         case .cloudDelete: return "删云端"
@@ -446,7 +446,9 @@ func begin(id: UUID,
                     self.finish(id: live.id, success: true, note: note)
                     // v2.60：新增房源/媒体上传重试成功时，最终日志由 retryHouseUpload 写一条
                     // 「新增房源 / 房号迁移 / 修改房源」，这里不再叠一条「上传媒体 成功」。
-                    if live.isHouseUpload != true {
+                    // b29：上传房源改动的成功日志由 retryPushUp → completePending 按“原待同步记录”收口，
+                    // 这里不再叠一条通用“上传房源改动 成功”，避免同一动作两条日志。
+                    if live.isHouseUpload != true && live.kind != .pushUp {
                         // 其他重试也是真实操作：写一条操作日志，账本里能看到「什么时候补传成功的」
                         BackupLogStore.log(category: "同步", action: live.title, result: "成功",
                                           detail: "手动重试成功" + (note.isEmpty ? "" : "：\(note)"),
@@ -506,9 +508,12 @@ func begin(id: UUID,
         // 2) 旧的「账本未同步」标记迁移进来（旧键只读，由中心接管）
         for key in SyncFailStore.all() {
             guard !failed.contains(where: { $0.kind == .pushUp && $0.roomKeys == [key] }) else { continue }
-            var item = TaskRecord(kind: .pushUp, title: "把本机改动传上去",
+            var item = TaskRecord(kind: .pushUp, title: "上传房源改动",
                                   roomKeys: [key], total: 1, state: .failed)
-            item.failure = "\(key) 的改动还在本机，云端没同步上；点重试"
+            let change = HousePendingRegistry.change(for: key)
+            item.failure = change.map { "\(key)：\($0.detail)" }
+                ?? "\(key) 的改动还在本机，云端没同步上；点重试"
+            item.note = change?.action ?? ""
             item.finishedAt = Date()
             failed.append(item)
         }
@@ -535,9 +540,12 @@ func begin(id: UUID,
         var changed = false
         for key in SyncFailStore.all() {
             guard !failed.contains(where: { $0.kind == .pushUp && $0.roomKeys == [key] }) else { continue }
-            var item = TaskRecord(kind: .pushUp, title: "把本机改动传上去",
+            var item = TaskRecord(kind: .pushUp, title: "上传房源改动",
                                   roomKeys: [key], total: 1, state: .failed)
-            item.failure = "\(key) 的改动还在本机，云端没同步上；点重试"
+            let change = HousePendingRegistry.change(for: key)
+            item.failure = change.map { "\(key)：\($0.detail)" }
+                ?? "\(key) 的改动还在本机，云端没同步上；点重试"
+            item.note = change?.action ?? ""
             item.finishedAt = Date()
             failed.insert(item, at: 0)
             changed = true
@@ -690,7 +698,7 @@ final class TaskRetryPerformer {
             guard let house = byKey[key] else { continue }
             let records = house.mediaItems.map { ($0.fileName, $0.kind) }
             guard !records.isEmpty else { continue }
-            let result = await HouseRemoteClient.shared.downloadMissingMedia(
+            let result = await HouseRepository.shared.downloadMissingMedia(
                 roomKey: key,
                 records: records,
                 onProgress: { fileDone, _, name in
@@ -745,7 +753,7 @@ final class TaskRetryPerformer {
                     SyncTaskCenter.shared.advance(id: item.id, done: index + 1, total: files.count, note: "已跳过本地缺失文件")
                     continue
                 }
-                _ = try await HouseRemoteClient.shared.uploadMedia(
+                _ = try await HouseRepository.shared.uploadMedia(
                     roomKey: roomKey, fileName: fileName, kind: kind, data: data)
                 HouseMediaUploadQueue.remove(roomKey: roomKey, fileName: fileName)
                 SyncTaskCenter.shared.advance(id: item.id, done: index + 1, total: files.count, note: "已上传 \(index + 1)/\(files.count)", currentFileFraction: 1)
@@ -763,7 +771,7 @@ final class TaskRetryPerformer {
                 let all = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
                 if let house = all.first(where: { $0.mediaRoomKey == roomKey && !$0.isTrashed }) {
                     do {
-                        _ = try await HouseSyncEngine.shared.pushHouse(house)
+                        _ = try await HouseRepository.shared.push(house)
                         SyncFailStore.clear(roomKey)
                         ledgerWritten = true
                         note += "，服务器账本已补上这 \(files.count) 个"
@@ -805,7 +813,7 @@ final class TaskRetryPerformer {
         var failures: [String] = []
         for fileName in files {
             do {
-                try await HouseRemoteClient.shared.deleteMedia(roomKey: roomKey, fileName: fileName)
+                try await HouseRepository.shared.deleteMedia(roomKey: roomKey, fileName: fileName)
             } catch {
                 failures.append(fileName)
             }
@@ -828,7 +836,7 @@ final class TaskRetryPerformer {
             do {
                 if let h = localHouse, let ctx {
                     // 服务器硬删成功后才清本地：数据库记录、媒体目录、状态标记、待传队列一并清掉
-                    try await HouseSyncEngine.shared.pushDelete(h)
+                    try await HouseRepository.shared.pushDelete(h)
                     MediaStore.deleteHouseDirectory(roomKey: key)
                     SyncFailStore.clear(key)
                     UnreadCloudHouseStore.clear(key)
@@ -837,7 +845,7 @@ final class TaskRetryPerformer {
                     localCleaned += 1
                 } else {
                     // 本地已无记录：服务器记录直接硬删，清残留目录与标记，同样安全幂等
-                    try await HouseRemoteClient.shared.delete(key)
+                    try await HouseRepository.shared.deleteRemote(key)
                     MediaStore.deleteHouseDirectory(roomKey: key)
                     SyncFailStore.clear(key)
                     UnreadCloudHouseStore.clear(key)
@@ -870,9 +878,11 @@ final class TaskRetryPerformer {
                 continue
             }
             do {
-                _ = try await HouseSyncEngine.shared.pushHouse(house)
-                SyncFailStore.clear(key)
+                let remote = try await HouseRepository.shared.push(house)
                 house.cloudStatus = .both
+                // b29：把原“待同步”日志就地收口成成功，并带上具体改动；
+                // 任务中心不再另写一条通用成功日志。
+                HouseRepository.shared.completePending(key, remoteKey: remote.roomKey)
             } catch {
                 failures.append(key)
             }
@@ -906,14 +916,14 @@ final class TaskRetryPerformer {
                         HouseMediaUploadQueue.remove(roomKey: key, fileName: media.name)
                         continue
                     }
-                    _ = try await HouseRemoteClient.shared.uploadMedia(
+                    _ = try await HouseRepository.shared.uploadMedia(
                         roomKey: key, fileName: media.name, kind: media.kind, data: data)
                     // 只把这条任务里的文件从待上传登记簿摘掉，别一把清空（同房其他文件可能还没传）
                     HouseMediaUploadQueue.remove(roomKey: key, fileName: media.name)
                 }
                 // 媒体传完后补推房源引用；账本补写失败不判整房失败，提示再点一次
                 do {
-                    _ = try await HouseSyncEngine.shared.pushHouse(house)
+                    _ = try await HouseRepository.shared.push(house)
                     SyncFailStore.clear(key)
                 } catch {
                     failures.append("\(key)（媒体已传上，账本没写上）")
@@ -1124,7 +1134,7 @@ struct TaskCenterView: View {
                         return
                     }
                     let keys = target.roomKeys
-                    _ = HouseSyncEngine.shared.purgeLocalHouses(keys, context: ctx)
+                    _ = HouseRepository.shared.purgeLocal(keys)
                     // 房源已按服务器为准删除，对应失败任务不能留着再让人重试。
                     for task in center.failed where !Set(task.roomKeys).isDisjoint(with: Set(keys)) {
                         center.purge(id: task.id)
@@ -1142,6 +1152,15 @@ struct TaskCenterView: View {
 /// 统一行组件（顶部条 / 中心 / 其他页面复用同一个）
 struct TaskRowView: View {
     let record: TaskRecord
+
+    /// b29：待同步卡直接读登记簿里的最新改动，旧任务也能显示“改了什么”
+    private var failureText: String {
+        if record.kind == .pushUp, let key = record.roomKeys.first,
+           let change = HousePendingRegistry.change(for: key), !change.detail.isEmpty {
+            return "\(key)：\(change.detail)"
+        }
+        return record.failure
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -1164,9 +1183,9 @@ struct TaskRowView: View {
                     Text(record.note).font(.caption2).foregroundColor(.secondary)
                 }
             } else if record.state == .failed {
-                Text(record.failure).font(.caption2).foregroundColor(.secondary)
+                Text(failureText).font(.caption2).foregroundColor(.secondary)
             } else if record.state == .cancelled {
-                Text(record.failure).font(.caption2).foregroundColor(.secondary)
+                Text(failureText).font(.caption2).foregroundColor(.secondary)
             } else if !record.note.isEmpty {
                 Text(record.note).font(.caption2).foregroundColor(.secondary)
             }

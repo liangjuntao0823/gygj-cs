@@ -46,6 +46,29 @@ enum BackupLogStore {
         }
     }
 
+    /// b29：补传动作为一条日志收口。
+    /// 原失败路径只写本机「待同步」，补传成功后用这里把那条待同步记录替换成「成功」，
+    /// 不再追加第二条通用“把本机改动传上去”，从根上解决一次操作两条日志。
+    static func resolvePending(room: String, pendingRoom: String? = nil,
+                               action: String, result: String, detail: String,
+                               cloud: Bool = false) {
+        let pendingKey = pendingRoom ?? room
+        var list = all()
+        let before = list.count
+        list.removeAll { entry in
+            let entryRoom = entry.room ?? ""
+            return entry.result == "待同步" &&
+                (entryRoom == pendingKey || entryRoom == room)
+        }
+        if list.count != before {
+            if let data = try? JSONEncoder().encode(list) {
+                UserDefaults.standard.set(data, forKey: key)
+            }
+        }
+        log(category: "房源", action: action, result: result, detail: detail,
+            room: room, cloud: cloud)
+    }
+
     private static func makeEntry(category: String, action: String, result: String, detail: String, checksum: String, username: String?, room: String) -> BackupLogEntry {
         let name = username ?? CloudUser.username
         return BackupLogEntry(date: Date(), category: category, action: action, result: result, detail: detail, checksum: checksum,

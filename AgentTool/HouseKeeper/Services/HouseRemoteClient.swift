@@ -102,6 +102,18 @@ struct RemoteHouseStats: Codable {
     let pendingOutbox: Int
 }
 
+/// b29：设置页服务器磁盘用量（服务端 /api/house/storage）
+struct RemoteStorageStats: Codable, Equatable {
+    let ok: Bool
+    let diskTotal: Int64
+    let diskUsed: Int64
+    let diskFree: Int64
+    let diskPercent: Double
+    let mediaBytes: Int64?
+    let mediaFiles: Int?
+    let houseCount: Int?
+}
+
 /// 服务器备份 zip 清单条目（替代旧对象存储对象元数据）
 struct RemoteBackupRecord: Codable {
     let name: String
@@ -631,6 +643,24 @@ final class HouseRemoteClient {
         }
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         return (json?["config"] as? [String: Any]) ?? [:]
+    }
+
+    /// b29：公开在线更新块（无需房屋库授权，检查更新专用）
+    func fetchPublicUpdate() async throws -> [String: Any] {
+        let (data, http) = try await makeRequest("/api/public/app-update", method: "GET")
+        guard http.statusCode == 200 else {
+            throw HouseAPIError(message: "读取在线更新失败（服务器 \(http.statusCode)）")
+        }
+        return (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// b29：服务器磁盘用量（设置页服务器磁盘块）
+    func fetchStorageStats() async throws -> RemoteStorageStats {
+        let (data, http) = try await makeRequest("/api/house/storage", method: "GET")
+        guard http.statusCode == 200 else {
+            throw HouseAPIError(message: "读取服务器磁盘失败（服务器 \(http.statusCode)）")
+        }
+        return try JSONDecoder().decode(RemoteStorageStats.self, from: data)
     }
 
     /// 写回应用远程配置

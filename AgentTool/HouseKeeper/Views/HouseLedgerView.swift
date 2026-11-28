@@ -162,7 +162,7 @@ struct HouseLedgerView: View {
         isSyncing = true
         syncHint = nil
         do {
-            let remoteEvents = try await HouseRemoteClient.shared.ledger(roomKey)
+            let remoteEvents = try await HouseRepository.shared.ledger(roomKey: roomKey)
             events = remoteEvents.map { HouseLedgerEvent(remote: $0) }
             sourceIsServer = true
             sourceText = "服务器账本"
