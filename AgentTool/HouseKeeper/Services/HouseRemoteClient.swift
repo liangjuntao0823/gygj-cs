@@ -1055,6 +1055,9 @@ struct HouseSyncPayload {
     var baseMedia: [String]? = nil
     /// 本次显式删除的服务器媒体 objectKey（本地已移除的旧媒体）
     var removedMedia: [String]? = nil
+    /// b31：本次真正改动过的字段名（roomNo/tower/landlord/layout/price/password/remark/status）。
+    /// 服务器只覆盖清单里的字段，其余保留服务器当前值；同字段后写入者优先。
+    var changedFields: [String]? = nil
 
     var json: [String: Any] {
         var d: [String: Any] = ["roomKey": roomKey, "roomNo": roomNo, "tower": tower,
@@ -1064,6 +1067,7 @@ struct HouseSyncPayload {
         if let base { d["base"] = base }
         if let baseMedia { d["baseMedia"] = baseMedia }
         if let removedMedia, !removedMedia.isEmpty { d["removedMedia"] = removedMedia }
+        if let changedFields { d["changed"] = changedFields }
         return d
     }
 }

@@ -776,7 +776,7 @@ struct HouseDetailView: View {
             // 服务器模式：状态切换直接推服务器权威库，不走旧 COS 账本链路；失败入待补传队列
             Task {
                 do {
-                    _ = try await HouseRepository.shared.push(house)
+                    _ = try await HouseRepository.shared.push(house, changedFields: ["status"])
                     if HousePendingRegistry.change(for: roomKey) != nil {
                         HouseRepository.shared.completePending(roomKey, remoteKey: roomKey)
                     } else if oldStatus != newStatus {
@@ -796,7 +796,9 @@ struct HouseDetailView: View {
                                            room: roomKey, cloud: false)
                     }
                     await MainActor.run {
-                        HouseRepository.shared.markPending(roomKey, action: "切换状态", detail: statusDetail)
+                        HouseRepository.shared.markPending(roomKey, action: "切换状态",
+                                                            detail: statusDetail,
+                                                            changedFields: ["status"])
                         HouseActionNotifier.shared.send(
                             key: "statusfail.\(roomKey)",
                             title: "状态同步失败",

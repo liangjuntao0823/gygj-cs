@@ -562,19 +562,8 @@ struct MainTabView: View {
                 UserDefaults.standard.set(nowForeground, forKey: "cloudDetectLastForegroundAt")
                 detectCloudLedgerChange()
             }
-            // 后台硬删/改动后，房源卡片不能继续显示旧的“双端”：回前台做一次真实服务器对账。
-            // 先补传本机离线改动再拉全量，避免把本机未提交修改覆盖掉；30 秒内重复解锁不重复拉。
-            if HouseServerMode.ready, let ctx = houseModelContext {
-                let lastPull = UserDefaults.standard.double(forKey: "house.lastForegroundPullAt")
-                if nowForeground - lastPull >= 30 {
-                    UserDefaults.standard.set(nowForeground, forKey: "house.lastForegroundPullAt")
-                    Task {
-                        _ = await HousePendingUploader.shared.flush(context: ctx)
-                        _ = try? await HouseSyncEngine.shared.pull(context: ctx)
-                        NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
-                    }
-                }
-            }
+            // b31：回前台不再自动补传/自动拉取。只保留上面的轻量变更检测（挂横幅），
+            // 服务器→本机、本机→服务器都由用户手动确认后执行。
             WidgetDataSync.sync(modelContext: modelContext)
         }
         // v2.68：退后台（含唤起共享菜单前）刷新配置镜像，保证分享扩展读到最新用户名/地址/哈希/压缩开关

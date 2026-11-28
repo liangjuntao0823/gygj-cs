@@ -81,8 +81,10 @@ final class HouseRepository {
 
     // MARK: - 服务器同步（视图不直接碰引擎/客户端）
 
-    func push(_ house: House, mediaFileNames: Set<String>? = nil) async throws -> RemoteHouse {
-        try await HouseSyncEngine.shared.pushHouse(house, mediaFileNames: mediaFileNames)
+    func push(_ house: House, mediaFileNames: Set<String>? = nil,
+              changedFields: Set<String>? = nil) async throws -> RemoteHouse {
+        try await HouseSyncEngine.shared.pushHouse(house, mediaFileNames: mediaFileNames,
+                                                   changedFields: changedFields)
     }
 
     func pushHousesBatch(_ houses: [House]) async throws -> [String: Error] {

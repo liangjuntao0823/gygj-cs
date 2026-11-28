@@ -102,6 +102,8 @@ struct HouseListView: View {
     @State private var isSyncing = false
     /// v2.65：长按触发的深度核对与普通刷新分开提示（否则长按后只显示「正在刷新…」，看不出走的是哪条路）
     @State private var isDeepSyncing = false
+    /// b31/iOS17：长按刷新触发后抑制同一次触摸的单击动作，避免长按又跑一次普通刷新。
+    @State private var suppressNextRefreshTap = false
     /// v2.50：云端有更新 → 顶栏常驻横幅，只有手动点 ✕ 才收起（此前 toast 不到 1 秒就消失，容易错过）
     @State private var cloudUpdateBannerVisible = false
     @ObservedObject private var syncCenter = SyncTaskCenter.shared
@@ -289,7 +291,11 @@ struct HouseListView: View {
                     HStack(spacing: 14) {
                         // v1.19：左上角手动同步（已取消下拉刷新，这里是唯一手动入口）
                         Button {
-                            requestManualSync(deep: false)
+                            if suppressNextRefreshTap {
+                                suppressNextRefreshTap = false
+                            } else {
+                                requestManualSync(deep: false)
+                            }
                         } label: {
                             if isSyncing {
                                 ProgressView().controlSize(.small)
@@ -299,9 +305,15 @@ struct HouseListView: View {
                         }
                         // v2.62（B5）：长按 = 深度刷新——忽略清单摘要与 24h 缓存，逐套全量核对。
                         // 日常点按走增量（1~3 秒）；怀疑漏更新时用长按强制全量。
-                        .highPriorityGesture(
+                        // b31：iOS17 上 highPriorityGesture 会吞掉 Button 的单击，
+                        // 改用 simultaneousGesture；长按后抑制同一次触摸的单击。
+                        .simultaneousGesture(
                             LongPressGesture(minimumDuration: 0.6).onEnded { _ in
+                                suppressNextRefreshTap = true
                                 requestManualSync(deep: true)
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                                    suppressNextRefreshTap = false
+                                }
                             }
                         )
                         // v2.63：同步进行中禁用按钮（点按与长按都生效），配合入口重入保护，连点不会再开第二份任务
@@ -488,17 +500,9 @@ struct HouseListView: View {
         }
         .onAppear {
             reloadHouses()
-            // 服务器模式：进页面静默增量拉取权威库（小 JSON，失败不打扰、不打断操作）
-            if HouseServerMode.ready {
-                Task {
-                    // 进页先补传离线未提交的改动，再全量对账权威库（弱网改动不丢）
-                    _ = await HouseRepository.shared.flushPending()
-                    let result = try? await HouseRepository.shared.pull()
-                    if result?.didChangeStore == true {
-                        reloadHouses()
-                    }
-                }
-            }
+            // b31：进入房源页不再自动补传/自动拉取。所有本机→服务器、服务器→本机的写入
+            // 都必须由用户在任务中心或左上角刷新按钮手动触发，避免“新设备一接入就把本地房
+            // 自动推到服务器、另一台设备未经确认就写回本机”。
             // v2.58（#3）：整次云端同步的重试入口——页面必须回报真实结果（成功/失败/等确认）
             TaskRetryPerformer.shared.cloudPull = { retryTaskID in
                 await syncCloudHouses(retryTaskID: retryTaskID)
@@ -507,7 +511,7 @@ struct HouseListView: View {
             // 只消费「App 启动 / 回前台」写下的 pending 标记；没有标记就不发请求。
             let pending = UserDefaults.standard.bool(forKey: "cloudLedgerPendingHint")
             UserDefaults.standard.set(false, forKey: "cloudLedgerPendingHint")
-            if pending && !HouseServerMode.ready { showCloudChangeHint() }
+            if pending && HouseServerMode.ready { showCloudChangeHint() }
             // v2.62（A5）：静默兜底——距上次检测超过 30 分钟、且当前没有上传任务时，才轻量检测一次；
             // 失败不弹提示（避免刚进页面就打扰），只有真有更新才挂横幅。
             Task {
@@ -517,22 +521,12 @@ struct HouseListView: View {
                 let lastAt = UserDefaults.standard.double(forKey: "cloudDetectLastAt")
                 guard now - lastAt >= 1800 else { return }
                 let changeState = await Self.detectCloudLedgerChange(houseContext: houseModelContext)
+                UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "cloudDetectLastAt")
                 if changeState == .hasUpdate { showCloudChangeHint() }
             }
         }
-        // 房源卡片上的「本地 / 云端 / 双端」不是本地持久化的假标识：
-        // 停留在房源板块时每 45 秒按服务器权威清单对账一次，后台删房/改房后无需杀 App 或反复进出。
-        .task {
-            guard HouseServerMode.ready else { return }
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 45 * 1_000_000_000)
-                guard !Task.isCancelled else { break }
-                guard !isSyncing else { continue }
-                if let result = try? await HouseRepository.shared.pull(), result.didChangeStore {
-                    reloadHouses()
-                }
-            }
-        }
+        // b31：去掉 45 秒自动 pull。自动检测只查服务器是否有变化并挂横幅，
+        // 绝不把服务器数据写回本机；用户点左上角刷新、确认后才同步。
         .onReceive(NotificationCenter.default.publisher(for: Self.houseStoreChanged)) { _ in
             reloadHouses()
         }
@@ -542,7 +536,7 @@ struct HouseListView: View {
         // b120：通知到达也走统一提示入口（showCloudChangeHint 防抖），并消费 pendingHint
         .onReceive(NotificationCenter.default.publisher(for: Self.cloudLedgerChangedLight)) { _ in
             UserDefaults.standard.set(false, forKey: "cloudLedgerPendingHint")
-            if !HouseServerMode.ready { showCloudChangeHint() }
+            if HouseServerMode.ready { showCloudChangeHint() }
         }
     }
 
@@ -555,9 +549,25 @@ struct HouseListView: View {
         }
     }
 
-    /// 旧对象存储清单变更感知已下线：服务器模式下权威库由 HouseSyncEngine.pull 增量对账，本方法恒返回无变化。
+    /// b31：自动检测只读服务器清单并和本地对比，不写本地、不拉媒体、不自动补传。
+    /// 有新增/修改/删除时返回 .hasUpdate，由页面挂“检测到服务器有更新”横幅；
+    /// 本机待补传的房号要排除，否则自己的离线改动会被误报成服务器更新。
     static func detectCloudLedgerChange(houseContext _: ModelContext?) async -> CloudChangeState {
-        .noChange
+        guard HouseServerMode.ready else { return .noChange }
+        do {
+            let preview = try await HouseRepository.shared.preview()
+            let pending = Set(HouseRepository.shared.pendingKeys())
+            let newKeys = preview.newKeys.filter { !pending.contains($0) }
+            let updatedKeys = preview.updatedKeys.filter { !pending.contains($0) }
+            let deletedKeys = preview.deletedKeys.filter { !pending.contains($0) }
+            if !newKeys.isEmpty || !updatedKeys.isEmpty || !deletedKeys.isEmpty || preview.hiddenCount > 0 {
+                return .hasUpdate
+            }
+            return .noChange
+        } catch {
+            // 检测失败静默；用户手动刷新时会得到明确错误。
+            return .noChange
+        }
     }
 
     /// 从独立 HouseStore 配置拉取房源（按创建时间倒序，与原来 @Query 一致；v1.7：排除已进回收站的软删除房源）
@@ -1263,7 +1273,7 @@ struct HouseListView: View {
             let roomNo = house.displayRoomNo
             Task {
                 do {
-                    _ = try await HouseRepository.shared.push(house)
+                    _ = try await HouseRepository.shared.push(house, changedFields: ["status"])
                     if HousePendingRegistry.change(for: roomKey) != nil {
                         // 之前失败过：把那条“待同步”收口成成功，不再叠加第二条成功日志
                         HouseRepository.shared.completePending(roomKey, remoteKey: roomKey)
@@ -1282,7 +1292,9 @@ struct HouseListView: View {
                                        detail: "\(changeText)；服务器更新失败，已存本机待补传（\(error.localizedDescription)）",
                                        room: roomKey, cloud: false)
                     await MainActor.run {
-                        HouseRepository.shared.markPending(roomKey, action: action, detail: changeText)
+                        HouseRepository.shared.markPending(roomKey, action: action,
+                                                            detail: changeText,
+                                                            changedFields: ["status"])
                         HouseActionNotifier.shared.send(
                             key: "statusfail.\(roomKey)",
                             title: "状态同步失败",
@@ -1401,9 +1413,10 @@ struct HouseListView: View {
                                       note: "正在补传本机改动")
         }
         do {
-            // 先补传本地离线写，再拉取服务器全量清单对账，保证两端最终一致
-            _ = await HouseRepository.shared.flushPending()
+            // b31：刷新只做“服务器 → 本机”，不再自动补传本机改动。
+            // 本机改动由任务中心逐套确认上传，避免刷新动作顺带把本地房源推到服务器。
             syncCenter.advance(id: taskID, done: 0, note: "正在拉取服务器房源")
+            let preview = try? await HouseRepository.shared.preview()
             let result = try await HouseRepository.shared.pull(reportMediaTask: true)
             let hidden = HouseRepository.shared.hiddenCloudCount()
             let pending = HouseRepository.shared.pendingKeys().count
@@ -1412,21 +1425,22 @@ struct HouseListView: View {
             if let mediaNote = result.mediaNote {
                 tail += "；\(mediaNote)"
             }
-            let toast: String
-            if result.changed > 0 {
-                toast = "已从服务器同步 \(result.changed) 套房源" + tail
-            } else {
-                toast = "服务器上房源已是最新" + tail
-            }
+            let changeText = preview?.resultText ?? (result.changed > 0
+                ? "已同步 \(result.changed) 套房源" : "已刷新，无变化")
+            let toast = changeText + tail
             showToast(toast)
-            let note = result.changed > 0
-                ? "已同步 \(result.changed) 套" + (result.mediaTotal > 0 ? "，媒体在任务中心继续" : "")
-                : "已核对，服务器无变化" + (result.mediaTotal > 0 ? "，媒体在任务中心继续" : "")
+            // b31：手动同步也写本机操作日志（此前只写云端/任务中心，用户在本机日志里查不到）。
+            BackupLogStore.log(category: "房源", action: "刷新服务器房源",
+                               result: "成功", detail: toast, cloud: false)
+            let note = changeText + (result.mediaTotal > 0 ? "，媒体在任务中心继续" : "")
             syncCenter.finish(id: taskID, success: true, note: note)
+            cloudUpdateBannerVisible = false
             return .finished
         } catch {
             let msg = "服务器同步失败：\(error.localizedDescription)"
             showToast(msg, isError: true)
+            BackupLogStore.log(category: "房源", action: "刷新服务器房源",
+                               result: "失败", detail: msg, cloud: false)
             syncCenter.finish(id: taskID, success: false, failure: msg)
             return .failed(msg)
         }
@@ -1445,7 +1459,12 @@ struct HouseListView: View {
                 let preview = try await HouseRepository.shared.preview()
                 await MainActor.run {
                     isSyncing = false
-                    if hidden > 0 {
+                    // b31：无变化不再弹“与服务器同步房源？”确认框（旧版这里直接提示“已刷新，无变化”）。
+                    if preview.isEmpty {
+                        showToast("已刷新，无变化")
+                        BackupLogStore.log(category: "房源", action: "刷新服务器房源",
+                                           result: "成功", detail: "已刷新，无变化", cloud: false)
+                    } else if hidden > 0 {
                         refreshPrompt = .hidden(count: hidden, deep: deep, summary: preview.summary)
                     } else {
                         refreshPrompt = .confirm(deep: deep, summary: preview.summary)

@@ -20,6 +20,9 @@ struct HousePendingChange: Codable, Equatable {
     /// 例如「修改备注 空 改 测试」；任务中心和补传成功日志直接复用
     let detail: String
     let updatedAt: Date
+    /// b31：本次改动字段名，补传时只提交这些字段，避免旧快照把服务器其他字段回滚。
+    /// 旧数据没有该字段，解码为 nil，按全量提交。
+    let changedFields: [String]?
 }
 
 enum HousePendingRegistry {
@@ -45,7 +48,8 @@ enum HousePendingRegistry {
         changes().sorted { $0.updatedAt > $1.updatedAt }
     }
 
-    static func insert(_ roomKey: String, action: String = "", detail: String = "") {
+    static func insert(_ roomKey: String, action: String = "", detail: String = "",
+                       changedFields: Set<String>? = nil) {
         guard !roomKey.isEmpty else { return }
         var set = keys()
         set.insert(roomKey)
@@ -61,13 +65,21 @@ enum HousePendingRegistry {
                 let mergedDetail = [old.detail, detail].filter { !$0.isEmpty }
                     .reduce(into: [String]()) { acc, x in if !acc.contains(x) { acc.append(x) } }
                     .joined(separator: "；")
+                let mergedFields: [String]? = {
+                    guard old.changedFields != nil || changedFields != nil else { return nil }
+                    var set = Set(old.changedFields ?? [])
+                    set.formUnion(changedFields ?? [])
+                    return Array(set).sorted()
+                }()
                 map[idx] = HousePendingChange(roomKey: roomKey,
                                               action: mergedAction.isEmpty ? old.action : mergedAction,
                                               detail: mergedDetail,
-                                              updatedAt: Date())
+                                              updatedAt: Date(),
+                                              changedFields: mergedFields)
             } else {
                 map.append(HousePendingChange(roomKey: roomKey, action: action,
-                                              detail: detail, updatedAt: Date()))
+                                              detail: detail, updatedAt: Date(),
+                                              changedFields: changedFields.map { Array($0).sorted() }))
             }
             saveChanges(map)
         }
@@ -122,8 +134,10 @@ final class HousePendingUploader {
 
     var hasPending: Bool { !pendingKeys.isEmpty }
 
-    func markPending(_ roomKey: String, action: String = "", detail: String = "") {
-        HousePendingRegistry.insert(roomKey, action: action, detail: detail)
+    func markPending(_ roomKey: String, action: String = "", detail: String = "",
+                     changedFields: Set<String>? = nil) {
+        HousePendingRegistry.insert(roomKey, action: action, detail: detail,
+                                    changedFields: changedFields)
     }
 
     func clearPending(_ roomKey: String) {
@@ -155,7 +169,7 @@ final class HousePendingUploader {
 
     /// 联网后按序补传所有待提交房源；返回成功数
     @discardableResult
-    func flush(context: ModelContext) async -> Int {
+    func flush(context: ModelContext, onlyKeys: Set<String>? = nil) async -> Int {
         let houses = (try? context.fetch(FetchDescriptor<House>())) ?? []
         let byKey = Dictionary(houses.map { ($0.mediaRoomKey, $0) },
                                uniquingKeysWith: { a, _ in a })
@@ -163,11 +177,12 @@ final class HousePendingUploader {
         // 先补媒体二进制：媒体成功后才能把真实引用写进服务器。
         // 之前先 pushHouse 再传媒体，会把还没传上去的文件写进 media_refs，
         // 刷新时服务器指向不存在的文件，客户端就 404/无图。
-        let uploadedRooms = await flushMedia(context: context)
+        let uploadedRooms = await flushMedia(context: context, onlyKeys: onlyKeys)
 
         var done = 0
         let pendingKeySet = Set(pendingKeys)
         var keysToPush = pendingKeySet
+        if let onlyKeys { keysToPush.formIntersection(onlyKeys) }
         for key in Array(keysToPush) where byKey[key] == nil {
             clearPending(key)   // 本地已无此房（被彻底删除），不再补传
             keysToPush.remove(key)
@@ -180,8 +195,10 @@ final class HousePendingUploader {
                 .filter { $0.roomKey == key }
                 .map { $0.fileName })
             let allowed = Set(h.mediaItems.map { $0.fileName }).subtracting(pendingNames)
+            let changed: Set<String>? = HousePendingRegistry.change(for: key)?.changedFields.map(Set.init)
             do {
-                _ = try await HouseRepository.shared.push(h, mediaFileNames: allowed)
+                _ = try await HouseRepository.shared.push(h, mediaFileNames: allowed,
+                                                          changedFields: changed)
                 if pendingKeySet.contains(key) || HousePendingRegistry.keys().contains(key) {
                     completePending(key, remoteKey: h.mediaRoomKey, note: "已上传到服务器")
                 }
@@ -203,8 +220,9 @@ final class HousePendingUploader {
     /// 服务器模式：把待传媒体队列逐个补传到服务器磁盘；成功清条目，本地文件已失则清条目，失败保留待下轮。
     /// 返回本次成功上传过的房源 roomKey 集合，调用方据此补写服务器 media_refs。
     @discardableResult
-    func flushMedia(context: ModelContext) async -> Set<String> {
-        let items = HouseMediaUploadQueue.pendingItems()
+    func flushMedia(context: ModelContext, onlyKeys: Set<String>? = nil) async -> Set<String> {
+        var items = HouseMediaUploadQueue.pendingItems()
+        if let onlyKeys { items = items.filter { onlyKeys.contains($0.roomKey) } }
         guard !items.isEmpty else { return [] }
         var uploadedRooms = Set<String>()
         for item in items {

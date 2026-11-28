@@ -460,6 +460,15 @@ class HouseStore:
         self._validate_fields(room_key, fields)
         media = payload.get("media") or []
         base = payload.get("base") if isinstance(payload.get("base"), dict) else None
+        # b31：字段级写入协议。客户端只提交本次真正改动的字段名，
+        # 服务器只把这些字段覆盖到现有行；未提交字段一律保留服务器当前值。
+        # 这解决了“编辑页持有旧快照，保存备注时把别人刚改的租金回滚”的问题。
+        changed_fields = payload.get("changed")
+        changed_set: set[str] | None = None
+        if isinstance(changed_fields, list):
+            allowed = {"roomNo", "tower", "landlord", "layout", "price",
+                       "password", "remark", "status"}
+            changed_set = {str(x) for x in changed_fields if str(x) in allowed}
         base_media = payload.get("baseMedia") if isinstance(payload.get("baseMedia"), list) else None
         removed_media = {
             str(x) for x in (payload.get("removedMedia") or []) if str(x or "")
@@ -481,7 +490,13 @@ class HouseStore:
                 return self._insert(conn, room_key, fields, media, operator,
                                     origin_device_id, now, notify_scope, notify_user_token)
             if base is not None:
-                fields = self._merge_fields(room_key, existing, fields, base)
+                if changed_set is not None:
+                    # b31 字段级：只覆盖本次改动字段，其余保留服务器当前值。
+                    # 同字段两边都改时按“后写入者优先”，不再抛字段冲突。
+                    fields = self._apply_changed_fields(existing, fields, changed_set)
+                else:
+                    # 兼容 b30 及更早客户端：没有 changed 清单，继续三路合并。
+                    fields = self._merge_fields(room_key, existing, fields, base)
                 merged_media = self._merge_media(
                     conn, room_key, media, base_media, removed_media)
                 return self._update(conn, existing, room_key, fields, merged_media,
@@ -520,6 +535,20 @@ class HouseStore:
         for key in ("landlord", "layout", "password", "remark"):
             if len(str(fields.get(key) or "")) > 500:
                 raise ValueError(f"{key} too long")
+
+    @staticmethod
+    def _apply_changed_fields(existing: sqlite3.Row,
+                              client: dict[str, Any],
+                              changed: set[str]) -> dict[str, Any]:
+        """b31 字段级写入：只覆盖 changed 中的字段，其余保留服务器当前值。
+
+        同一字段被两台设备先后修改时，后到的一次覆盖先前值（last write wins）。
+        """
+        merged: dict[str, Any] = {}
+        for key in ("roomNo", "tower", "landlord", "layout", "price",
+                    "password", "remark", "status"):
+            merged[key] = client[key] if key in changed else existing[HouseStore._column(key)]
+        return merged
 
     @staticmethod
     def _merge_fields(room_key: str, existing: sqlite3.Row,

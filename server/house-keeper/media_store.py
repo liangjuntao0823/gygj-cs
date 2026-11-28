@@ -303,6 +303,15 @@ class MediaStore:
             raise ValueError("invalid release path")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
+        # 旧版在线更新规则：服务器 releases/ 只保留最新一个安装包，避免旧包越堆越多。
+        for old in path.parent.iterdir():
+            if old == path or not old.is_file():
+                continue
+            if _ext(old.name) in RELEASE_EXTS:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
         return rel
 
     def read_release(self, file_name: str) -> bytes | None:

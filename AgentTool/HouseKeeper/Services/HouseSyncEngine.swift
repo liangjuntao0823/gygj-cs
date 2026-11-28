@@ -46,6 +46,19 @@ struct HouseChangePreview {
         return "• \(label) \(keys.count) 套：\(head)\(more)"
     }
 
+    var isEmpty: Bool {
+        newKeys.isEmpty && updatedKeys.isEmpty && deletedKeys.isEmpty && hiddenCount == 0
+    }
+
+    /// 同步完成提示：必须区分新增/修改/服务器删除，避免把“跟随服务器删除”说成“新增”。
+    var resultText: String {
+        var parts: [String] = []
+        if !newKeys.isEmpty { parts.append("新增 \(newKeys.count) 套") }
+        if !updatedKeys.isEmpty { parts.append("更新 \(updatedKeys.count) 套") }
+        if !deletedKeys.isEmpty { parts.append("服务器删除 \(deletedKeys.count) 套，本机已同步删除") }
+        return parts.isEmpty ? "已刷新，无变化" : "已同步：" + parts.joined(separator: "，")
+    }
+
     var summary: String {
         var parts: [String] = []
         if !newKeys.isEmpty { parts.append(line("新增", newKeys)) }
@@ -302,6 +315,7 @@ final class HouseSyncEngine: ObservableObject {
             byKey[h.mediaRoomKey] = h
         }
         var changed = 0
+        var unreadKeys: [String] = []
         hiddenCloudCount = 0
         // 本机有还没推上去的改动：服务器清单不能直接盖回来，否则弱网/冲突时
         // 用户刚改的租金、状态、媒体会被下一次自动对账静默回滚。
@@ -322,8 +336,9 @@ final class HouseSyncEngine: ObservableObject {
             if pendingKeys.contains(r.roomKey) {
                 continue
             }
+            let isNewForLocal = byKey[r.roomKey] == nil
             let target = byKey[r.roomKey] ?? House()
-            if byKey[r.roomKey] == nil {
+            if isNewForLocal {
                 context.insert(target)
             }
             let before = snapshot(target)
@@ -345,9 +360,17 @@ final class HouseSyncEngine: ObservableObject {
             }
             reconcileMedia(target, remote: r, context: context)
             if snapshot(target) != before { changed += 1 }
+            // b31：手动同步后，新插入或被服务器改动的房源恢复红框未读提示。
+            // 自动检测只挂横幅、不写本地，因此不会产生未读；进入详情页后照旧清除。
+            if !r.trashed && (isNewForLocal || snapshot(target) != before) {
+                unreadKeys.append(r.roomKey)
+            }
             setServerRevision(r.revision, forKey: r.roomKey)
             // 保存一份服务器快照：下次编辑提交时作为字段级合并的 base
             HouseBaseSnapshotStore.save(r)
+        }
+        if !unreadKeys.isEmpty {
+            UnreadCloudHouseStore.mark(unreadKeys)
         }
         // 服务器已硬删的本地孤儿：曾同步过（revMap 有记录）但全量清单已不含 → 物理删除本地记录；
         // 从未同步过的纯本地房保留，并明确标为“本地”，避免沿用旧的“双端”。
@@ -413,7 +436,8 @@ final class HouseSyncEngine: ObservableObject {
     /// - Parameter mediaFileNames: 本次允许写进服务器 media_refs 的本地文件名集合；
     ///   传 nil 表示全部。上传失败的媒体不应写进服务器，否则会在服务器留下 404 幽灵引用。
     @discardableResult
-    func pushHouse(_ house: House, mediaFileNames: Set<String>? = nil) async throws -> RemoteHouse {
+    func pushHouse(_ house: House, mediaFileNames: Set<String>? = nil,
+                   changedFields: Set<String>? = nil) async throws -> RemoteHouse {
         let roomKey = house.mediaRoomKey
         // 任何入口 pushHouse 都自动排除仍在待上传队列里的媒体：
         // 状态切换、批量导入等路径不会把“本地有、服务器还没有”的文件写进 media_refs。
@@ -435,7 +459,8 @@ final class HouseSyncEngine: ObservableObject {
             password: house.password, remark: house.remark,
             status: house.statusRaw, media: mediaPayload,
             base: base?.fields, baseMedia: base?.mediaKeys,
-            removedMedia: removedKeys)
+            removedMedia: removedKeys,
+            changedFields: changedFields.map { Array($0).sorted() })
         let expected = revMap[roomKey]
         // 新增/本机从未拿到服务器修订号：按“创建”提交，服务器已同房号时直接拒绝，
         // 不能把别人的房源当成本机旧版本覆盖掉。

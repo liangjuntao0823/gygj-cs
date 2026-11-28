@@ -338,10 +338,19 @@ final class UpdateDownloader: ObservableObject {
         guard !isBusy else { return }
         var url: URL?
         if !update.objectKey.isEmpty {
-            let rel = update.objectKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? update.objectKey
             #if !APP_EXTENSION
             let base = NotifyHub.shared.endpoint
-            url = URL(string: "\(base)/api/public/media/\(rel)")
+            let objectKey = update.objectKey
+            if objectKey.hasPrefix("releases/") {
+                // b31：新架构安装包落服务器 releases/ 目录，走专用公开下载接口；
+                // 旧版 objectKey 仍兼容 /api/public/media/ 路径。
+                let name = (objectKey as NSString).lastPathComponent
+                let encoded = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name
+                url = URL(string: "\(base)/api/public/release/\(encoded)")
+            } else {
+                let rel = objectKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? objectKey
+                url = URL(string: "\(base)/api/public/media/\(rel)")
+            }
             #endif
         }
         if url == nil, !update.downloadURL.isEmpty {

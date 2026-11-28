@@ -106,6 +106,35 @@ class HouseStoreTests(unittest.TestCase):
         self.assertEqual(doc["price"], 1250)
         self.assertEqual(doc["remark"], "服务器备注")
 
+    def test_field_level_changed_only_overwrites_named_fields(self):
+        """b31：只提交 changed 中的字段；编辑备注不能把别人刚改的租金带回旧值。
+
+        同字段两边都改时后写入者优先（不再抛 FieldConflict）。
+        """
+        first = self.store.upsert_house(make_house(price=900), operator="A(iPhone)")
+        base = {k: first[k] for k in ("roomNo", "tower", "landlord", "layout",
+                                      "price", "password", "remark", "status")}
+        # B 设备把租金改成 1000
+        self.store.upsert_house(make_house(price=1000), operator="B(iPhone)",
+                                expected_revision=first["revision"])
+        # A 设备只改备注：payload 仍带旧租金 900，但 changed 只有 remark
+        client = make_house(price=900, landlord="康")
+        client["remark"] = "备注2"
+        client["base"] = base
+        client["changed"] = ["remark"]
+        doc = self.store.upsert_house(client, operator="A(iPhone)")
+        self.assertEqual(doc["price"], 1000)
+        self.assertEqual(doc["remark"], "备注2")
+
+        # 两台同时改备注：后写入者覆盖
+        client2 = make_house(price=1000, landlord="康")
+        client2["remark"] = "后写的备注"
+        client2["base"] = doc
+        client2["changed"] = ["remark"]
+        doc2 = self.store.upsert_house(client2, operator="C(iPhone)")
+        self.assertEqual(doc2["remark"], "后写的备注")
+        self.assertEqual(doc2["price"], 1000)
+
     def test_field_level_conflict_same_field(self):
         """同字段两边都改：拒绝覆盖并返回明细。"""
         first = self.store.upsert_house(make_house(price=1100), operator="A(iPhone)")

@@ -142,12 +142,20 @@ struct ServerConfigView: View {
                     Button {
                         connect()
                     } label: {
-                        HStack(spacing: 6) {
-                            if busy { ProgressView().controlSize(.small) }
-                            Label("连接", systemImage: "link")
+                        ZStack {
+                            Text("连接")
+                                .font(.subheadline).fontWeight(.medium)
+                                .frame(maxWidth: .infinity)
+                            HStack {
+                                if busy {
+                                    ProgressView().controlSize(.small)
+                                } else {
+                                    Image(systemName: "link")
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.leading, 12)
                         }
-                        .font(.subheadline)
-                        .fontWeight(.medium)
                         .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
@@ -156,10 +164,17 @@ struct ServerConfigView: View {
                     Button {
                         disconnect()
                     } label: {
-                        Label("断开连接", systemImage: "link.slash")
-                            .font(.subheadline)
-                            .fontWeight(.medium)
-                            .frame(maxWidth: .infinity)
+                        ZStack {
+                            Text("断开连接")
+                                .font(.subheadline).fontWeight(.medium)
+                                .frame(maxWidth: .infinity)
+                            HStack {
+                                Image(systemName: "link.slash")
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.leading, 12)
+                        }
+                        .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
                     .disabled(busy)
@@ -169,8 +184,6 @@ struct ServerConfigView: View {
                         .font(.footnote)
                         .foregroundColor(tipPositive ? .green : .red)
                 }
-
-                Divider()
 
                 if bound {
                     HStack(spacing: 6) {

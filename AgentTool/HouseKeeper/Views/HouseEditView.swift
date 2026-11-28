@@ -40,6 +40,8 @@ struct HouseEditView: View {
     @State private var towerTouched = false
     /// 编辑前原房号目录 key（房号变更时迁移媒体目录）
     @State private var originalRoomKey = ""
+    /// b31：打开编辑页时的字段快照，保存时只把真正改过的字段写服务器。
+    @State private var openedFieldSnapshot: HouseFieldSnapshot?
     /// v1.7：房号实时查重——输入时即提示（变红），与保存时校验同一口径
     @State private var duplicateHint: House?
     @State private var showDuplicateHint = false
@@ -447,6 +449,10 @@ struct HouseEditView: View {
         mediaItems = Array(house.mediaItems)
         towerTouched = true
         originalRoomKey = house.mediaRoomKey
+        openedFieldSnapshot = HouseFieldSnapshot(
+            roomNo: house.roomNo, tower: house.tower, landlord: house.landlord,
+            layout: house.layout, price: house.price, password: house.password,
+            remark: house.remark, statusRaw: house.statusRaw)
     }
 
     // MARK: - v1.7 房号查重（实时提示 + 保存校验同一口径）
@@ -724,6 +730,22 @@ struct HouseEditView: View {
         target.remark = remark.trimmingCharacters(in: .whitespacesAndNewlines)
         target.status = status
         target.updatedAt = Date()
+        // b31：只把本次真正改动的字段发给服务器，避免编辑页旧快照回滚别人的新改动。
+        let changedFieldKeys: Set<String> = {
+            guard let opened = openedFieldSnapshot else {
+                return isEditing ? [] : []
+            }
+            var keys = Set<String>()
+            if opened.roomNo != target.roomNo { keys.insert("roomNo") }
+            if opened.tower != target.tower { keys.insert("tower") }
+            if opened.landlord != target.landlord { keys.insert("landlord") }
+            if opened.layout != target.layout { keys.insert("layout") }
+            if opened.price != target.price { keys.insert("price") }
+            if opened.password != target.password { keys.insert("password") }
+            if opened.remark != target.remark { keys.insert("remark") }
+            if opened.statusRaw != target.statusRaw { keys.insert("status") }
+            return keys
+        }()
         // v1.19：最后更新时间（首次录入 / 编辑保存时刷新）
         target.lastUpdatedAt = Date()
 
@@ -994,7 +1016,8 @@ struct HouseEditView: View {
                 removed: removedRefs, ledgerEventIds: ledgerEventIds, stashID: rollbackStashID)
             launchServerPush(target: target, mediaSnapshots: mediaSnapshots,
                              kind: cloudPushKind, oldRoomKey: oldRoomKeyForPurge,
-                             opAction: opAction, opDetail: opDetail, rollback: rollback)
+                             opAction: opAction, opDetail: opDetail, rollback: rollback,
+                             changedFields: isNewHouse ? nil : changedFieldKeys)
             NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
             dismiss()
             return
@@ -1003,7 +1026,8 @@ struct HouseEditView: View {
         let offlineChange = opDetail.isEmpty ? (opAction.isEmpty ? "房源改动" : opAction) : opDetail
         HouseRepository.shared.markPending(target.mediaRoomKey,
                                              action: opAction.isEmpty ? "上传房源改动" : opAction,
-                                             detail: offlineChange)
+                                             detail: offlineChange,
+                                             changedFields: isNewHouse ? nil : changedFieldKeys)
         if !opAction.isEmpty {
             BackupLogStore.log(category: "房源", action: opAction, result: "待同步",
                                detail: "\(offlineChange)；仅存本机（未绑定服务器账号），绑定后自动补传",
@@ -1022,6 +1046,18 @@ struct HouseEditView: View {
         let roomKey: String
     }
 
+    /// b31：编辑页打开瞬间的字段快照；保存时据此算 changed 清单。
+    private struct HouseFieldSnapshot: Equatable {
+        let roomNo: String
+        let tower: Int
+        let landlord: String
+        let layout: String
+        let price: Int
+        let password: String
+        let remark: String
+        let statusRaw: String
+    }
+
     /// 本次保存属于哪种场景，决定后台推送的先后顺序
     private enum CloudPushKind {
         case newHouse   // 新增房源（#23：先媒体后账本）
@@ -1036,7 +1072,8 @@ struct HouseEditView: View {
     private func launchServerPush(target: House, mediaSnapshots: [MediaUploadSnapshot],
                                   kind: CloudPushKind, oldRoomKey: String,
                                   opAction: String, opDetail: String,
-                                  rollback: HouseUploadRollback? = nil) {
+                                  rollback: HouseUploadRollback? = nil,
+                                  changedFields: Set<String>? = nil) {
         let taskID = UUID()
         let logRoomKey = target.mediaRoomKey
         if !mediaSnapshots.isEmpty {
@@ -1090,7 +1127,7 @@ struct HouseEditView: View {
                     return Set(target.mediaItems.map { $0.fileName }).subtracting(failed)
                 }()
                 let remote = try await HouseRepository.shared.push(
-                    target, mediaFileNames: allowedNames)
+                    target, mediaFileNames: allowedNames, changedFields: changedFields)
                 // 新房先有房源、后有账本：append 时的上行会因“房源不存在”失败，
                 // 权威房源落库后立刻补一次账本上行，避免新收房源账本要等下次启动才出现。
                 await HouseLedgerStore.syncPending(roomKey: remote.roomKey)
@@ -1171,7 +1208,7 @@ struct HouseEditView: View {
                         HouseRepository.shared.markPending(
                             logRoomKey,
                             action: opAction.isEmpty ? "上传房源改动" : opAction,
-                            detail: changeText)
+                            detail: changeText, changedFields: changedFields)
                         HouseActionNotifier.shared.send(
                             key: "fail.\(target.mediaRoomKey)",
                             title: "已存本机",
