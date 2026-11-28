@@ -536,6 +536,10 @@ def serve(store: mw.Store, engine: mw.Engine) -> int:
         engine.run_all(startup=True)
     except Exception:
         mw.log.exception("启动首轮值守异常（不影响同步 API）")
+    try:
+        hub.run_due_reminders()
+    except Exception:
+        mw.log.exception("启动首轮待办提醒扫描异常")
 
     while not stop.is_set():
         awakened = wake.wait(timeout=tick_seconds)
@@ -564,10 +568,15 @@ def serve(store: mw.Store, engine: mw.Engine) -> int:
                     engine.run_all(startup=False)
             except Exception:
                 mw.log.exception("唤醒值守轮询异常，下一轮重试")
+            try:
+                hub.run_due_reminders()
+            except Exception:
+                mw.log.exception("唤醒轮待办提醒扫描异常")
         else:
             try:
                 engine.run_all(startup=False, only_due=True)
                 ha.deliver_pending(house_store, hub)  # 兜底：异步投递失败的 outbox 下轮补发
+                hub.run_due_reminders()
             except Exception:
                 mw.log.exception("值守调度异常，下一 tick 重试")
 

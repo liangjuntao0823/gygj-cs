@@ -872,8 +872,8 @@ struct SettingsView: View {
                                 subtitle: "电表监控 · 安居客后台 · AI 助手") { ServicesSettingsPage() }
                     settingsRow("云端推送", icon: "bell.badge.fill",
                                 subtitle: notifyHub.isBound
-                                    ? "\(notifyHub.username.isEmpty ? "已绑定" : notifyHub.username) · \(notifyHub.devices.count) 台设备 · 电表通知\(notifyHub.channelEnabled && notifyHub.meterModuleEnabled ? "开" : "关")"
-                                    : "未绑定 · 电表告警 / 将来到期收租通知") { CloudPushSettingsView() }
+                                    ? "\(notifyHub.username.isEmpty ? "已绑定" : notifyHub.username) · \(notifyHub.devices.count) 台设备 · 业务通知\(notifyHub.channelEnabled ? "开" : "关")"
+                                    : "未绑定 · 电表 / 房源 / 待办推送") { CloudPushSettingsView() }
                     settingsRow("后台与运营", icon: "chart.bar.xaxis",
                                 subtitle: "远程配置 · 获客分析 · 分享记录 · 后台密码") { AdminOpsSettingsPage() }
                     settingsRow("存储与清理", icon: "internaldrive",

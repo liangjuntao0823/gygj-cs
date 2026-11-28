@@ -43,6 +43,10 @@ log = logging.getLogger("notify-hub")
 MAX_DEVICES_PER_USER = 10
 MAX_EVENTS_PER_USER = 50       # 磁盘每用户最多保留事件
 EVENTS_RETURN = 20             # API 最近事件返回条数
+MAX_REMINDERS_PER_SOURCE = 100 # 每台设备最多上报的未来待办提醒
+REMINDER_EXPIRE_SEC = 6 * 3600 # 到点超过 6 小时未投递则视为过期，避免离线补推轰炸
+REMINDER_INFLIGHT_SEC = 180    # 投递中的租约，进程异常后 3 分钟可重试
+REMINDER_MAX_ATTEMPTS = 5      # 单条提醒最多尝试 5 轮，避免 Bark 故障时无限重试
 DEDUP_WINDOW_SEC = 300         # 同用户同文案 5 分钟内指纹去重（防重启/多出口重复推）
 DEDUP_LOOKBACK = 10
 ENROLL_WINDOW_SEC = 600
@@ -408,7 +412,7 @@ class HubRuntime:
                 "created_at": now,
                 "updated_at": now,
                 "devices": [],
-                "prefs": {"enabled": True, "modules": {"meter": True}},
+                "prefs": {"enabled": True, "modules": {"meter": True, "house": True, "todo": True}},
                 "events": [],
             }
             self._upsert_device(user, key, dname, plat, sbase)
@@ -444,6 +448,158 @@ class HubRuntime:
             doc["users"][token] = user
             self.store.save(doc)
             return self.public_view(user), None
+
+    # ---- 待办提醒：App 上报未来到点的提醒，服务端到点经 Bark 投递 ----
+    def replace_reminders(self, token: str, source: str, raw: Any) -> tuple[dict[str, Any] | None, str | None]:
+        """按设备来源替换提醒清单；同一账号多台手机互不覆盖各自待办。"""
+        if not isinstance(raw, list):
+            return None, "bad_reminders"
+        src = str(source or "").strip()[:64] or "default"
+        now = now_ts()
+        clean: list[dict[str, Any]] = []
+        with self.store.lock:
+            doc = self.store.doc()
+            user = doc["users"].get(token)
+            if not isinstance(user, dict):
+                return None, "unauthorized"
+            all_rem = user.get("reminders")
+            if not isinstance(all_rem, dict):
+                all_rem = {}
+            existing = {
+                str(r.get("id")): r for r in (all_rem.get(src) or [])
+                if isinstance(r, dict) and r.get("id")
+            }
+            for item in raw[:MAX_REMINDERS_PER_SOURCE]:
+                if not isinstance(item, dict):
+                    continue
+                rid = str(item.get("id") or "").strip()[:80]
+                if not rid:
+                    continue
+                try:
+                    due = float(item.get("dueAt") or item.get("due_at") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if due <= 0:
+                    continue
+                # 已经过去太久的提醒不再补推，避免用户离线几天后一次收到一堆旧待办
+                if due < now - REMINDER_EXPIRE_SEC:
+                    continue
+                body = str(item.get("body") or "").strip()[:1000]
+                if not body:
+                    continue
+                title = str(item.get("title") or "待办提醒").strip()[:120] or "待办提醒"
+                old = existing.get(rid)
+                sent_at = None
+                if old and abs(float(old.get("due_at") or 0) - due) <= 1:
+                    sent_at = old.get("sent_at")
+                clean.append({"id": rid, "due_at": due, "title": title, "body": body,
+                              "sent_at": sent_at, "updated_at": now})
+            all_rem[src] = clean
+            user["reminders"] = all_rem
+            user["updated_at"] = iso_now()
+            doc["users"][token] = user
+            self.store.save(doc)
+        return {"ok": True, "count": len(clean), "source": src}, None
+
+    def run_due_reminders(self, now: float | None = None, limit: int = 50) -> int:
+        """到点扫描待办提醒并投递；由 meter-watch 常驻 worker 每 tick 调用。"""
+        now = float(now if now is not None else time.time())
+        claimed: list[tuple[str, str, str, str]] = []
+        with self.store.lock:
+            doc = self.store.doc()
+            changed = False
+            for token, user in doc["users"].items():
+                if not isinstance(user, dict):
+                    continue
+                prefs = user.get("prefs") if isinstance(user.get("prefs"), dict) else {}
+                if prefs.get("enabled") is False:
+                    continue
+                modules = prefs.get("modules") if isinstance(prefs.get("modules"), dict) else {}
+                if modules.get("todo", True) is False:
+                    continue
+                all_rem = user.get("reminders")
+                if not isinstance(all_rem, dict):
+                    continue
+                for src, items in all_rem.items():
+                    if not isinstance(items, list):
+                        continue
+                    for r in items:
+                        if not isinstance(r, dict) or r.get("sent_at"):
+                            continue
+                        try:
+                            due = float(r.get("due_at") or 0)
+                        except (TypeError, ValueError):
+                            due = 0
+                        if due <= 0 or due > now:
+                            continue
+                        if now - due > REMINDER_EXPIRE_SEC:
+                            r["sent_at"] = now
+                            r["status"] = "expired"
+                            changed = True
+                            continue
+                        inflight = float(r.get("in_flight_at") or 0)
+                        if inflight and now - inflight < REMINDER_INFLIGHT_SEC:
+                            continue
+                        attempts = int(r.get("attempts") or 0) + 1
+                        if attempts > REMINDER_MAX_ATTEMPTS:
+                            r["sent_at"] = now
+                            r["status"] = "failed_too_many_attempts"
+                            changed = True
+                            continue
+                        r["in_flight_at"] = now
+                        r["attempts"] = attempts
+                        r["status"] = "sending"
+                        changed = True
+                        claimed.append((token, str(r.get("id") or ""),
+                                        str(r.get("title") or "待办提醒"),
+                                        str(r.get("body") or "")))
+                        break  # 每 tick 每个来源只取一条，避免一次 tick 长时间阻塞
+                    if len(claimed) >= limit:
+                        break
+                if len(claimed) >= limit:
+                    break
+            if changed:
+                self.store.save(doc)
+
+        sent = 0
+        for token, rid, title, body in claimed:
+            try:
+                # event_type 带上提醒 ID，避免两条同文案待办被 5 分钟指纹去重
+                res = self.dispatch(token, "todo", "todo_" + rid[:20], title, body,
+                                    data={"reminderId": rid})
+            except Exception:
+                log.exception("待办提醒投递异常 user=%s id=%s", mask_key(token), rid)
+                res = {"ok": False, "reason": "exception"}
+            ok = bool(res.get("ok"))
+            if ok:
+                sent += 1
+            with self.store.lock:
+                doc = self.store.doc()
+                user = doc["users"].get(token)
+                if isinstance(user, dict):
+                    all_rem = user.get("reminders")
+                    if isinstance(all_rem, dict):
+                        for items in all_rem.values():
+                            if not isinstance(items, list):
+                                continue
+                            for r in items:
+                                if not isinstance(r, dict) or str(r.get("id") or "") != rid:
+                                    continue
+                                r.pop("in_flight_at", None)
+                                if ok:
+                                    r["sent_at"] = now
+                                    r["status"] = "sent"
+                                elif res.get("reason") in ("unknown_user", "no_device", "user_disabled",
+                                                            "module_disabled", "module_access_denied"):
+                                    r["sent_at"] = now
+                                    r["status"] = "suppressed:" + str(res.get("reason"))
+                                else:
+                                    r["status"] = "retry"
+                                break
+                        self.store.save(doc)
+        if claimed:
+            log.info("待办提醒本轮处理 %d 条，成功 %d 条", len(claimed), sent)
+        return sent
 
     def remove_device(self, token: str, device_id: str = "", bark_key: str = "") -> dict[str, Any] | None:
         key = parse_bark_key(bark_key) if bark_key else ""
@@ -558,7 +714,8 @@ class HubRuntime:
     @staticmethod
     def _group(module: str) -> str:
         return {"system": "公寓管家-通道", "meter": "公寓管家-电表",
-                "house": "公寓管家-房源"}.get(module, f"公寓管家-{module}")
+                "house": "公寓管家-房源", "todo": "公寓管家-待办"}.get(
+                    module, f"公寓管家-{module}")
 
     def broadcast(self, module: str, event_type: str, title: str, body: str,
                   exclude_device_id: str = "", data: dict[str, Any] | None = None,
@@ -971,6 +1128,20 @@ def route_request(handler: Any, method: str, path: str, hub: HubRuntime) -> bool
                 return send(200, view)
             return send(400, {"ok": False, "error": "unsupported_action"})
 
+        if sub == "reminders" and method == "POST":
+            body = handler._read_json()
+            if body is None:
+                return send(400, {"ok": False, "error": "bad_json"})
+            view, err = hub.replace_reminders(
+                token,
+                str(body.get("source") or ""),
+                body.get("reminders") if isinstance(body.get("reminders"), list) else None,
+            )
+            if err:
+                status = 401 if err == "unauthorized" else 400
+                return send(status, {"ok": False, "error": err})
+            return send(200, view or {"ok": True})
+
         # 通知文案模板：读取 / 保存 / 预览（预览会按当前模板真实推送到该用户设备）
         if sub == "templates/meter" and method == "GET":
             tpls = hub.get_templates(token, "meter")
@@ -993,7 +1164,7 @@ def route_request(handler: Any, method: str, path: str, hub: HubRuntime) -> bool
             event_key = str((body or {}).get("eventKey") or "low")
             return send(200, hub.preview_template(token, "meter", event_key))
 
-        if sub.startswith("register") or sub in ("me", "events", "test", "prefs", "devices", "health"):
+        if sub.startswith("register") or sub in ("me", "events", "test", "prefs", "devices", "reminders", "health"):
             return send(405, {"ok": False, "error": "method_not_allowed"})
         return send(404, {"ok": False, "error": "not_found"})
 

@@ -744,6 +744,8 @@ struct NotifyHubEvent: Codable, Identifiable, Equatable {
     let status: String?
     let sent: Int?
     let total: Int?
+    let count: Int?
+    let source: String?
 }
 
 struct NotifyHubPrefs: Codable, Equatable {
@@ -786,7 +788,7 @@ final class NotifyHub: ObservableObject {
     @Published var username = ""
     @Published var devices: [NotifyHubDevice] = []
     @Published var events: [NotifyHubEvent] = []
-    @Published var prefs = NotifyHubPrefs(enabled: true, modules: ["meter": true])
+    @Published var prefs = NotifyHubPrefs(enabled: true, modules: ["meter": true, "house": true, "todo": true])
     @Published var busy = false
     @Published var statusText: String?
     @Published var lastSyncAt: Date?
@@ -803,6 +805,8 @@ final class NotifyHub: ObservableObject {
     var token: String? { KeychainStore.load(NotifyHubConfig.tokenKey) }
     var channelEnabled: Bool { prefs.enabled ?? true }
     var meterModuleEnabled: Bool { prefs.modules?["meter"] ?? true }
+    var houseModuleEnabled: Bool { prefs.modules?["house"] ?? true }
+    var todoModuleEnabled: Bool { prefs.modules?["todo"] ?? true }
 
     /// 与电表云端值守共用同一台服务器（8082 同进程挂载 /api/notify），地址在「设置 → 云端配置」里改
     var endpoint: String {
@@ -973,18 +977,25 @@ final class NotifyHub: ObservableObject {
         }
     }
 
-    /// 总开关 / 电表模块开关；先乐观更新再以服务器档案为准回滚
-    func updatePrefs(channelEnabled: Bool? = nil, meterEnabled: Bool? = nil) async {
+    /// 总开关 / 电表 / 房源 / 待办模块开关；先乐观更新再以服务器档案为准回滚
+    func updatePrefs(channelEnabled: Bool? = nil,
+                     meterEnabled: Bool? = nil,
+                     houseEnabled: Bool? = nil,
+                     todoEnabled: Bool? = nil) async {
         var body: [String: Any] = [:]
         if let channelEnabled {
             body["enabled"] = channelEnabled
             prefs.enabled = channelEnabled
         }
-        if let meterEnabled {
-            body["modules"] = ["meter": meterEnabled]
-            var modules = prefs.modules ?? [:]
-            modules["meter"] = meterEnabled
-            prefs.modules = modules
+        var modules: [String: Bool] = [:]
+        if let meterEnabled { modules["meter"] = meterEnabled }
+        if let houseEnabled { modules["house"] = houseEnabled }
+        if let todoEnabled { modules["todo"] = todoEnabled }
+        if !modules.isEmpty {
+            body["modules"] = modules
+            var current = prefs.modules ?? [:]
+            for (key, value) in modules { current[key] = value }
+            prefs.modules = current
         }
         guard !body.isEmpty else { return }
         do {
@@ -993,6 +1004,21 @@ final class NotifyHub: ObservableObject {
         } catch {
             statusText = error.localizedDescription
             await refreshMe()
+        }
+    }
+
+    /// 上报本机待办提醒清单；服务端按 dueAt 扫描并经 Bark 投递。
+    /// source 用 App 稳定设备标识，保证同账号多台手机各自的待办不会互相覆盖。
+    func replaceTodoReminders(_ reminders: [[String: Any]]) async -> String? {
+        guard isBound else { return "推送通道未绑定" }
+        do {
+            _ = try await request("reminders", method: "POST", body: [
+                "source": HouseRemoteClient.shared.originDeviceId,
+                "reminders": reminders
+            ])
+            return nil
+        } catch {
+            return error.localizedDescription
         }
     }
 

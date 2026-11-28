@@ -196,6 +196,69 @@ class TestDispatchIsolation(unittest.TestCase):
         self.assertTrue(ev["results"][0]["ok"])
 
 
+class TestTodoReminders(unittest.TestCase):
+    def setUp(self):
+        self.tmp, self.hub, self.sender = make_hub()
+        self.u, _ = self.hub.register(code="123456", username="待办用户", bark_key=KEY_A)
+        self.token = self.u["token"]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_replace_by_source_keeps_other_device(self):
+        now = nh.now_ts()
+        v, err = self.hub.replace_reminders(self.token, "dev_a", [
+            {"id": "a1", "dueAt": now + 10, "body": "交房租"},
+        ])
+        self.assertIsNone(err)
+        self.assertEqual(v["count"], 1)
+        v2, err = self.hub.replace_reminders(self.token, "dev_b", [
+            {"id": "b1", "dueAt": now + 20, "body": "抄水表"},
+        ])
+        self.assertIsNone(err)
+        u = self.hub.store.get_user(self.token)
+        self.assertEqual(set(u["reminders"].keys()), {"dev_a", "dev_b"})
+        self.assertEqual(u["reminders"]["dev_a"][0]["body"], "交房租")
+
+    def test_run_due_sends_once_and_preserves_sent(self):
+        now = nh.now_ts()
+        self.hub.replace_reminders(self.token, "dev_a", [
+            {"id": "due1", "dueAt": now - 5, "body": "今天收租"},
+            {"id": "future1", "dueAt": now + 60, "body": "明天抄表"},
+        ])
+        sent = self.hub.run_due_reminders(now=now)
+        self.assertEqual(sent, 1)
+        self.assertEqual(len(self.sender.calls), 1)
+        self.assertEqual(self.sender.calls[0][2]["body"], "今天收租")
+        self.assertIn("待办", self.sender.calls[0][2]["group"])
+        # 第二次扫描不重复发送
+        self.assertEqual(self.hub.run_due_reminders(now=now + 1), 0)
+        # 客户端再次同步同一 dueAt，保留 sent_at
+        self.hub.replace_reminders(self.token, "dev_a", [
+            {"id": "due1", "dueAt": now - 5, "body": "今天收租"},
+            {"id": "future1", "dueAt": now + 60, "body": "明天抄表"},
+        ])
+        self.assertEqual(self.hub.run_due_reminders(now=now + 2), 0)
+        u = self.hub.store.get_user(self.token)
+        self.assertTrue(u["reminders"]["dev_a"][0]["sent_at"])
+
+    def test_module_switch_and_expired(self):
+        now = nh.now_ts()
+        self.hub.replace_reminders(self.token, "dev_a", [
+            {"id": "old", "dueAt": now - nh.REMINDER_EXPIRE_SEC - 60, "body": "很旧的待办"},
+            {"id": "soon", "dueAt": now + 5, "body": "快到了"},
+        ])
+        self.hub.set_prefs(self.token, modules={"todo": False})
+        self.assertEqual(self.hub.run_due_reminders(now=now), 0)
+        self.assertEqual(self.sender.calls, [])
+        self.hub.set_prefs(self.token, modules={"todo": True})
+        self.assertEqual(self.hub.run_due_reminders(now=now + 6), 1)
+        u = self.hub.store.get_user(self.token)
+        ids = {r["id"]: r for r in u["reminders"]["dev_a"]}
+        self.assertNotIn("old", ids)   # 超过过期窗口的提醒在上报时就被丢弃
+        self.assertEqual(ids["soon"]["status"], "sent")
+
+
 class FakeHandler:
     def __init__(self, body=None, headers=None, ip="127.0.0.1"):
         self._body = body if body is not None else {}

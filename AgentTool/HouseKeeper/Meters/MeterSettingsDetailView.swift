@@ -351,6 +351,7 @@ private struct MeterCloudWatchSection: View {
 
 struct NotifyHubSettingsView: View {
     @ObservedObject private var hub = NotifyHub.shared
+    @Environment(\.modelContext) private var modelContext
 
     @State private var codeInput = ""
     @State private var usernameInput = ""
@@ -415,7 +416,10 @@ struct NotifyHubSettingsView: View {
             if hub.isBound { Task { await hub.refreshMe() } }
         }
         .alert("退出本机通道登录？", isPresented: $confirmLogout) {
-            Button("退出", role: .destructive) { hub.logout() }
+            Button("退出", role: .destructive) {
+                hub.logout()
+                TodoReminderSync.shared.refresh(modelContext: modelContext)
+            }
             Button("取消", role: .cancel) {}
         } message: {
             Text("仅清除本机登录令牌与缓存，服务器上的账号和设备绑定仍保留。")
@@ -484,6 +488,7 @@ struct NotifyHubSettingsView: View {
             case .none:
                 testTip = "绑定成功，建议立即发送一条通道测试通知"
             }
+            TodoReminderSync.shared.refresh(modelContext: modelContext)
         } else {
             formTip = err
         }
@@ -526,7 +531,12 @@ struct NotifyHubSettingsView: View {
         Section {
             Toggle("启用云端推送通道（总开关）", isOn: Binding(
                 get: { hub.channelEnabled },
-                set: { on in Task { await hub.updatePrefs(channelEnabled: on) } }
+                set: { on in
+                    Task {
+                        await hub.updatePrefs(channelEnabled: on)
+                        TodoReminderSync.shared.refresh(modelContext: modelContext)
+                    }
+                }
             ))
         } header: {
             Text("通道总开关")
@@ -629,6 +639,7 @@ struct NotifyHubSettingsView: View {
         if err == nil {
             addBarkInput = ""
             showAddDevice = false
+            TodoReminderSync.shared.refresh(modelContext: modelContext)
         }
     }
 
@@ -702,6 +713,8 @@ struct NotifyHubSettingsView: View {
     private func moduleLabel(_ module: String?) -> String {
         switch module {
         case "meter": return "电表"
+        case "house": return "房源"
+        case "todo": return "待办"
         case "system": return "通道"
         default: return module ?? "通知"
         }
@@ -731,12 +744,13 @@ struct NotifyHubSettingsView: View {
 }
 
 // MARK: - 一级菜单「云端推送」（b206）
-// 统一通知设置首页：本页只放“收不收业务通知”的模块开关（当前仅电表推送，后续扩展到期/收租/待办）；
+// 统一通知设置首页：本页只放“收不收业务通知”的模块开关（电表 / 待办 / 房源，后续扩展到期/收租）；
 // Bark 绑定、多设备、通道总开关、通道测试与最近投递记录收进二级页 NotifyHubSettingsView。
 // 注意与「电表监控设置 → 云端轮询」的分工：轮询开关决定服务器查不查电表，本页开关决定查出来的告警推不推到手机。
 
 struct CloudPushSettingsView: View {
     @ObservedObject private var hub = NotifyHub.shared
+    @Environment(\.modelContext) private var modelContext
 
     var body: some View {
         Form {
@@ -749,10 +763,34 @@ struct CloudPushSettingsView: View {
                         .font(.system(size: 14))
                 }
                 .disabled(!hub.isBound || !hub.channelEnabled)
+
+                Toggle(isOn: Binding(
+                    get: { hub.todoModuleEnabled },
+                    set: { on in
+                        Task {
+                            await hub.updatePrefs(todoEnabled: on)
+                            // 开关切换后立即重算：开则未来待办交给服务器 Bark，关则本机本地通知兜底
+                            TodoReminderSync.shared.refresh(modelContext: modelContext)
+                        }
+                    }
+                )) {
+                    Label("待办提醒", systemImage: "checklist")
+                        .font(.system(size: 14))
+                }
+                .disabled(!hub.isBound || !hub.channelEnabled)
+
+                Toggle(isOn: Binding(
+                    get: { hub.houseModuleEnabled },
+                    set: { on in Task { await hub.updatePrefs(houseEnabled: on) } }
+                )) {
+                    Label("房源推送", systemImage: "building.2.fill")
+                        .font(.system(size: 14))
+                }
+                .disabled(!hub.isBound || !hub.channelEnabled)
             } header: {
                 Text("通知开关")
             } footer: {
-                Text(meterFooter)
+                Text([meterFooter, todoFooter, houseFooter].joined(separator: "\n\n"))
             }
 
             Section {
@@ -781,7 +819,7 @@ struct CloudPushSettingsView: View {
             } header: {
                 Text("推送通道")
             } footer: {
-                Text("通道按账号隔离，事件只投到本账号绑定的手机；首次使用先进入上方绑定 Bark 首页推送链接。电表“要不要服务器轮询查询”在「电表监控设置 → 云端轮询」里控制，与本页“要不要接收通知”相互独立。后续到期、收租、待办等提醒会在本页增加独立开关。")
+                Text("通道按账号隔离，事件只投到本账号绑定的手机；首次使用先进入上方绑定 Bark 首页推送链接。电表“要不要服务器轮询查询”在「电表监控设置 → 云端轮询」里控制，与本页“要不要接收通知”相互独立。到期、收租等提醒后续也会加到本页的独立开关。")
             }
 
             Section {
@@ -807,7 +845,12 @@ struct CloudPushSettingsView: View {
         .navigationTitle("云端推送")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
-            if hub.isBound { Task { await hub.refreshMe() } }
+            if hub.isBound {
+                Task {
+                    await hub.refreshMe()
+                    TodoReminderSync.shared.refresh(modelContext: modelContext)
+                }
+            }
         }
     }
 
@@ -825,6 +868,26 @@ struct CloudPushSettingsView: View {
             return "推送通道总开关已关闭；请先到下方「通道账号、设备、测试与投递记录」打开总开关，再设置电表推送。"
         }
         return "控制服务器云端轮询产生的低电量、拉闸、值守告警是否推送到本账号设备。关闭后服务器仍会按「电表监控设置 → 云端轮询」的开关与间隔查询并更新云端快照，但不发通知；重新打开即恢复推送。"
+    }
+
+    private var todoFooter: String {
+        if !hub.isBound {
+            return "待办提醒：未绑定 Bark 时由本机本地通知提醒；绑定并打开本开关后，未来待办改由服务器经 Bark 推送，本机不再重复排未来通知。"
+        }
+        if !hub.channelEnabled {
+            return "待办提醒：推送通道总开关已关闭，当前由本机本地通知兜底。"
+        }
+        return "待办提醒：开启后，未来待办到点由服务器经 Bark 推送，本机不再为同一条未来待办排本地通知，避免 Bark 与公寓管家各弹一次；服务器不可达/未绑定时自动回退本机本地通知，已过点的待办仍保留本机每小时兜底。"
+    }
+
+    private var houseFooter: String {
+        if !hub.isBound {
+            return "房源推送：需先绑定 Bark；绑定后服务器才能把房源动作推送到本账号其他设备。"
+        }
+        if !hub.channelEnabled {
+            return "房源推送：推送通道总开关已关闭；本机房源操作仍由本机本地通知提示。"
+        }
+        return "房源推送：控制服务器把本机或其他设备的新增、修改、删除房源动作推送到本账号设备；本机动作仍由本机通知提示。关闭后只是不再接收服务器房源推送，不影响房源同步本身。"
     }
 }
 
