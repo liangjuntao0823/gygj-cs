@@ -27,8 +27,6 @@ struct AgentToolApp: App {
     @StateObject private var elevatorCodeCenter = ElevatorCodeCenter.shared
     // b140：启动图——系统 LaunchScreen 显示静态图（不含版本号），App 首帧叠同一张图 + 动态版本号，0.5 秒内收起
     @State private var showLaunchSplash = true
-    /// b32：一次冷启动只自动检查一次更新，避免根视图 onAppear 被系统重复触发时反复弹窗。
-    @State private var didAutoCheckUpdate = false
 
     init() {
         // 强制应用内系统控件使用中文
@@ -340,6 +338,8 @@ struct MainTabView: View {
     @State private var showUpdateDetailFromPopup = false
     // v1.83：上次异常退出提示（检测到崩溃日志时弹一次，设置页可查看/导出）
     @State private var showCrashTip = false
+    /// b32：一次冷启动只自动检查一次更新，避免根视图 onAppear 被系统重复触发时反复弹窗。
+    @State private var didAutoCheckUpdate = false
 
     private let tabs = [
         (title: "工作台", icon: "house.fill"),

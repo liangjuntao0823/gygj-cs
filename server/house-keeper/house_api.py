@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 import urllib.parse
@@ -474,7 +475,10 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
             handler.send_header("Content-Length", str(len(data)))
             # b32：文件名可能含中文；http.server 的 header 只接受 latin-1，直接用中文会抛 UnicodeEncodeError。
             # 同时给 ASCII 兜底名和 RFC 5987 的 filename*，浏览器/下载器优先用 UTF-8 原名。
-            ascii_name = name.encode("ascii", "ignore").decode("ascii").strip() or "app.ipa"
+            ascii_name = name.encode("ascii", "ignore").decode("ascii").strip()
+            # 纯中文文件名按 ASCII 过滤后只剩 ".ipa"，兜底名补成 app.ipa，避免下载器看到隐藏文件式名字
+            if not ascii_name or ascii_name.strip(".") == "":
+                ascii_name = "app" + os.path.splitext(name)[1]
             quoted_name = urllib.parse.quote(name, safe="")
             handler.send_header(
                 "Content-Disposition",
