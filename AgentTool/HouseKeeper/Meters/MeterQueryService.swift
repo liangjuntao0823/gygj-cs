@@ -167,7 +167,6 @@ final class MeterQueryService: MeterQuerying {
                 try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
             }
         }
-        store.sendLowAlertIfNeeded()
         if ok == 0, let lastError {
             throw lastError
         }

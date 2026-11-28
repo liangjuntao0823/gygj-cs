@@ -92,6 +92,28 @@ class TestRegisterAndProfile(unittest.TestCase):
         me = self.hub.public_view(self.hub.store.get_user(view["token"]))
         self.assertEqual(me["devices"][0]["name"], "我的 iPhone")
 
+    def test_source_device_mapping_for_single_device(self):
+        view, err = self.hub.register(code="123456", username="涛", bark_key=KEY_A,
+                                      device_name="我的 iPhone")
+        self.assertIsNone(err)
+        token = view["token"]
+        # 已绑定旧账号没有 source；带 token + source 调一次 register 即补上
+        view2, err2 = self.hub.register(token=token, source_device_id="dev_abc123")
+        self.assertIsNone(err2)
+        dev = view2["devices"][0]
+        self.assertEqual(dev.get("sourceDeviceId"), "dev_abc123")
+
+    def test_source_mapping_does_not_guess_between_two_unnamed_devices(self):
+        v1, _ = self.hub.register(code="123456", username="涛", bark_key=KEY_A,
+                                  device_name="我的 iPhone")
+        t1 = v1["token"]
+        self.hub.register(token=t1, bark_key=KEY_B, device_name="我的 iPhone")
+        v2, err = self.hub.register(token=t1, source_device_id="dev_abc123",
+                                    device_name="我的 iPhone")
+        self.assertIsNone(err)
+        self.assertEqual(v2["devices"][0].get("sourceDeviceId"), "")
+        self.assertEqual(v2["devices"][1].get("sourceDeviceId"), "")
+
     def test_username_conflict_then_token_update(self):
         v1, _ = self.hub.register(code="123456", username="涛", bark_key=KEY_A)
         t1 = v1["token"]
@@ -175,6 +197,28 @@ class TestDispatchIsolation(unittest.TestCase):
         r = self.hub.broadcast("house", "house_add", "房源新增", "只应发给乙")
         self.assertEqual((r["sent"], r["total"]), (1, 1))
         self.assertEqual(self.sender.keys(), [KEY_B])
+
+    def test_broadcast_excludes_source_device(self):
+        token = self.u1["token"]
+        self.hub.register(token=token, source_device_id="dev_abc123")
+        r = self.hub.broadcast("house", "house_edit", "房源修改", "不应发给本机",
+                               exclude_source_device_id="dev_abc123")
+        self.assertEqual((r["sent"], r["total"]), (1, 1))
+        self.assertEqual(self.sender.keys(), [KEY_B])
+        self.sender.calls.clear()
+        # 没有映射时按 device_id 排除仍然有效
+        r2 = self.hub.broadcast("house", "house_edit", "房源修改", "按设备排除",
+                                exclude_device_id=self.u1["devices"][0]["deviceId"])
+        self.assertEqual((r2["sent"], r2["total"]), (1, 1))
+        self.assertEqual(self.sender.keys(), [KEY_B])
+
+    def test_dispatch_excludes_source_device(self):
+        token = self.u1["token"]
+        self.hub.register(token=token, source_device_id="dev_abc123")
+        r = self.hub.dispatch(token, "house", "house_edit", "本机不发", "只给其他设备",
+                              exclude_source_device_id="dev_abc123")
+        self.assertEqual(r["reason"], "no_device")
+        self.assertEqual(self.sender.keys(), [])
 
     def test_house_access_checker_overrides_push_switch(self):
         hub = self.hub

@@ -90,14 +90,10 @@ struct MeterSettingsDetailView: View {
                             .foregroundColor(.themeText3)
                     }
                 }
-                Toggle("低电量提醒", isOn: Binding(
-                    get: { store.settings.lowAlertEnabled },
-                    set: { store.settings.lowAlertEnabled = $0; store.saveSettings() }
-                ))
             } header: {
                 Text("预警")
             } footer: {
-                Text("刷新后剩余电量低于阈值的房号在列表标红；低电量提醒每天最多推送一次，避免骚扰。拉闸房号同样标红。")
+                Text("刷新后剩余电量低于阈值的房号在列表标红，拉闸房号同样标红。低电量/拉闸告警由服务器云端轮询经 Bark 推送（在「设置 → 云端推送 → 电表推送」开关）；App 无法常驻后台，不再使用本机本地通知，避免漏报和重复弹。")
             }
 
             Section {
@@ -885,9 +881,9 @@ struct CloudPushSettingsView: View {
             return "房源推送：需先绑定 Bark；绑定后服务器才能把房源动作推送到本账号其他设备。"
         }
         if !hub.channelEnabled {
-            return "房源推送：推送通道总开关已关闭；本机房源操作仍由本机本地通知提示。"
+            return "房源推送：推送通道总开关已关闭；本机房源操作仍由公寓管家本地通知提示，其他设备不会收到 Bark。"
         }
-        return "房源推送：控制服务器把本机或其他设备的新增、修改、删除房源动作推送到本账号设备；本机动作仍由本机通知提示。关闭后只是不再接收服务器房源推送，不影响房源同步本身。"
+        return "房源推送：本机改房源仍由公寓管家本地通知提示；服务器会按本机安装标识排除本机，只把动作推给本账号的其他设备，避免同一动作本机弹两次。关闭后其他设备不再收房源 Bark，房源同步本身不受影响。"
     }
 }
 

@@ -292,6 +292,7 @@ class HubRuntime:
     def public_view(self, user: dict[str, Any], include_events: bool = True) -> dict[str, Any]:
         devices = [{
             "deviceId": d.get("device_id", ""),
+            "sourceDeviceId": d.get("source_device_id", ""),
             "name": d.get("name", ""),
             "platform": d.get("platform", ""),
             "serverBase": d.get("server_base", ""),
@@ -320,8 +321,37 @@ class HubRuntime:
     # ---- 注册 / 更新 ----
 
     @staticmethod
+    def _map_device_source_locked(user: dict[str, Any], source_device_id: str,
+                                  device_name: str = "") -> bool:
+        """把 App 的本机安装标识（house originDeviceId）映射到一台 Bark 设备。
+
+        绑定/新增设备时由 _upsert_device 直接写入；已绑定但旧数据没有映射时，
+        这里做一次兼容补齐：优先按同名设备，其次在账号只有一台设备时直接认领。
+        多台设备且同名时不猜，避免把 A 手机的房源动作错排到 B 手机上。
+        """
+        src = str(source_device_id or "").strip()[:64]
+        if not src:
+            return False
+        devices = [d for d in user.get("devices", []) if isinstance(d, dict)]
+        for d in devices:
+            if str(d.get("source_device_id") or "") == src:
+                return True
+        name = str(device_name or "").strip()[:60]
+        if name:
+            matched = [d for d in devices if str(d.get("name") or "") == name]
+            if len(matched) == 1:
+                matched[0]["source_device_id"] = src
+                return True
+        if len(devices) == 1:
+            devices[0]["source_device_id"] = src
+            return True
+        return False
+
+    @staticmethod
     def _upsert_device(user: dict[str, Any], key: str, name: str,
-                       platform: str, server_base: str) -> str | None:
+                       platform: str, server_base: str,
+                       source_device_id: str = "") -> str | None:
+        src = str(source_device_id or "").strip()[:64]
         for d in user.setdefault("devices", []):
             if isinstance(d, dict) and d.get("bark_key") == key:
                 if name:
@@ -330,12 +360,15 @@ class HubRuntime:
                     d["platform"] = platform
                 if server_base:
                     d["server_base"] = server_base
+                if src:
+                    d["source_device_id"] = src
                 return None
         if len(user["devices"]) >= MAX_DEVICES_PER_USER:
             return "device_limit"
         user["devices"].append({
             "device_id": "dv_" + secrets.token_hex(6),
             "bark_key": key,
+            "source_device_id": src,
             "name": name or "我的 iPhone",
             "platform": platform or "ios",
             "server_base": server_base or "",
@@ -365,7 +398,7 @@ class HubRuntime:
 
     def register(self, code: str = "", token: str = "", username: str = "",
                  bark_key: str = "", device_name: str = "", platform: str = "",
-                 server_base: str = "") -> tuple[dict[str, Any] | None, str | None]:
+                 server_base: str = "", source_device_id: str = "") -> tuple[dict[str, Any] | None, str | None]:
         """返回 (脱敏用户档案, 错误码)。token 有效=已登录更新（加/换设备、改名）；否则凭接入码新建。"""
         username = str(username or "").strip()[:40]
         key = parse_bark_key(bark_key)
@@ -385,9 +418,13 @@ class HubRuntime:
                 if bark_key and not key:
                     return None, "invalid_bark_key"
                 if key:
-                    err = self._upsert_device(existing, key, dname, plat, sbase)
+                    err = self._upsert_device(existing, key, dname, plat, sbase,
+                                              source_device_id)
                     if err:
                         return None, err
+                elif source_device_id:
+                    # 已绑定但未重绑的旧设备：带 token 调 register 即可补上本机映射。
+                    self._map_device_source_locked(existing, source_device_id, dname)
                 existing["updated_at"] = iso_now()
                 users[token] = existing
                 self.store.save(doc)
@@ -415,7 +452,7 @@ class HubRuntime:
                 "prefs": {"enabled": True, "modules": {"meter": True, "house": True, "todo": True}},
                 "events": [],
             }
-            self._upsert_device(user, key, dname, plat, sbase)
+            self._upsert_device(user, key, dname, plat, sbase, source_device_id)
             users[nt] = user
             idx[username.lower()] = nt
             self.store.save(doc)
@@ -500,6 +537,9 @@ class HubRuntime:
                               "sent_at": sent_at, "updated_at": now})
             all_rem[src] = clean
             user["reminders"] = all_rem
+            # 待办上报也带本机 source；旧账号只有一台设备时可顺手补上房源去重映射。
+            if src != "default":
+                self._map_device_source_locked(user, src)
             user["updated_at"] = iso_now()
             doc["users"][token] = user
             self.store.save(doc)
@@ -723,9 +763,11 @@ class HubRuntime:
 
     def broadcast(self, module: str, event_type: str, title: str, body: str,
                   exclude_device_id: str = "", data: dict[str, Any] | None = None,
-                  level: str | None = None, subtitle: str = "") -> dict[str, Any]:
+                  level: str | None = None, subtitle: str = "",
+                  exclude_source_device_id: str = "") -> dict[str, Any]:
         """房源板块广播：投给所有 enabled、模块未禁用、有设备的用户名下设备；
-        exclude_device_id 为发起本次修改的设备，跳过它（本机走本地通知，沿用现有文案）。
+        exclude_device_id 为发起本次修改的设备，exclude_source_device_id 为 App 的本机安装标识；
+        两者任一命中都跳过该设备（本机走本地通知，其他设备走 Bark）。
         改一条推一条，不做合并。"""
         module = str(module or "house")[:32]
         event_type = str(event_type or "change")[:32]
@@ -748,9 +790,12 @@ class HubRuntime:
                 modules = prefs.get("modules") if isinstance(prefs.get("modules"), dict) else {}
                 if modules.get(module, True) is False:
                     continue
+                ex_dev = str(exclude_device_id or "").strip()
+                ex_src = str(exclude_source_device_id or "").strip()
                 devices = [d for d in user.get("devices", [])
                            if self.device_allows(d, module)
-                           and str(d.get("device_id")) != str(exclude_device_id)]
+                           and (not ex_dev or str(d.get("device_id") or "") != ex_dev)
+                           and (not ex_src or str(d.get("source_device_id") or "") != ex_src)]
                 if not devices:
                     continue
                 event = {
@@ -825,8 +870,11 @@ class HubRuntime:
 
     def dispatch(self, user_token: str, module: str, event_type: str, title: str, body: str,
                  data: dict[str, Any] | None = None, idem_key: str | None = None,
-                 level: str | None = None, subtitle: str = "") -> dict[str, Any]:
-        """业务模块统一入口：只按 user_token 投该用户名下设备，绝不跨用户群发。"""
+                 level: str | None = None, subtitle: str = "",
+                 exclude_device_id: str = "",
+                 exclude_source_device_id: str = "") -> dict[str, Any]:
+        """业务模块统一入口：只按 user_token 投该用户名下设备，绝不跨用户群发。
+        exclude_* 用于“只通知本账号其他设备”，例如本机刚改完房源时跳过本机 Bark。"""
         module = str(module or "generic")[:32]
         event_type = str(event_type or "alert")[:32]
         title = str(title or "通知")[:120]
@@ -854,8 +902,12 @@ class HubRuntime:
                 return self._suppressed_locked(doc, user, module, event_type, title, body, data,
                                                "module_disabled")
 
+            ex_dev = str(exclude_device_id or "").strip()
+            ex_src = str(exclude_source_device_id or "").strip()
             devices = [d for d in user.get("devices", [])
-                       if self.device_allows(d, module)]
+                       if self.device_allows(d, module)
+                       and (not ex_dev or str(d.get("device_id") or "") != ex_dev)
+                       and (not ex_src or str(d.get("source_device_id") or "") != ex_src)]
             if not devices:
                 return self._suppressed_locked(doc, user, module, event_type, title, body, data, "no_device")
 
@@ -1080,6 +1132,7 @@ def route_request(handler: Any, method: str, path: str, hub: HubRuntime) -> bool
                 device_name=str(body.get("deviceName") or body.get("device_name") or ""),
                 platform=str(body.get("platform") or ""),
                 server_base=str(body.get("serverBase") or body.get("server_base") or ""),
+                source_device_id=str(body.get("sourceDeviceId") or body.get("source_device_id") or ""),
             )
             if err:
                 if auth_user is None and err == "invalid_code":

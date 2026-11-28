@@ -327,6 +327,16 @@ final class UpdateDownloader: ObservableObject {
 
     private var task: URLSessionDownloadTask?
     private var timer: Timer?
+    private var pendingURLs: [URL] = []
+    private var activeUpdate: UpdateCenter.Available?
+    private var lastFailure = ""
+    private let session: URLSession = {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+        cfg.timeoutIntervalForRequest = 120
+        cfg.timeoutIntervalForResource = 300
+        return URLSession(configuration: cfg)
+    }()
 
     var isBusy: Bool {
         if case .downloading = phase { return true }
@@ -336,11 +346,18 @@ final class UpdateDownloader: ObservableObject {
 
     func start(_ update: UpdateCenter.Available) {
         guard !isBusy else { return }
-        var url: URL?
+        var urls: [URL] = []
+        // 服务器配置里的 downloadURL 是完整绝对地址，优先使用；objectKey 只作兜底。
+        // 这样即使本机保存的服务器地址和安装包实际所在端口不一致，也不会下到别的服务。
+        let direct = update.downloadURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !direct.isEmpty, let u = URL(string: direct) {
+            urls.append(u)
+        }
         if !update.objectKey.isEmpty {
             #if !APP_EXTENSION
             let base = NotifyHub.shared.endpoint
             let objectKey = update.objectKey
+            let url: URL?
             if objectKey.hasPrefix("releases/") {
                 // b31：新架构安装包落服务器 releases/ 目录，走专用公开下载接口；
                 // 旧版 objectKey 仍兼容 /api/public/media/ 路径。
@@ -351,19 +368,35 @@ final class UpdateDownloader: ObservableObject {
                 let rel = objectKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? objectKey
                 url = URL(string: "\(base)/api/public/media/\(rel)")
             }
+            if let url { urls.append(url) }
             #endif
         }
-        if url == nil, !update.downloadURL.isEmpty {
-            url = URL(string: update.downloadURL)
-        }
-        guard let finalURL = url else {
+        // 去重，避免 direct 与 objectKey 拼出同一条地址后重复下载一遍。
+        var seen = Set<String>()
+        pendingURLs = urls.filter { seen.insert($0.absoluteString).inserted }
+        guard !pendingURLs.isEmpty else {
             phase = .failed("服务器还没有安装包，请在后台填 objectKey 或 downloadURL")
             return
         }
+        activeUpdate = update
+        lastFailure = ""
+        beginNextDownload()
+    }
 
+    private func beginNextDownload() {
+        guard let update = activeUpdate, !pendingURLs.isEmpty else {
+            phase = .failed(lastFailure.isEmpty ? "没有可用的安装包地址" : lastFailure)
+            return
+        }
+        let url = pendingURLs.removeFirst()
         phase = .downloading
         progress = 0
-        let t = URLSession.shared.downloadTask(with: finalURL) { [weak self] tmp, resp, err in
+
+        var req = URLRequest(url: url)
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        req.timeoutInterval = 120
+        req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        let t = session.downloadTask(with: req) { [weak self] tmp, resp, err in
             Task { @MainActor in
                 self?.finish(tmp: tmp, response: resp, error: err, update: update)
             }
@@ -384,12 +417,19 @@ final class UpdateDownloader: ObservableObject {
     private func finish(tmp: URL?, response: URLResponse?, error: Error?, update: UpdateCenter.Available) {
         timer?.invalidate()
         timer = nil
+        task = nil
+
         if let error {
-            phase = .failed("下载失败：\(error.localizedDescription)")
+            retryOrFail("下载失败：\(error.localizedDescription)")
             return
         }
         guard let tmp else {
-            phase = .failed("下载失败：没有拿到文件")
+            retryOrFail("下载失败：没有拿到文件")
+            return
+        }
+        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            try? FileManager.default.removeItem(at: tmp)
+            retryOrFail("服务器返回 HTTP \(http.statusCode)，不是安装包")
             return
         }
         phase = .verifying
@@ -405,25 +445,43 @@ final class UpdateDownloader: ObservableObject {
         do {
             try FileManager.default.moveItem(at: tmp, to: dest)
         } catch {
-            phase = .failed("保存失败：\(error.localizedDescription)")
+            retryOrFail("保存失败：\(error.localizedDescription)")
+            return
+        }
+
+        let actualSize = (try? dest.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        if update.sizeBytes > 0, actualSize != update.sizeBytes {
+            try? FileManager.default.removeItem(at: dest)
+            retryOrFail("下载不完整：实际 \(actualSize) 字节，应为 \(update.sizeBytes) 字节")
             return
         }
 
         if !update.sha256.isEmpty, let data = try? Data(contentsOf: dest) {
             let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-            if hash.lowercased() != update.sha256.lowercased() {
+            if hash.lowercased() != update.sha256.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
                 try? FileManager.default.removeItem(at: dest)
-                phase = .failed("安装包校验失败（文件可能不完整），请重新下载")
+                retryOrFail("安装包校验失败：已下载 \(actualSize) 字节，SHA256 与服务器配置不一致")
                 return
             }
         }
 
         // v2.23：校验通过后清掉目录里其它旧安装包——只留刚下载的这一个（每版约 10MB，不清理会一直堆）
         Self.pruneOldPackages(keep: dest)
-
+        pendingURLs.removeAll()
+        activeUpdate = nil
         localURL = dest
         progress = 1
         phase = .ready
+    }
+
+    /// 当前地址失败时自动换下一条；全部失败才把最后一个真实原因交给界面。
+    private func retryOrFail(_ message: String) {
+        lastFailure = message
+        if !pendingURLs.isEmpty {
+            beginNextDownload()
+        } else {
+            phase = .failed(message)
+        }
     }
 }
 

@@ -6,6 +6,7 @@
 
 import Foundation
 import SwiftUI
+import UIKit
 
 @MainActor
 final class MeterStore: ObservableObject {
@@ -83,7 +84,7 @@ final class MeterStore: ObservableObject {
     // 说明：autoRefreshEnabled 开启时，App 前台运行期间按 autoRefreshMinutes 间隔自动刷新电表并保存；
     // iOS 系统限制 App 被杀后无法后台执行——App 下次打开不会自动补刷（v2.4 起），
     // 总刷新仅手动按钮/下拉刷新，或设置页开启定时刷新后按间隔执行。
-    // 配合低电量本地通知（lowAlertEnabled）即可实现「AI 盯电表」的完整闭环。
+    // 低电量告警由服务器云端轮询经 Bark 推送；App 不能常驻后台，本机本地通知只作为历史遗留开关，不再触发。
 
     private var refreshTimer: Timer?
 
@@ -219,46 +220,6 @@ final class MeterStore: ObservableObject {
         if changed { saveMeters() }
     }
 
-    // MARK: - 低电量提醒（本地通知，每天每户最多一次，防骚扰）
-
-    private let alertDateKey = "meter.lowAlertDate"   // yyyyMMdd，全局每日一次
-
-    func sendLowAlertIfNeeded() {
-        guard settings.lowAlertEnabled else { return }
-        let center = UNUserNotificationCenter.current()
-        let cal = Calendar.current
-        let todayKey = { () -> String in
-            let f = DateFormatter(); f.dateFormat = "yyyyMMdd"; return f.string(from: Date())
-        }()
-        let last = UserDefaults.standard.string(forKey: alertDateKey)
-        guard last != todayKey else { return }
-
-        let low = meters.filter { $0.isLow(threshold: settings.lowThreshold) }
-        let off = meters.filter { $0.isOff }
-        guard !low.isEmpty || !off.isEmpty else { return }
-
-        center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
-            guard granted else { return }
-            let content = UNMutableNotificationContent()
-            content.title = "电表预警"
-            var bodyParts: [String] = []
-            if !low.isEmpty {
-                let sample = low.prefix(3).map { "\($0.room.isEmpty ? $0.uid : $0.room) \(String(format: "%.1f", $0.shengyu))度" }
-                bodyParts.append("低电量 \(low.count) 户：" + sample.joined(separator: "、"))
-            }
-            if !off.isEmpty {
-                let sample = off.prefix(3).map { $0.room.isEmpty ? $0.uid : $0.room }
-                bodyParts.append("拉闸 \(off.count) 户：" + sample.joined(separator: "、"))
-            }
-            content.body = bodyParts.joined(separator: "；") + "。请及时充值。"
-            content.userInfo = ["tab": 0]
-            content.sound = .default
-            let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
-            let req = UNNotificationRequest(identifier: "meter.lowAlert", content: content, trigger: trigger)
-            center.add(req)
-            UserDefaults.standard.set(todayKey, forKey: self.alertDateKey)
-        }
-    }
 }
 
 // MARK: - 云端值守：看板快照合并（#236 双模式）
@@ -909,7 +870,9 @@ final class NotifyHub: ObservableObject {
             "barkKey": barkText.trimmingCharacters(in: .whitespacesAndNewlines),
             "deviceName": deviceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? "我的 iPhone" : deviceName.trimmingCharacters(in: .whitespacesAndNewlines),
-            "platform": "ios"
+            "platform": "ios",
+            // 房源广播时服务器用这个稳定安装标识排除本机，避免本机本地通知和 Bark 各弹一次。
+            "sourceDeviceId": HouseRemoteClient.shared.originDeviceId
         ]
         do {
             let obj = try await request("register", method: "POST", body: body)
@@ -935,6 +898,18 @@ final class NotifyHub: ObservableObject {
         let store = MeterStore.shared
         // 保持用户当前值守开关状态，不借绑定动作擅自开启服务器轮询
         return await sync.pushConfig(store: store, enabled: store.settings.cloudWatchEnabled)
+    }
+
+    /// 已绑定旧账号没有本机 source 映射时，启动/进设置页补一次；不新增设备、不改 Bark。
+    /// 服务器只在账号只有一台设备（或设备名唯一匹配）时认领，多台同名设备不会乱猜。
+    func ensureSourceMapping() async {
+        guard isBound else { return }
+        let body: [String: Any] = [
+            "sourceDeviceId": HouseRemoteClient.shared.originDeviceId,
+            "deviceName": UIDevice.current.name,
+            "platform": "ios"
+        ]
+        _ = try? await request("register", method: "POST", body: body)
     }
 
     func refreshMe() async {

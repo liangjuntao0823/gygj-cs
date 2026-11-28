@@ -22,15 +22,19 @@ class FakeHub:
         self.calls = []
 
     def broadcast(self, module, action, title, body,
-                  exclude_device_id="", data=None):
+                  exclude_device_id="", data=None, exclude_source_device_id=""):
         self.calls.append({"kind": "broadcast", "module": module, "action": action,
-                           "exclude": exclude_device_id, "data": data})
+                           "exclude": exclude_device_id,
+                           "exclude_source": exclude_source_device_id, "data": data})
         return dict(self._result)
 
     def dispatch(self, user_token, module, event_type, title, body,
-                 data=None, idem_key=None, level=None, subtitle=""):
+                 data=None, idem_key=None, level=None, subtitle="",
+                 exclude_device_id="", exclude_source_device_id=""):
         self.calls.append({"kind": "dispatch", "user": user_token, "module": module,
-                           "type": event_type, "data": data})
+                           "type": event_type, "data": data,
+                           "exclude": exclude_device_id,
+                           "exclude_source": exclude_source_device_id})
         return dict(self._result)
 
 
@@ -79,6 +83,7 @@ class DeliverPendingTests(unittest.TestCase):
         self.assertEqual(len(hub.calls), 1)
         self.assertEqual(hub.calls[0]["kind"], "dispatch")
         self.assertEqual(hub.calls[0]["user"], "nt_target")
+        self.assertEqual(hub.calls[0]["exclude_source"], "dev_x")
         self.assertNotIn("notifyScope", hub.calls[0]["data"])
         self.assertNotIn("notifyUserToken", hub.calls[0]["data"])
 

@@ -1165,10 +1165,9 @@ struct AIToolExecutor {
         case "set_low_alert":
             let store = MeterStore.shared
             if let th = d(a, "threshold") { store.settings.lowThreshold = th }
-            if let en = a["enabled"] as? Bool { store.settings.lowAlertEnabled = en }
             store.saveSettings()
-            logAI(category: "电表", action: "设置低电量预警", result: "成功", detail: "阈值 \(store.settings.lowThreshold) 度，\(store.settings.lowAlertEnabled ? "开启" : "关闭")")
-            return "已设置低电量预警：低于 \(Int(store.settings.lowThreshold)) 度提醒（\(store.settings.lowAlertEnabled ? "已开启" : "已关闭")），时间 \(dateText(Date()))"
+            logAI(category: "电表", action: "设置低电量预警", result: "成功", detail: "阈值 \(store.settings.lowThreshold) 度；服务器云端轮询经 Bark 推送")
+            return "已设置低电量阈值：低于 \(Int(store.settings.lowThreshold)) 度在列表标红，并由服务器云端轮询经 Bark 推送告警（需在设置→云端推送打开电表推送）。时间 \(dateText(Date()))"
 
         case "set_auto_refresh":
             let store = MeterStore.shared

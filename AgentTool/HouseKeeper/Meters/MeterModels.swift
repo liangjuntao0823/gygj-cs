@@ -105,7 +105,7 @@ struct MeterSettings: Codable {
     var lowThreshold: Double = 30   // 低电量阈值（度），默认 30，可自行输入
     var autoRefreshMinutes: Int = 30 // 定时自动刷新间隔（分钟），默认 30
     var autoRefreshEnabled: Bool = false // 定时刷新开关，默认关
-    var lowAlertEnabled: Bool = true  // 低电量本地通知提醒，默认开
+    var lowAlertEnabled: Bool = true  // 历史兼容字段：本机低电量通知已停用，实际告警走服务器 Bark
 
     // MARK: 云端值守（gygj-cs 试验功能）
     // 必须用 Optional 存储属性：旧版 settings.json 缺这些键时，合成 Decodable 才不会因缺键解码失败（nil 即默认）。

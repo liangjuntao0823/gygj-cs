@@ -482,6 +482,10 @@ struct MainTabView: View {
         .onAppear {
             // v1.80：远程配置——先读本地缓存（断网可用），再异步拉取云端最新（联网更新缓存）
             RemoteConfig.loadCache()
+            // b34：已绑定旧账号若没有本机安装标识映射，启动时补一次，房源本机动作才不会被 Bark 重复推。
+            if NotifyHub.shared.isBound {
+                Task { await NotifyHub.shared.ensureSourceMapping() }
+            }
             // v2.21：每次进 App 都检查一次更新——先按本地缓存判断（离线也能显示），
             // 再复用同一次 config.json 拉取完成在线检查，不额外发请求。
             UpdateCenter.shared.evaluate()

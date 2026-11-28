@@ -121,11 +121,15 @@ def deliver_pending(store: Any, hub: Any) -> None:
                     continue
                 res = hub.dispatch(
                     target, "house", item["action"], item["title"], item["body"],
-                    data=public_data)
+                    data=public_data,
+                    exclude_device_id=item["originDeviceId"],
+                    exclude_source_device_id=item["originDeviceId"])
             else:
                 res = hub.broadcast(
                     "house", item["action"], item["title"], item["body"],
-                    exclude_device_id=item["originDeviceId"], data=public_data)
+                    exclude_device_id=item["originDeviceId"],
+                    exclude_source_device_id=item["originDeviceId"],
+                    data=public_data)
 
             # broadcast 没有目标设备时允许标记 sent（账本已可追溯，不永久堆积）。
             # 全部目标失败则保留 pending，交由值守 tick 下一轮重试。
@@ -338,51 +342,48 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
             return True
 
         if path.startswith(f"{PUBLIC_PREFIX}/media/") and method == "GET":
-            if not _rate_limit(handler, "media", 900):
-                return send(429, {"ok": False, "error": "too_many_requests"})
-            rel = urllib.parse.unquote(path[len(f"{PUBLIC_PREFIX}/media/"):])
-            token, rec = public_record()
-            if not rec:
-                return send(410, {"ok": False, "error": "link_expired"})
-            segs = [s for s in rel.replace("\\", "/").split("/") if s]
-            if segs[:1] == ["a"] and len(segs) == 2:
-                # 脱敏分享的不透明媒体别名：只按当前分享记录解析，URL 无房号。
-                rel = store.resolve_share_asset(int(rec.get("id") or 0), segs[1])
-                if not rel:
-                    return send(404, {"ok": False, "error": "not_found"})
-                segs = [s for s in rel.replace("\\", "/").split("/") if s]
-            if segs[:1] in (["houses"], ["share"]) and len(segs) >= 3:
-                raw_room = segs[1]
-                if raw_room.startswith("~"):
-                    # 脱敏页媒体别名：只在当前分享允许的房号里反查，别名本身不可逆。
-                    if (rec.get("kind") or "single") == "list":
-                        candidates = [str(h.get("roomKey") or "") for h in store.public_rooms("masked")]
-                    else:
-                        candidates = [str(rec.get("roomKey") or "")] + [str(k) for k in (rec.get("roomKeys") or [])]
-                    resolved = store.share_signer.match_room_alias(raw_room, candidates)
-                    if not resolved:
-                        return send(403, {"ok": False, "error": "forbidden"})
-                    segs[1] = resolved
-                    rel = "/".join(segs)
-                if not room_allowed(rec, segs[1]):
-                    return send(403, {"ok": False, "error": "forbidden"})
-            elif segs[:1] == ["profile"]:
-                pass
+            # 兼容旧版客户端：b31 之前安装包 objectKey 走 /api/public/media/releases/xxx，
+            # 当时没有独立 release 路由，旧版会拿到 410 错误页并误判“安装包校验失败”。
+            # 这里把该前缀重写到公开 release 路由，旧包也能正常在线更新。
+            if path.startswith(f"{PUBLIC_PREFIX}/media/releases/"):
+                path = f"{PUBLIC_PREFIX}/release/" + path[len(f"{PUBLIC_PREFIX}/media/releases/"):]
             else:
-                return send(403, {"ok": False, "error": "forbidden"})
-            data = store.media.read_rel(rel)
-            if data is None:
-                return send(404, {"ok": False, "error": "not_found"})
-            handler.send_response(200)
-            handler.send_header("Content-Type", store.media.guess_content_type(rel))
-            handler.send_header("Content-Length", str(len(data)))
-            handler.send_header("Cache-Control", "public, max-age=86400")
-            handler.end_headers()
-            try:
-                handler.wfile.write(data)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            return True
+                if not _rate_limit(handler, "media", 900):
+                    return send(429, {"ok": False, "error": "too_many_requests"})
+                rel = urllib.parse.unquote(path[len(f"{PUBLIC_PREFIX}/media/"):])
+                token, rec = public_record()
+                if not rec:
+                    return send(410, {"ok": False, "error": "link_expired"})
+                segs = [s for s in rel.replace("\\", "/").split("/") if s]
+                if segs[:1] == ["a"] and len(segs) == 2:
+                    # 脱敏分享的不透明媒体别名：只按当前分享记录解析，URL 无房号。
+                    rel = store.resolve_share_asset(int(rec.get("id") or 0), segs[1])
+                    if not rel:
+                        return send(404, {"ok": False, "error": "not_found"})
+                    segs = [s for s in rel.replace("\\", "/").split("/") if s]
+                if segs[:1] in (["houses"], ["share"]) and len(segs) >= 3:
+                    raw_room = segs[1]
+                    if raw_room.startswith("~"):
+                        # 脱敏页媒体别名：只在当前分享允许的房号里反查，别名本身不可逆。
+                        if (rec.get("kind") or "single") == "list":
+                            candidates = [str(h.get("roomKey") or "") for h in store.public_rooms("masked")]
+                        else:
+                            candidates = [str(rec.get("roomKey") or "")] + [str(k) for k in (rec.get("roomKeys") or [])]
+                        resolved = store.share_signer.match_room_alias(raw_room, candidates)
+                        if not resolved:
+                            return send(403, {"ok": False, "error": "forbidden"})
+                        segs[1] = resolved
+                        rel = "/".join(segs)
+                    if not room_allowed(rec, segs[1]):
+                        return send(403, {"ok": False, "error": "forbidden"})
+                elif segs[:1] == ["profile"]:
+                    pass
+                else:
+                    return send(403, {"ok": False, "error": "forbidden"})
+                data = store.media.read_rel(rel)
+                if data is None:
+                    return send(404, {"ok": False, "error": "not_found"})
+                return send_file(200, data, store.media.guess_content_type(rel))
 
         if path == f"{PREFIX}/health" and method == "GET":
             return send(200, {"ok": True, "service": "house-keeper", **store.stats()})
