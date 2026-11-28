@@ -252,6 +252,11 @@ class TestTodoReminders(unittest.TestCase):
         self.assertEqual(self.hub.run_due_reminders(now=now), 0)
         self.assertEqual(self.sender.calls, [])
         self.hub.set_prefs(self.token, modules={"todo": True})
+        # 关闭待办时服务端已清空待发提醒；重新打开后需要 App 重新上报才会再推
+        self.assertEqual(self.hub.run_due_reminders(now=now + 6), 0)
+        self.hub.replace_reminders(self.token, "dev_a", [
+            {"id": "soon", "dueAt": now + 5, "body": "快到了"},
+        ])
         self.assertEqual(self.hub.run_due_reminders(now=now + 6), 1)
         u = self.hub.store.get_user(self.token)
         ids = {r["id"]: r for r in u["reminders"]["dev_a"]}

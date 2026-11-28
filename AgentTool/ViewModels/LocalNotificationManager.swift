@@ -171,7 +171,6 @@ final class TodoReminderSync {
     static let shared = TodoReminderSync()
     private var syncTask: Task<Void, Never>?
     private var lastFingerprint: String?
-    private var clearedWhenUnavailable = false
     /// 最近一次上报是否成功；只有成功且通道/模块开关打开时才让本机放弃未来待办本地通知
     private(set) var remoteReady = false
 
@@ -191,17 +190,11 @@ final class TodoReminderSync {
             let wasReady = remoteReady
             remoteReady = false
             lastFingerprint = nil
-            // 绑定着账号但总开关/待办开关刚关掉时，清掉服务端本设备残留，避免以后再打开时补推旧待办
-            if !clearedWhenUnavailable, NotifyHub.shared.isBound {
-                clearedWhenUnavailable = true
-                Task { _ = await NotifyHub.shared.replaceTodoReminders([]) }
-            }
             if wasReady, let modelContext {
                 LocalNotificationManager.shared.rebuildAll(modelContext: modelContext, syncTodoRemote: false)
             }
             return
         }
-        clearedWhenUnavailable = false
 
         // 只上报未来待办；已过点的交给本机每小时兜底，避免服务器补推旧提醒
         let payload = todos.compactMap { item -> [String: Any]? in

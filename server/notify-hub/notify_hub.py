@@ -444,6 +444,10 @@ class HubRuntime:
                     if isinstance(v, bool):
                         cur[kk] = v
                 prefs["modules"] = cur
+            # 待办模块或通道总开关关闭时，清掉本账号所有设备的待发提醒；
+            # 重新打开后由 App 的待办同步重新上报，避免关闭期间/重开后补推旧提醒。
+            if enabled is False or (isinstance(modules, dict) and modules.get("todo") is False):
+                user["reminders"] = {}
             user["updated_at"] = iso_now()
             doc["users"][token] = user
             self.store.save(doc)
