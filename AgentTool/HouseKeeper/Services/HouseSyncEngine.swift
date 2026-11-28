@@ -71,7 +71,7 @@ struct HouseChangePreview {
         if hiddenCount > 0 {
             text += "\n另有 \(hiddenCount) 套仅删除了本地，本机继续隐藏。"
         }
-        text += "\n\n会先补传本机未上传的改动，再拉取服务器权威数据。"
+        text += "\n\n只同步服务器→本机；本机未上传的改动会保留在任务中心，不会自动补传。"
         return text
     }
 }

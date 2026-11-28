@@ -115,7 +115,7 @@ struct HouseEditView: View {
                 }
                 Button("取消", role: .cancel) {}
             } message: {
-                Text("检测不到网络连接，本次保存会先存在本机并挂待补传；联网后自动同步到服务器。")
+                Text("检测不到网络连接，本次保存会先存在本机并挂到任务中心；联网后在任务中心点同步，不会自动上传。")
             }
             // v1.42：保存后上传云端失败 → 提示已存本机、待网络恢复自动补传（媒体已入队，账本恢复后刷新同步）
             .alert("已保存到本机", isPresented: Binding(
@@ -1030,7 +1030,7 @@ struct HouseEditView: View {
                                              changedFields: isNewHouse ? nil : changedFieldKeys)
         if !opAction.isEmpty {
             BackupLogStore.log(category: "房源", action: opAction, result: "待同步",
-                               detail: "\(offlineChange)；仅存本机（未绑定服务器账号），绑定后自动补传",
+                               detail: "\(offlineChange)；仅存本机（未绑定服务器账号），绑定后在任务中心手动同步",
                                room: target.mediaRoomKey, cloud: false)
         }
         NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
@@ -1212,7 +1212,7 @@ struct HouseEditView: View {
                         HouseActionNotifier.shared.send(
                             key: "fail.\(target.mediaRoomKey)",
                             title: "已存本机",
-                            body: "服务器同步失败：\(error.localizedDescription)，联网后自动补传")
+                            body: "服务器同步失败：\(error.localizedDescription)；已挂到任务中心，请联网后手动点重试")
                     }
                 }
             }
