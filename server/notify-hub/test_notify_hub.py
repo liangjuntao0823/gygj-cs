@@ -92,6 +92,28 @@ class TestRegisterAndProfile(unittest.TestCase):
         me = self.hub.public_view(self.hub.store.get_user(view["token"]))
         self.assertEqual(me["devices"][0]["name"], "我的 iPhone")
 
+    def test_source_device_mapping_for_single_device(self):
+        view, err = self.hub.register(code="123456", username="涛", bark_key=KEY_A,
+                                      device_name="我的 iPhone")
+        self.assertIsNone(err)
+        token = view["token"]
+        # 已绑定旧账号没有 source；带 token + source 调一次 register 即补上
+        view2, err2 = self.hub.register(token=token, source_device_id="dev_abc123")
+        self.assertIsNone(err2)
+        dev = view2["devices"][0]
+        self.assertEqual(dev.get("sourceDeviceId"), "dev_abc123")
+
+    def test_source_mapping_does_not_guess_between_two_unnamed_devices(self):
+        v1, _ = self.hub.register(code="123456", username="涛", bark_key=KEY_A,
+                                  device_name="我的 iPhone")
+        t1 = v1["token"]
+        self.hub.register(token=t1, bark_key=KEY_B, device_name="我的 iPhone")
+        v2, err = self.hub.register(token=t1, source_device_id="dev_abc123",
+                                    device_name="我的 iPhone")
+        self.assertIsNone(err)
+        self.assertEqual(v2["devices"][0].get("sourceDeviceId"), "")
+        self.assertEqual(v2["devices"][1].get("sourceDeviceId"), "")
+
     def test_username_conflict_then_token_update(self):
         v1, _ = self.hub.register(code="123456", username="涛", bark_key=KEY_A)
         t1 = v1["token"]
@@ -167,6 +189,47 @@ class TestDispatchIsolation(unittest.TestCase):
         r = self.hub.dispatch(self.t1, "meter", "low", "t", "b")
         self.assertEqual(r["reason"], "no_device")
 
+    def test_device_module_switch_filters(self):
+        d1 = self.u1["devices"][0]["deviceId"]
+        view, err = self.hub.set_device_prefs(self.t1, d1, modules={"house": False})
+        self.assertIsNone(err)
+        self.assertFalse(view["devices"][0]["modules"]["house"])
+        r = self.hub.broadcast("house", "house_add", "房源新增", "只应发给乙")
+        self.assertEqual((r["sent"], r["total"]), (1, 1))
+        self.assertEqual(self.sender.keys(), [KEY_B])
+
+    def test_broadcast_excludes_source_device(self):
+        token = self.u1["token"]
+        self.hub.register(token=token, source_device_id="dev_abc123")
+        r = self.hub.broadcast("house", "house_edit", "房源修改", "不应发给本机",
+                               exclude_source_device_id="dev_abc123")
+        self.assertEqual((r["sent"], r["total"]), (1, 1))
+        self.assertEqual(self.sender.keys(), [KEY_B])
+        self.sender.calls.clear()
+        # 没有映射时按 device_id 排除仍然有效
+        r2 = self.hub.broadcast("house", "house_edit", "房源修改", "按设备排除",
+                                exclude_device_id=self.u1["devices"][0]["deviceId"])
+        self.assertEqual((r2["sent"], r2["total"]), (1, 1))
+        self.assertEqual(self.sender.keys(), [KEY_B])
+
+    def test_dispatch_excludes_source_device(self):
+        token = self.u1["token"]
+        self.hub.register(token=token, source_device_id="dev_abc123")
+        r = self.hub.dispatch(token, "house", "house_edit", "本机不发", "只给其他设备",
+                              exclude_source_device_id="dev_abc123")
+        self.assertEqual(r["reason"], "no_device")
+        self.assertEqual(self.sender.keys(), [])
+
+    def test_house_access_checker_overrides_push_switch(self):
+        hub = self.hub
+        hub.access_checker = lambda token, module: token != self.t2
+        r = hub.dispatch(self.t2, "house", "house_add", "标题", "正文")
+        self.assertEqual(r["reason"], "module_access_denied")
+        self.assertEqual(self.sender.calls, [])
+        r2 = hub.broadcast("house", "house_add", "广播", "只发甲")
+        self.assertEqual(r2["sent"], 1)
+        self.assertEqual(self.sender.keys(), [KEY_A])
+
     def test_event_history_masked(self):
         self.hub.dispatch(self.t1, "meter", "low", "历史事件", "正文")
         me = self.hub.public_view(self.hub.store.get_user(self.t1))
@@ -175,6 +238,74 @@ class TestDispatchIsolation(unittest.TestCase):
         self.assertEqual(ev["module"], "meter")
         self.assertNotIn(KEY_A, str(ev))
         self.assertTrue(ev["results"][0]["ok"])
+
+
+class TestTodoReminders(unittest.TestCase):
+    def setUp(self):
+        self.tmp, self.hub, self.sender = make_hub()
+        self.u, _ = self.hub.register(code="123456", username="待办用户", bark_key=KEY_A)
+        self.token = self.u["token"]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_replace_by_source_keeps_other_device(self):
+        now = nh.now_ts()
+        v, err = self.hub.replace_reminders(self.token, "dev_a", [
+            {"id": "a1", "dueAt": now + 10, "body": "交房租"},
+        ])
+        self.assertIsNone(err)
+        self.assertEqual(v["count"], 1)
+        v2, err = self.hub.replace_reminders(self.token, "dev_b", [
+            {"id": "b1", "dueAt": now + 20, "body": "抄水表"},
+        ])
+        self.assertIsNone(err)
+        u = self.hub.store.get_user(self.token)
+        self.assertEqual(set(u["reminders"].keys()), {"dev_a", "dev_b"})
+        self.assertEqual(u["reminders"]["dev_a"][0]["body"], "交房租")
+
+    def test_run_due_sends_once_and_preserves_sent(self):
+        now = nh.now_ts()
+        self.hub.replace_reminders(self.token, "dev_a", [
+            {"id": "due1", "dueAt": now - 5, "body": "今天收租"},
+            {"id": "future1", "dueAt": now + 60, "body": "明天抄表"},
+        ])
+        sent = self.hub.run_due_reminders(now=now)
+        self.assertEqual(sent, 1)
+        self.assertEqual(len(self.sender.calls), 1)
+        self.assertEqual(self.sender.calls[0][2]["body"], "今天收租")
+        self.assertIn("待办", self.sender.calls[0][2]["group"])
+        # 第二次扫描不重复发送
+        self.assertEqual(self.hub.run_due_reminders(now=now + 1), 0)
+        # 客户端再次同步同一 dueAt，保留 sent_at
+        self.hub.replace_reminders(self.token, "dev_a", [
+            {"id": "due1", "dueAt": now - 5, "body": "今天收租"},
+            {"id": "future1", "dueAt": now + 60, "body": "明天抄表"},
+        ])
+        self.assertEqual(self.hub.run_due_reminders(now=now + 2), 0)
+        u = self.hub.store.get_user(self.token)
+        self.assertTrue(u["reminders"]["dev_a"][0]["sent_at"])
+
+    def test_module_switch_and_expired(self):
+        now = nh.now_ts()
+        self.hub.replace_reminders(self.token, "dev_a", [
+            {"id": "old", "dueAt": now - nh.REMINDER_EXPIRE_SEC - 60, "body": "很旧的待办"},
+            {"id": "soon", "dueAt": now + 5, "body": "快到了"},
+        ])
+        self.hub.set_prefs(self.token, modules={"todo": False})
+        self.assertEqual(self.hub.run_due_reminders(now=now), 0)
+        self.assertEqual(self.sender.calls, [])
+        self.hub.set_prefs(self.token, modules={"todo": True})
+        # 关闭待办时服务端已清空待发提醒；重新打开后需要 App 重新上报才会再推
+        self.assertEqual(self.hub.run_due_reminders(now=now + 6), 0)
+        self.hub.replace_reminders(self.token, "dev_a", [
+            {"id": "soon", "dueAt": now + 5, "body": "快到了"},
+        ])
+        self.assertEqual(self.hub.run_due_reminders(now=now + 6), 1)
+        u = self.hub.store.get_user(self.token)
+        ids = {r["id"]: r for r in u["reminders"]["dev_a"]}
+        self.assertNotIn("old", ids)   # 超过过期窗口的提醒在上报时就被丢弃
+        self.assertEqual(ids["soon"]["status"], "sent")
 
 
 class FakeHandler:

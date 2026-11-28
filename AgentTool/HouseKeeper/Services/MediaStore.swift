@@ -264,18 +264,39 @@ enum MediaStore {
         }
     }
 
-    /// v1.35：已收录房源套数——以 Media/ 下房号文件夹数量为准（旧版平铺文件不计入）
-    static func houseCount() -> Int {
-        let dir = mediaDirectory()
-        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return 0 }
-        var count = 0
-        for name in names {
-            var isDir: ObjCBool = false
-            if FileManager.default.fileExists(atPath: dir.appendingPathComponent(name).path, isDirectory: &isDir), isDir.boolValue {
-                count += 1
-            }
-        }
-        return count
+    /// 任务撤回：删除媒体前先复制一份到本机暂存区（成功后清掉，失败撤回时还原）
+    @discardableResult
+    static func stashForRollback(fileName: String, roomKey: String, stashID: String) -> Bool {
+        guard !fileName.isEmpty, !roomKey.isEmpty, !stashID.isEmpty else { return false }
+        let src = houseDirectory(roomKey: roomKey).appendingPathComponent(fileName)
+        guard FileManager.default.fileExists(atPath: src.path) else { return false }
+        let dir = DataRoot.url().appendingPathComponent("rollback", isDirectory: true)
+            .appendingPathComponent(stashID, isDirectory: true)
+            .appendingPathComponent(roomKey, isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dst = dir.appendingPathComponent(fileName)
+        try? FileManager.default.removeItem(at: dst)
+        do { try FileManager.default.copyItem(at: src, to: dst); return true } catch { return false }
+    }
+
+    /// 撤回时把暂存文件还原回房号目录
+    @discardableResult
+    static func restoreFromRollback(fileName: String, roomKey: String, stashID: String) -> Bool {
+        let src = DataRoot.url().appendingPathComponent("rollback", isDirectory: true)
+            .appendingPathComponent(stashID, isDirectory: true)
+            .appendingPathComponent(roomKey, isDirectory: true)
+            .appendingPathComponent(fileName)
+        guard FileManager.default.fileExists(atPath: src.path) else { return false }
+        let dst = houseDirectory(roomKey: roomKey).appendingPathComponent(fileName)
+        try? FileManager.default.removeItem(at: dst)
+        do { try FileManager.default.copyItem(at: src, to: dst); return true } catch { return false }
+    }
+
+    static func clearRollbackStash(_ stashID: String) {
+        guard !stashID.isEmpty else { return }
+        let dir = DataRoot.url().appendingPathComponent("rollback", isDirectory: true)
+            .appendingPathComponent(stashID, isDirectory: true)
+        try? FileManager.default.removeItem(at: dir)
     }
 
     /// 房号变更时，把旧房号目录整体迁移到新房号目录（编辑房号后媒体不丢失）
@@ -426,7 +447,7 @@ enum BackupGuide {
         App 数据放在「文件」App → 我的 iPhone → 公寓管家 下，分两个子文件夹：
 
         · 备份/ —— 房源信息数据库（housekeeper.store）、备份包（Backups/）、
-          恢复前快照（PreRestore/）、云端配置（CosConfig/）、分享缓存（ShareCache/）、
+          恢复前快照（PreRestore/）、分享缓存（ShareCache/）、
           名片二维码（qrcode.png）、操作日志（Logs/）、本说明文件
         · media/ —— 所有房源图片和视频，按房号分文件夹
 
@@ -446,14 +467,11 @@ enum BackupGuide {
 // MARK: - 分享链接缓存（v1.18：同一房源的媒体与信息都没变化时，点分享直接复用上次链接，不再重复上传）
 // v1.21：缓存按「分享模式」双轨分开（脱敏 masked / 完整 full），两种分享互不影响、各自增量。
 
-/// 缓存的分享卡片记录：媒体清单 + 房源信息快照 + 上次生成的分享链接 + 当时的 COS 配置（换桶/换域名后自动失效）
+/// 缓存的分享卡片记录：媒体清单 + 房源信息快照 + 上次生成的分享链接与生成条件。
 struct ShareCacheRecord: Codable {
     let mediaFiles: [ShareMediaFile]
     let info: ShareHouseInfo
     let shareURL: String
-    let bucket: String
-    let region: String
-    let customDomain: String?   // v1.19：生成链接时的自定义域名；换域名后旧缓存自动失效（Optional 兼容旧版缓存 JSON）
     var compressOnShare: Bool? = nil          // v1.23：生成链接时的「分享时压缩」开关状态；开关变化 → 缓存失效重新上传（Optional 兼容旧版）
     var collectionRooms: [ShareCollectionItem]? = nil   // v1.22：合集分享缓存——记录合集包含的每套房源快照；任一套变动 → 缓存失效重新生成（Optional 兼容旧版）
     var templateVersion: Int? = nil           // v1.25：生成链接时的 HTML 模板版本；模板改动（改页面设计）→ 旧缓存自动失效重新生成（Optional 兼容旧版）

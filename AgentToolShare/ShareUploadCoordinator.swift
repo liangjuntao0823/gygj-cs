@@ -2,10 +2,10 @@ import Foundation
 import UIKit
 
 /// v2.68 分享扩展上传编排：与 App 内「新增房源 / 编辑保存」同一套函数、同一口径。
-/// - 媒体：CosUploader.uploadHouseMedia（命名/压缩/转码/幂等/看门狗全复用）；
-///   失败不自动重试（v2.52 口径），预登记在共享队列，主 App 任务中心手动重试；
-/// - 账本：CloudHouseSync.uploadGuarded（合并∪−删除、revision+1、CAS）+ HouseLedgerStore.append/sync；
-/// - 清单：CloudManifestUpdater.flush（扩展生命周期内必须落地，不能等防抖）；
+/// - 媒体：ExtensionHouseClient.uploadMedia（本地入库已压缩，上传原样二进制；命名/去重复用本地队列）；
+///   失败不自动重试，预登记在共享队列，主 App 任务中心手动重试；
+/// - 房源：ExtensionHouseClient.upsert（expectedRevision 乐观锁 + 服务器回写权威记录）；
+///   账本本地 append + markDirty，服务器账本上行归阶段 B 编排收口；
 /// - 日志：v2.71 改 BackupLogStore.logAwait（先入共享待补队→await 发送→成功出队，进程被杀不丢）；
 /// - 本地落库：v2.71 每次入库写 ShareLocalInbox 待写账，App 启动/回前台收养进 SwiftData，
 ///   分享新增不再「只上云、本机没有」；
@@ -107,15 +107,20 @@ final class ShareUploadCoordinator: ObservableObject {
         }
     }
 
-    /// 入库：图片 UIImage→JPEG 0.85（与 loadPhotos 同参数）；视频原文件+真实容器后缀（与 loadVideos 同口径）。
+    /// 入库：图片走设置页同一套压缩参数（长边≤1600/JPEG 0.8）；视频转 720p H.264 mp4。
     /// 逐张 autoreleasepool，控制扩展内存峰值。
-    private func ingest(_ item: StagedItem, roomKey: String) -> String? {
+    private func ingest(_ item: StagedItem, roomKey: String) async -> String? {
+        let compress = SharedBridge.mirroredCompress
         if item.kind == "video" {
+            if let optimized = await MediaOptimizer.optimizedVideoDataForUpload(
+                from: item.url, compress: compress) {
+                return MediaStore.save(data: optimized, ext: "mov", roomKey: roomKey)
+            }
             return MediaStore.saveFile(from: item.url, roomKey: roomKey)
         }
         return autoreleasepool { () -> String? in
-            guard let image = UIImage(contentsOfFile: item.url.path),
-                  let jpeg = image.jpegData(compressionQuality: 0.85) else { return nil }
+            guard let data = try? Data(contentsOf: item.url),
+                  let jpeg = MediaOptimizer.optimizedImageDataForUpload(data, compress: compress) else { return nil }
             return MediaStore.save(data: jpeg, ext: "jpg", roomKey: roomKey)
         }
     }
@@ -131,16 +136,8 @@ final class ShareUploadCoordinator: ObservableObject {
         let roomKey = existing?.roomKey ?? form.roomKey
         let isNewHouse = mode == .newHouse
 
-        // 1) 取 COS 配置（云函数 cosCfg，仅内存持有）
-        let config: CosConfig
-        do {
-            config = try await CosConfig.fetchForExtension()
-        } catch {
-            out.lastError = error.localizedDescription
-            out.title = "分享配置未就绪"
-            out.body = out.lastError
-            return out
-        }
+        // 端点/令牌由 ExtensionHouseClient 内部经 SharedBridge 镜像从 App Group 读取；
+        // 镜像缺失时在首次请求抛"服务器地址无效"。
 
         await MediaActivityGate.shared.beginUpload()
         defer { Task { await MediaActivityGate.shared.endUpload() } }
@@ -149,7 +146,7 @@ final class ShareUploadCoordinator: ObservableObject {
         phaseText = "媒体入库中"
         var saved: [(fileName: String, kind: String)] = []
         for item in staged {
-            if let name = ingest(item, roomKey: roomKey) {
+            if let name = await ingest(item, roomKey: roomKey) {
                 saved.append((name, item.kind))
                 HouseMediaUploadQueue.enqueue(roomKey: roomKey, fileName: name, kind: item.kind)
             } else {
@@ -176,11 +173,14 @@ final class ShareUploadCoordinator: ObservableObject {
         var failedDeletes: [String] = []
         var ledgerSynced = false
         var cloudOK = false
+        // 预登记：扩展进程若在媒体上传/合并中途被系统杀掉，App 打开即可先建出本机房、
+        // 再把共享队列里的媒体补传，不会出现“照片传了、房源没进本机”。同 id 覆盖写。
+        let inboxID = UUID().uuidString
 
         // v2.71：本地待写账——所有退出路径（含取消/云端失败）都写，App 打开即收养进本地库
         func stashInbox() {
             ShareLocalInbox.write(ShareLocalInboxEntry(
-                id: UUID().uuidString,
+                id: inboxID,
                 roomKey: roomKey,
                 isNewHouse: isNewHouse,
                 formRecord: localRecord,
@@ -202,26 +202,25 @@ final class ShareUploadCoordinator: ObservableObject {
             }
         }
 
-        // 3) 逐文件直传（uploadHouseMedia 原函数；失败不自动重试，留在共享队列）
-        let compress = SharedBridge.mirroredCompress
+        // 2.5) 预登记本地待写账：此时媒体已入库并进上传队列，云端尚未写
+        stashInbox()
+
+        // 3) 逐文件直传服务器（本地入库已完成压缩/转码，上传原样二进制；失败不自动重试，留在共享队列）
         let total = saved.count
         var successNames: [String] = []
         for (idx, file) in saved.enumerated() {
             phaseText = "上传中 \(idx + 1)/\(total)"
             rows[idx].state = "uploading"
             do {
-                try await CosUploader.uploadHouseMedia(
-                    fileName: file.fileName, kind: file.kind, roomKey: roomKey,
-                    config: config, compress: compress,
-                    onStage: { stage in
-                        Task { @MainActor in self.rows[idx].stage = stage }
-                    },
-                    onTranscodeProgress: { p in
-                        Task { @MainActor in self.rows[idx].percent = max(0, min(1, p.isFinite ? p : 0)) * 0.5 }
-                    },
-                    onBytes: { p in
-                        Task { @MainActor in self.rows[idx].percent = 0.5 + max(0, min(1, p.isFinite ? p : 0)) * 0.5 }
-                    })
+                let localURL = MediaStore.url(for: file.fileName, roomKey: roomKey)
+                guard FileManager.default.fileExists(atPath: localURL.path),
+                      let data = try? Data(contentsOf: localURL) else {
+                    throw ExtHouseError(message: "本地媒体文件读取失败")
+                }
+                // 服务器可能把同名文件唯一化/视频统一 .mp4；返回值已写入本地名映射，
+                // 后续 upsert 用真实 objectKey，本地文件名保持不动。
+                _ = try await ExtensionHouseClient.uploadMedia(
+                    roomKey: roomKey, fileName: file.fileName, kind: file.kind, data: data)
                 HouseMediaUploadQueue.remove(roomKey: roomKey, fileName: file.fileName)
                 rows[idx].state = "success"
                 rows[idx].percent = 1
@@ -241,26 +240,6 @@ final class ShareUploadCoordinator: ObservableObject {
             }
         }
 
-        // 4) 媒体阶段日志（与 uploadMedia 逐字同口径；v2.71 可靠上云）
-        let upSplit = HouseLedgerFormat.split(saved.map { (name: $0.fileName, kind: $0.kind) })
-        let upParts = HouseLedgerFormat.mediaParts(images: upSplit.images, videos: upSplit.videos, includeNames: false)
-        if out.failed > 0 {
-            let upAction = isNewHouse ? "新增房源" : "新增媒体（本地→云端）"
-            let upResult = isNewHouse && out.failed >= total ? "失败" : "部分失败"
-            let upDetail = isNewHouse
-                ? HouseMediaLogFormat.failureDetail(images: upSplit.images.count, videos: upSplit.videos.count, error: out.lastError)
-                : upParts.joined(separator: "；") + "；成功 \(out.success) 失败 \(out.failed)（已入队自动补传）" + (out.lastError.isEmpty ? "" : "；错误：\(out.lastError)")
-            await BackupLogStore.logAwait(category: "房源", action: upAction, result: upResult,
-                                          detail: upDetail, room: roomKey, cloud: true)
-        } else if out.success > 0 && !isNewHouse {
-            let upAction: String
-            if upSplit.videos.isEmpty { upAction = "新增图片（本地→云端）" }
-            else if upSplit.images.isEmpty { upAction = "新增视频（本地→云端）" }
-            else { upAction = "新增媒体（本地→云端）" }
-            await BackupLogStore.logAwait(category: "房源", action: upAction, result: "成功",
-                                          detail: upParts.joined(separator: "；"), room: roomKey, cloud: true)
-        }
-
         // 5) 账本事件 + 记录推送（新增：先媒体后账本；失败文件名不进 mediaNames）
         phaseText = "同步账本"
         let successSplit = HouseLedgerFormat.split(saved.filter { successNames.contains($0.fileName) }.map { (name: $0.fileName, kind: $0.kind) })
@@ -273,7 +252,8 @@ final class ShareUploadCoordinator: ObservableObject {
             changeText = "新建房源，" + (initial.isEmpty ? "无媒体" : initial)
             record = form.record(mediaNames: successNames)
             if out.success > 0 || total == 0 {
-                HouseLedgerStore.append(roomKey: roomKey, action: action, detail: changeText)
+                HouseLedgerStore.append(roomKey: roomKey, action: action, detail: changeText,
+                                        cloudLog: false, writeOpLog: false)
             }
         } else {
             var base = existing!
@@ -288,36 +268,35 @@ final class ShareUploadCoordinator: ObservableObject {
             base.updatedBy = CloudUser.signedUsername
             record = base
             if !addedParts.isEmpty {
-                HouseLedgerStore.append(roomKey: roomKey, action: action, detail: changeText)
+                HouseLedgerStore.append(roomKey: roomKey, action: action, detail: changeText,
+                                        cloudLog: false, writeOpLog: false)
             }
         }
 
         do {
-            let (merged, hadExisting) = try await CloudHouseSync.uploadGuarded(
-                record: record, removedMedia: Set(removedNames), config: config)
+            let merged = try await ExtensionHouseClient.upsert(
+                record,
+                expectedRevision: existing?.revision.map { Int($0) },
+                createOnly: isNewHouse,
+                baseRecord: isNewHouse ? nil : existing,
+                removedMedia: removedNames)
             cloudRecord = merged
             cloudOK = true
-            // 合并注记与 uploadLedger 同口径（集合差判定）
+            // 合并注记与旧链同口径（集合差判定）
+            let hadExisting = !isNewHouse
             let cloudOnly = Set(merged.mediaNames).subtracting(Set(record.mediaNames))
-            let mergeNote = (hadExisting && !cloudOnly.isEmpty)
-                ? "；已合并云端原有 \(cloudOnly.count) 个媒体"
-                : ""
-            let mainLogged = isNewHouse ? out.failed == 0 : true
-            if mainLogged && (isNewHouse || !changeText.isEmpty) {
-                await BackupLogStore.logAwait(category: "房源", action: action, result: "成功",
-                                              detail: changeText + mergeNote, room: roomKey, cloud: true)
-            } else if !mergeNote.isEmpty {
-                await BackupLogStore.logAwait(category: "同步", action: "合并云端更新", result: "成功",
-                                              detail: "云端有别人的更新，已合并：媒体 \(record.mediaNames.count) 个 → \(merged.mediaNames.count) 个", room: roomKey, cloud: true)
+            var mergeNote = ""
+            if hadExisting && !cloudOnly.isEmpty {
+                mergeNote = "；已合并云端原有 \(cloudOnly.count) 个媒体"
             }
             out.ledgerOK = true
 
-            // 5.5) v2.71 清旧换新：删云端旧对象 + 清共享区旧文件 + 账本删除事件（与 App 编辑删媒体同口径）
+            // 5.5) v2.71 清旧换新：删云端旧对象 + 清共享区旧文件 + 账本删除事件
+            var deleteNote = ""
             if mode == .replace && !removedNames.isEmpty {
                 for name in removedNames {
-                    let kind = Self.kind(ofName: name)
                     do {
-                        try await CosUploader.deleteRemoteMedia(fileName: name, kind: kind, roomKey: roomKey, config: config)
+                        try await ExtensionHouseClient.deleteMedia(roomKey: roomKey, fileName: name)
                     } catch {
                         failedDeletes.append(name)
                     }
@@ -327,28 +306,39 @@ final class ShareUploadCoordinator: ObservableObject {
                 let rmAction = rmSplit.videos.isEmpty ? "删除图片"
                     : (rmSplit.images.isEmpty ? "删除视频" : "删除媒体")
                 let rmSummary = HouseLedgerFormat.mediaSummary(images: rmSplit.images.count, videos: rmSplit.videos.count)
-                HouseLedgerStore.append(roomKey: roomKey, action: rmAction, detail: "删除" + rmSummary)
-                await BackupLogStore.logAwait(
-                    category: "房源", action: "删除媒体（本地→云端）",
-                    result: failedDeletes.isEmpty ? "成功" : "部分失败",
-                    detail: rmSummary + (failedDeletes.isEmpty ? "" : "；\(failedDeletes.count) 个云端删除失败已挂任务中心"),
-                    room: roomKey, cloud: true)
+                HouseLedgerStore.append(roomKey: roomKey, action: rmAction, detail: "删除" + rmSummary,
+                                        cloudLog: false, writeOpLog: false)
+                deleteNote = "；删除旧媒体 \(removedNames.count) 个"
+                    + (failedDeletes.isEmpty ? "" : "（\(failedDeletes.count) 个云端删除失败，已挂补传）")
             }
 
-            // 6) 单房账本合并上传（扩展内显式 await；失败留 dirty+共享 pending，主 App 启动接手）
-            do {
-                try await HouseLedgerStore.sync(roomKey: roomKey, config: config)
-                ledgerSynced = true
-            } catch {
-                HouseLedgerStore.markDirty(roomKey)
+            // 最终结果只写一条日志：媒体部分失败也如实记“部分失败”，不再先写假成功
+            let finalAction = (!isNewHouse && successNames.isEmpty && !removedNames.isEmpty)
+                ? "删除媒体" : action
+            let finalResult: String
+            if out.failed == 0 && failedDeletes.isEmpty {
+                finalResult = "成功"
+            } else if out.success == 0 && total > 0 {
+                finalResult = "部分失败"
+            } else {
+                finalResult = "部分失败"
             }
-            // 7) 清单必须在扩展生命周期内落地
-            await CloudManifestUpdater.shared.flush()
+            var finalDetail = changeText
+            if finalDetail.isEmpty { finalDetail = "媒体 \(successNames.count) 个" }
+            finalDetail += deleteNote + mergeNote
+            if out.failed > 0 {
+                finalDetail += "；\(out.failed) 个媒体待补传"
+            }
+            await BackupLogStore.logAwait(category: "房源", action: finalAction, result: finalResult,
+                                          detail: finalDetail, room: roomKey, cloud: true)
+
+            // 6) 账本上行归阶段 B 编排收口；扩展内仅落本地 dirty 标记，主 App 启动接手补上行
+            HouseLedgerStore.markDirty(roomKey)
         } catch {
             await BackupLogStore.logAwait(category: "房源", action: action, result: "失败",
                                           detail: "云端更新失败：\(error.localizedDescription)", room: roomKey, cloud: true)
             out.lastError = error.localizedDescription
-            if error is CloudSyncConflict {
+            if (error as? ExtHouseError)?.conflict == true {
                 HouseActionNotifier.shared.send(
                     key: "conflict.\(roomKey)",
                     title: "修改没传上去",

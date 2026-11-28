@@ -1,8 +1,8 @@
 import SwiftUI
 
 // MARK: - v1.82 远程配置原生化（中文显示 + 排版优化）
-/// 读取：云函数 act=configGet（带口令）→ 未配置/为空时用默认模板填充
-/// 保存：POST act=configSave（自动 version+1）→ 云端生效 + 写本地缓存（断网兜底）
+/// 读取：服务器 fetchConfig → 未配置/为空时用默认模板填充
+/// 保存：服务器 putConfig（自动 version+1）→ 云端生效 + 写本地缓存
 /// 所有配置项显示中文名称（英文 key 以小字副标题展示，便于对照后台文档）
 struct RemoteConfigAdminView: View {
     @State private var config = RemoteConfig.Payload()
@@ -213,7 +213,7 @@ struct RemoteConfigAdminView: View {
                 TextField("最新版本号，如 2.21", text: $updateVersion)
                 TextField("Build 号，如 144", text: $updateBuild)
                     .keyboardType(.numberPad)
-                TextField("桶内对象路径，如 update/公寓管家2.21-b144.ipa", text: $updateObjectKey)
+                TextField("服务器媒体路径，如 update/公寓管家2.21-b144.ipa", text: $updateObjectKey)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
                 TextField("备用直链 https（选填）", text: $updateDownloadURL)
@@ -232,7 +232,7 @@ struct RemoteConfigAdminView: View {
             } header: {
                 Label("App 在线更新（v2.21）", systemImage: "arrow.up.circle")
             } footer: {
-                Text("最新版本号高于用户当前版本时，工作台版本号变橙色「↑」胶囊，设置页出现「发现新版本」。桶里只保留最新一个包：先删 update/ 下旧包再传新包，把对象路径填到第一栏。更新内容留空会自动取下方「版本更新记录」里对应版本的条目。")
+                Text("最新版本号高于用户当前版本时，工作台版本号变橙色「↑」胶囊，设置页出现「发现新版本」。服务器媒体目录只保留最新一个安装包：先删 update/ 下旧包再传新包，把媒体路径填到第一栏。更新内容留空会自动取下方「版本更新记录」里对应版本的条目。")
             }
 
             // ── AI 模型清单（v1.89）──
@@ -315,37 +315,50 @@ struct RemoteConfigAdminView: View {
     private func loadConfig() {
         loading = true
         statusText = ""
-        let u = (CloudUser.username).addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-        guard let url = URL(string: "\(CloudConfig.functionURL)?act=configGet&k=\(CloudConfig.passwordHash)&u=\(u)") else {
-            loading = false
-            statusText = "云函数地址无效，请先在「设置 → 云端配置」填写"
-            return
-        }
-        URLSession.shared.dataTask(with: url) { data, resp, _ in
-            DispatchQueue.main.async {
+        Task { @MainActor in
+            guard HouseServerMode.ready else {
                 loading = false
-                guard let data = data,
-                      let obj = try? JSONDecoder().decode(ConfigGetResponse.self, from: data),
-                      obj.ok else {
-                    statusText = "加载失败：无法连接云函数，请检查网络与地址"
-                    return
-                }
-                if let fetched = obj.config {
+                statusText = "未连接服务器，无法加载配置"
+                return
+            }
+            do {
+                let dict = try await HouseRemoteClient.shared.fetchConfig()
+                if let fetched = Self.payload(from: dict) {
                     config = fetched
-                    if let list = fetched.aiModels, let data = try? JSONEncoder().encode(list) {
-                        aiModelsJSON = String(data: data, encoding: .utf8) ?? ""
-                    } else {
-                        aiModelsJSON = ""
-                    }
+                    syncAIModels()
                 } else {
                     config = Self.defaultTemplate()
                     aiModelsJSON = ""
                 }
                 fillUpdateForm()
                 loaded = true
-                statusText = "已加载云端配置 v\(config.version)"
+                statusText = "已加载服务器配置 v\(config.version)"
+                loading = false
+            } catch {
+                loading = false
+                statusText = "服务器配置加载失败：\(error.localizedDescription)"
             }
-        }.resume()
+        }
+    }
+
+    private func syncAIModels() {
+        if let list = config.aiModels, let data = try? JSONEncoder().encode(list) {
+            aiModelsJSON = String(data: data, encoding: .utf8) ?? ""
+        } else {
+            aiModelsJSON = ""
+        }
+    }
+
+    private static func payload(from dict: [String: Any]) -> RemoteConfig.Payload? {
+        guard let data = try? JSONSerialization.data(withJSONObject: dict),
+              let p = try? JSONDecoder().decode(RemoteConfig.Payload.self, from: data) else { return nil }
+        return p
+    }
+
+    private static func dictionary(from p: RemoteConfig.Payload) -> [String: Any]? {
+        guard let data = try? JSONEncoder().encode(p),
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return dict
     }
 
     // MARK: 保存
@@ -369,30 +382,27 @@ struct RemoteConfigAdminView: View {
         config.version = (config.version > 0 ? config.version : 0) + 1
         var body = config
         body.updatedBy = CloudUser.username
-        let u = (CloudUser.username).addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-        guard let url = URL(string: "\(CloudConfig.functionURL)?act=configSave&k=\(CloudConfig.passwordHash)&u=\(u)"),
-              let payload = try? JSONEncoder().encode(body) else {
+
+        guard HouseServerMode.ready else {
             saving = false
-            statusText = "保存失败：参数无效"
+            statusText = "未连接服务器，无法保存配置"
             return
         }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.httpBody = payload
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        URLSession.shared.dataTask(with: request) { data, _, _ in
-            DispatchQueue.main.async {
-                saving = false
-                guard let data = data,
-                      let obj = try? JSONDecoder().decode(ConfigSaveResponse.self, from: data),
-                      obj.ok else {
-                    statusText = "保存失败：云函数未确认（请检查网络与口令）"
-                    return
+        Task { @MainActor in
+            do {
+                guard let dict = Self.dictionary(from: body) else {
+                    throw NSError(domain: "RemoteConfigAdmin", code: -1,
+                                   userInfo: [NSLocalizedDescriptionKey: "配置编码失败"])
                 }
+                try await HouseRemoteClient.shared.putConfig(dict)
                 RemoteConfig.apply(body)
-                statusText = "已保存 ✓ 配置版本 v\(obj.version ?? body.version)，App 下次启动/同步即生效"
+                saving = false
+                statusText = "已保存 ✓ 服务器配置 v\(body.version)，App 下次启动/同步即生效"
+            } catch {
+                saving = false
+                statusText = "保存失败：\(error.localizedDescription)"
             }
-        }.resume()
+        }
     }
 
     private func fillUpdateForm() {
@@ -476,7 +486,7 @@ struct RemoteConfigAdminView: View {
         "deletingCloud": "删除云端中提示",
         "bulkDeleteDone": "批量删除完成提示",
         "cloudCopyDeleted": "云端副本已删除提示",
-        "cloudDeleteFail": "云端删除失败提示",
+        "cloudDeleteFail": "服务器删除失败提示",
         "bulkRentDone": "批量已租完成提示",
         "backfillFail": "补传云端失败提示",
         "quickBackupOk": "快速备份成功提示",
@@ -527,15 +537,15 @@ struct RemoteConfigAdminView: View {
             "refreshNoChange": "已刷新，无变化",
             "refreshFail": "刷新失败，请检查网络",
             "syncFail": "同步失败：{error}",
-            "noCloudConfig": "未配置云存储，无法同步云端房源",
+            "noCloudConfig": "未连接服务器，无法同步房源",
             "containerUnavailable": "数据容器不可用，无法删除",
-            "deletingCloud": "已删除本地房源，正在同步删除云端…",
-            "bulkDeleteDone": "已彻底删除 {changed} 套本地房源（共选中 {total} 套）；云端同步删除中…",
-            "cloudCopyDeleted": "已删除云端同步副本",
-            "cloudDeleteFail": "云端删除失败：{error}。可在「设置 → 桶管理」手动清理",
+            "deletingCloud": "正在同步删除服务器副本…",
+            "bulkDeleteDone": "已永久删除 {changed} 套（共选中 {total} 套），服务器同步中…",
+            "cloudCopyDeleted": "已删除服务器同步副本",
+            "cloudDeleteFail": "服务器删除失败：{error}。可在同步任务中心重试",
             "bulkRentDone": "已将 {changed} 套标记为已租（共选中 {total} 套）",
-            "backfillFail": "补传云端失败：{error}。本地房源保持「仅本地」，可稍后重新同步补传",
-            "quickBackupOk": "快速备份成功：{file}\n已自动上传云端（若网络失败会在下次打开 App 时自动重试）",
+            "backfillFail": "补传服务器失败：{error}。本地房源保持「仅本地」，可稍后重新同步补传",
+            "quickBackupOk": "快速备份成功：{file}\n已自动上传服务器（若网络失败会在下次打开 App 时自动重试）",
             "quickBackupFail": "快速备份失败，请检查存储空间",
             "fullBackupOk": "全量备份成功：{file}\n可在「备份文件管理」中手动上传到云端",
             "fullBackupFail": "全量备份失败，请检查存储空间",
@@ -547,31 +557,17 @@ struct RemoteConfigAdminView: View {
             "billPreviewFail": "账单预览生成失败，请重试。"
         ]
         p.helpTexts = [
-            "houseShareFooter": "云端配置：腾讯云 COS 存储桶、密钥、自定义域名与云函数地址（后台网址），用于上传房源图片/视频生成微信分享卡片链接，以及打开云端管理后台；可导出部署包给别的房东自建后台。名片信息：分享 H5 页面和微信卡片上显示的姓名与电话。压缩上传开启后，新增/编辑房源的图片视频上传云端与分享 H5 都会压缩（视频压到 720p、图片轻压缩），上传更快更省流量。房源数据（数据库、图片视频、二维码）默认存放在「公寓管家」文件夹内的「备份」「media」两个子文件夹，长按拷贝/共享即为备份，重装后放回原位即可还原。",
-            "backupIntro": "备份数据 = 快速备份（账本 + 媒体清单，不含房源与照片视频，自动上传云端；房源统一从云端同步恢复）或全量备份（额外含全部房源与照片视频）。恢复会覆盖当前数据，恢复前自动打包当前数据做安全备份，失败自动还原。旧版分板块 JSON 备份仍可在「备份文件管理」中恢复，不会丢失。",
-            "autoBackupIntro": "自动备份 = 快速备份（账本 + 房源 + 清单），备份成功后自动上传云端；超过保留天数（默认 7 天）的自动备份会自动清理，手动备份不会被删除。若到点 App 未在前台，会等下次打开 App 时自动补做。",
-            "cloudSetupIntro": "• 单用户：填好云函数地址 + 桶配置 + 用户名即可，房源/备份自动上传云端，后台看统计与用量。\n• 多用户：几台手机填同一套桶配置、各自填不同用户名，房源云端共享（一台录入另一台下拉同步可见）；名片/水印/统计/备份按用户名隔离，互不读取。\n• 房源板块下拉刷新 / 左上角手动同步都是拉取云端房源到本地，效果一致。",
-            "passwordIntro": "网页版管理后台用此口令登录；App 内打开后台免登录。默认口令 12345678，建议修改为不易猜的字符。保存后会自动同步到云函数（云端后台、网页后台同用此口令）。",
-            "multiShareIntro": "多台手机填同一个桶配置、各自填用户名，即可共享房源：一台录入，另一台下拉同步就能看到。操作日志/分享/统计会带上您的用户名，其他私有数据（名片/水印/统计/备份）按用户名分开。",
-            "clearConfigWarn": "将删除本机保存的存储桶、地域、密钥、自定义域名全部配置，并断开与 COS 的连接。此操作不可撤销，可先用「备份配置到文件」留底。",
-            "tencentTutorial": "1. 打开 cloud.tencent.com 注册并实名认证；2. 开通「对象存储 COS」；3. 创建存储桶：名称可自定义、地域按实际选择、访问权限选「私有读写」；4. 在「访问管理 CAM → API 密钥管理」新建密钥，得到 SecretId 和 SecretKey；5. 在「存储桶 → 域名与传输管理 → 自定义源站域名」绑定自己的域名（微信只认自定义域名，才能把链接抓成网页卡片）。注意：桶名和地域必须和您实际创建的存储桶一致，才能连接成功。",
-            "backupConfigFile": "点「备份配置到文件」后，备份文件（桶名_地域_日期.json，含密钥）会直接生成到 iOS「文件」App → 我的 iPhone → 公寓管家 → 「备份」文件夹，随整个「备份」文件夹一起备份即可。换机 / 重装 / 误改后，点「从备份文件恢复配置」在列表中选择备份文件（或从其他位置导入）即可一键还原。含密钥内容请勿外泄。"
+            "houseShareFooter": "服务器配置：服务器地址与账号授权码，用于上传房源图片/视频、生成微信分享 H5 和打开服务器管理后台。名片信息：分享 H5 页面和微信卡片上显示的姓名与电话。压缩上传开启后，新增/编辑房源的图片视频上传服务器与分享 H5 都会压缩（视频压到 720p、图片轻压缩），上传更快更省流量。房源数据（数据库、图片视频、二维码）默认存放在「公寓管家」文件夹内的「备份」「media」两个子文件夹，长按拷贝/共享即为备份，重装后放回原位即可还原。",
+            "backupIntro": "备份数据 = 快速备份（账本 + 媒体清单，不含房源与照片视频，自动上传服务器；房源统一从服务器同步恢复）或全量备份（额外含全部房源与照片视频）。恢复会覆盖当前数据，恢复前自动打包当前数据做安全备份，失败自动还原。旧版分板块 JSON 备份仍可在「备份文件管理」中恢复，不会丢失。",
+            "autoBackupIntro": "自动备份 = 快速备份（账本 + 房源 + 清单），备份成功后自动上传服务器；超过保留天数（默认 7 天）的自动备份会自动清理，手动备份不会被删除。若到点 App 未在前台，会等下次打开 App 时自动补做。",
+            "cloudSetupIntro": "• 单用户：填好服务器地址 + 授权码，房源改动在任务中心手动上传/补传，备份自动上传服务器，后台看统计与用量。\n• 多用户：几台手机接入同一台服务器、各自用授权码接入，房源共享（一台录入，另一台点左上角刷新可见）；名片/水印/统计/备份按用户名隔离，互不读取。\n• 房源板块只保留左上角刷新；点按会先弹出确认，不会直接静默同步。",
+            "passwordIntro": "网页版管理后台用此口令登录；App 内打开后台免登录。默认口令 12345678，建议修改为不易猜的字符。保存后会自动同步到服务器后台（App 与网页后台同用此口令）。",
+            "multiShareIntro": "多台手机接入同一台服务器、各自用授权码，即可共享房源：一台录入，另一台点左上角刷新就能看到。操作日志/分享/统计会带上您的用户名，其他私有数据（名片/水印/统计/备份）按用户名分开。",
+            "clearConfigWarn": "将删除本机保存的服务器地址、授权码等全部配置，并断开与服务器的连接。此操作不可撤销，可先用「备份配置到文件」留底。",
+            "tencentTutorial": "1. 准备一台可公网访问的服务器，部署公寓管家服务；2. 打开服务器管理后台，生成 8 位授权码；3. App「云端配置」填服务器地址 + 授权码完成接入；4. 图片、视频、备份全部落服务器本地磁盘，请定期备份服务器数据目录。",
+            "backupConfigFile": "点「备份配置到文件」后，备份文件（服务器地址_日期.json，含授权码）会直接生成到 iOS「文件」App → 我的 iPhone → 公寓管家 → 「备份」文件夹，随整个「备份」文件夹一起备份即可。换机 / 重装 / 误改后，点「从备份文件恢复配置」在列表中选择备份文件（或从其他位置导入）即可一键还原。授权码请勿外泄。"
         ]
         p.changelog = []
         return p
     }
-}
-
-// MARK: 云函数响应
-
-private struct ConfigGetResponse: Codable {
-    let ok: Bool
-    let config: RemoteConfig.Payload?
-    let error: String?
-}
-
-private struct ConfigSaveResponse: Codable {
-    let ok: Bool
-    let version: Int?
-    let error: String?
 }

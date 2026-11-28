@@ -155,8 +155,8 @@ final class AIManager: ObservableObject {
 
         // 任务保存在属性上：View 关闭不取消；App 划掉进程终止
         let task = Task {
-            // 发送前实时拉取云端用量（失败给提示不阻断）
-            let cloudUsage = await fetchCloudUsageText()
+            // 媒体落服务器本地磁盘，无存储桶用量；云端用量段留空
+            let cloudUsage = ""
             let systemPrompt = buildSystemPrompt(cloudUsage: cloudUsage)
             var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
             for turn in history {
@@ -405,38 +405,6 @@ final class AIManager: ObservableObject {
         return base
     }
 
-    /// v1.95：实时拉取腾讯云桶用量（云函数 act=usage；未配置/失败返回提示，不阻断发送）
-    /// v1.98：加缓存——成功缓存 5 分钟、失败缓存 60 秒，避免每次发消息前都串行等网络（慢的根因之一）
-    private var usageCache: (text: String, time: Date)?
-    private func fetchCloudUsageText() async -> String {
-        // 命中缓存直接返回，不发请求
-        if let cache = usageCache,
-           Date().timeIntervalSince(cache.time) < (cache.text.contains("拉取失败") ? 60 : 300) {
-            return cache.text
-        }
-        guard !CloudConfig.functionURL.isEmpty, !CloudConfig.passwordHash.isEmpty,
-              let url = URL(string: "\(CloudConfig.functionURL)?act=usage&k=\(CloudConfig.passwordHash)") else {
-            return "云端用量：未配置云函数地址或密钥（设置→云端配置），无法拉取"
-        }
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 4 // v1.98：8s→4s，减少对首条回复的拖累
-        do {
-            let (data, _) = try await URLSession.shared.data(for: request)
-            if let obj = try? JSONDecoder().decode(UsageResponse.self, from: data), obj.ok {
-                let mb = Double(obj.total) / 1024.0 / 1024.0
-                let text = "腾讯云桶共 \(obj.total_files) 个文件，占用 \(String(format: "%.1f", mb)) MB"
-                usageCache = (text, Date())
-                return text
-            }
-            let text = "云端用量：拉取失败（请确认云函数已部署）"
-            usageCache = (text, Date())
-            return text
-        } catch {
-            let text = "云端用量：拉取失败（网络不可用或超时）"
-            usageCache = (text, Date())
-            return text
-        }
-    }
 
     /// 房源快照（House 容器）
     private func houseDataSnapshot() -> String {

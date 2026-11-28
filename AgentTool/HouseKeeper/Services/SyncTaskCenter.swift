@@ -9,23 +9,21 @@ import SwiftData
 enum SyncTaskKind: String, Codable, CaseIterable {
     case cloudPull   // 从云端拉下来
     case pushUp      // 把本机改动传上去
-    case media       // 搬媒体（上传/补传/下载）
+    case media       // 搬媒体（上传/补传）
+    case mediaDownload // 把服务器媒体下载到本机
     case cloudDelete // 删云端
     case retry       // 补漏与失败重试
-    case orphan      // 清理桶孤儿媒体
     case mediaDelete // 删云端媒体（本地已删，云端对象没删掉）
-    case houseDraft  // 断网时没提交成功的房源改动（原草稿箱，现并入任务中心）
 
     var displayName: String {
         switch self {
         case .cloudPull: return "从云端拉下来"
-        case .pushUp: return "把本机改动传上去"
+        case .pushUp: return "上传房源改动"
         case .media: return "搬媒体"
+        case .mediaDownload: return "下载服务器媒体"
         case .cloudDelete: return "删云端"
         case .retry: return "补漏与失败重试"
-        case .orphan: return "清理桶孤儿媒体"
         case .mediaDelete: return "删云端媒体"
-        case .houseDraft: return "提交房源改动"
         }
     }
 
@@ -34,15 +32,14 @@ enum SyncTaskKind: String, Codable, CaseIterable {
         case .cloudPull: return "arrow.triangle.2.circlepath"
         case .pushUp: return "arrow.up.circle"
         case .media: return "photo.on.rectangle.angled"
+        case .mediaDownload: return "arrow.down.circle"
         case .cloudDelete: return "trash"
         case .retry: return "wrench.and.screwdriver"
-        case .orphan: return "trash.circle"
         case .mediaDelete: return "trash.slash"
-        case .houseDraft: return "square.and.pencil"
         }
     }
 
-    /// 全部支持手动重试；孤儿扫描的「取消本次」是另一条路径，不走重试
+    /// 全部支持手动重试
     var isRetryable: Bool { true }
 }
 
@@ -146,6 +143,8 @@ struct HouseUploadRollback: Codable, Equatable {
     var removed: [HouseUploadMediaRef]
     /// 本次账本事件 id（撤回时从 pending 与正式账本移除）
     var ledgerEventIds: [String]
+    /// 本次删除媒体的本机暂存区 id（撤回时还原；成功后清掉）
+    var stashID: String? = nil
 }
 
 // MARK: - v2.52 上传任务句柄登记（取消按钮靠它真正中断 Task）
@@ -336,7 +335,7 @@ func begin(id: UUID,
         return item.id
     }
 
-    /// 取消本次（如孤儿扫描）：停止、不删任何文件，进最近完成并写明「已取消」
+    /// 取消本次：停止、不删任何文件，进最近完成并写明「已取消」
     func cancel(id: UUID, note: String) {
         if let idx = running.firstIndex(where: { $0.id == id }) {
             var item = running.remove(at: idx)
@@ -350,38 +349,55 @@ func begin(id: UUID,
 
     // MARK: v2.52 上传任务手动取消
 
-    /// 点「取消」：先真正中断 Task；Task 内 catch 到取消会调 finishCancelled。
-    /// 兜底：1.5 秒后仍在进行中（取消信号没被接住）就强制转「已取消」，不让界面一直卡着。
+    /// 点「取消」：先真正中断 Task；兜底 1.5 秒后仍在进行中（取消信号没被接住）就强制转「已取消」，不让界面一直卡着。
     func requestCancel(id: UUID) {
         UploadTaskRegistry.shared.cancel(id)
-        Task {
+        Task { @MainActor in
             try? await Task.sleep(nanoseconds: 1_500_000_000)
-            if let idx = running.firstIndex(where: { $0.id == id }) {
-                var item = running.remove(at: idx)
+            guard let idx = running.firstIndex(where: { $0.id == id }) else { return }
+            var item = running.remove(at: idx)
+            persist()
+            guard let rollback = item.rollback else {
+                // 历史任务没有改动前快照：只能停掉并删除任务记录，不碰房源。
                 item.state = .cancelled
                 item.finishedAt = Date()
-                item.failure = "已手动取消，可重试或彻底删除"
+                item.failure = "已取消；该历史任务没有快照，未改动房源"
+                failed.insert(item, at: 0)
+                persist()
+                BackupLogStore.log(category: "任务", action: "取消上传任务", result: "成功",
+                                   detail: "任务已停止；没有改动前快照，本机与服务器房源未改动",
+                                   room: item.roomKeys.first ?? "", cloud: false)
+                return
+            }
+            // b31：取消上传 = 彻底撤回本次任务，不留失败任务。
+            // 新增房源会连同本机/服务器的账本与媒体一起删；编辑/改名会恢复到上传前。
+            let ok = await Self.performRollback(rollback)
+            let sceneText: String
+            switch rollback.scene {
+            case .newHouse: sceneText = "新增房源及其账本、媒体"
+            case .rename: sceneText = "本次改名及新目录媒体"
+            case .plainEdit: sceneText = "本次字段与媒体改动"
+            }
+            BackupLogStore.log(
+                category: "任务", action: "取消上传任务", result: ok ? "成功" : "部分失败",
+                detail: ok ? "已彻底删除\(sceneText)（本机与服务器）" : "已尽量撤回\(sceneText)；服务器不可达或部分媒体未清，请刷新核对",
+                room: rollback.roomKey, cloud: true)
+            HouseActionNotifier.shared.send(
+                key: "cancel.\(rollback.roomKey)",
+                title: "已取消上传",
+                body: ok ? "\(rollback.roomKey)：本次\(sceneText)已从本机和服务器删除"
+                         : "\(rollback.roomKey)：本次改动已尽量撤回，服务器部分内容可能还在，请刷新核对",
+                silent: true)
+            NotificationCenter.default.post(name: NSNotification.Name("HouseStoreChanged"), object: nil)
+            if !ok {
+                // 没能完全撤回时保留一条可重试的失败任务，避免用户以为已经清干净。
+                item.state = .failed
+                item.failure = "取消未完全完成：服务器不可达或部分媒体未清，点重试继续撤回"
+                item.finishedAt = Date()
                 failed.insert(item, at: 0)
                 persist()
             }
         }
-    }
-
-    /// 上传 Task 捕获到取消后回调：进行中 → 已取消（留在待处理区，可重试/彻底删除）
-    func finishCancelled(id: UUID) {
-        guard let idx = running.firstIndex(where: { $0.id == id }) else { return }
-        var item = running.remove(at: idx)
-        item.state = .cancelled
-        item.finishedAt = Date()
-        item.failure = "已手动取消，本地文件没动；可重试或彻底删除"
-        item.currentFileFraction = nil
-        item.bytesPerSecond = nil
-        if let dup = failed.firstIndex(where: { $0.kind == item.kind && $0.roomKeys == item.roomKeys }) {
-            failed[dup] = item
-        } else {
-            failed.insert(item, at: 0)
-        }
-        persist()
     }
 
     /// 彻底删除任务条目（不删本地媒体文件、不碰云端）——仅用于没有回滚载荷的历史任务兜底
@@ -395,42 +411,93 @@ func begin(id: UUID,
                           room: item.roomKeys.first ?? "", cloud: false)
     }
 
-    /// v2.53：「彻底取消」= 全量撤回。有回滚载荷则本地+云端、媒体+账本全部恢复原样；
-    /// 撤回中任务转「进行中」显示「正在撤回…」，成功后移除条目（不进最近完成），
-    /// 失败回待处理区、可再次撤回。无载荷的历史任务退化为仅删条目。
+    /// 「彻底取消」：有回滚载荷的新任务按场景真撤回；旧任务没有快照，只删条目并留痕说明。
     func revoke(id: UUID, houseContext: ModelContext?) {
         guard let idx = failed.firstIndex(where: { $0.id == id }) else { return }
-        var item = failed.remove(at: idx)
-        guard let payload = item.rollback, let ctx = houseContext else {
-            // 旧任务 / 无房源上下文：无法全量撤回，按旧口径仅删条目
-            persist()
+        let item = failed[idx]
+        guard let rollback = item.rollback else {
+            purge(id: id)
+            BackupLogStore.log(category: "任务", action: "删除旧任务记录", result: "成功",
+                               detail: "「\(item.title)」是历史任务，没有改动前快照，只能删除任务记录；房源未被改动",
+                               room: item.roomKeys.first ?? "", cloud: false)
             return
         }
-        item.state = .running
-        item.failure = ""
-        item.note = "正在撤回…"
-        item.done = 0
-        item.finishedAt = nil
-        running.append(item)
+        failed.remove(at: idx)
         persist()
-        let work = Task {
-            let result = await HouseUploadRollbacker.revoke(item, payload: payload, ctx: ctx)
-            UploadTaskRegistry.shared.unregister(item.id)
-            if let rIdx = running.firstIndex(where: { $0.id == item.id }) {
-                if result.failed {
-                    var back = running.remove(at: rIdx)
-                    back.state = .failed
-                    back.failure = "撤回未完成：\(result.errorText)"
-                    back.note = "可再次点「彻底取消」继续撤回"
-                    failed.insert(back, at: 0)
-                    persist()
-                } else {
-                    running.remove(at: rIdx)
-                    persist()
-                }
-            }
+        Task { @MainActor in
+            let ok = await Self.performRollback(rollback)
+            BackupLogStore.log(category: "任务", action: "撤回本次改动", result: ok ? "成功" : "部分失败",
+                               detail: ok
+                                 ? "已把「\(item.title)」的本次改动撤回：本机与服务器都恢复到保存前"
+                                 : "「\(item.title)」已尽量撤回；服务器不可达或部分媒体已被替换，请刷新房源核对",
+                               room: rollback.roomKey, cloud: true)
+            NotificationCenter.default.post(name: NSNotification.Name("HouseStoreChanged"), object: nil)
         }
-        UploadTaskRegistry.shared.register(item.id, task: work)
+    }
+
+    /// 按场景撤回：newHouse 整套删除；rename 恢复旧房号并重建服务器旧记录；plainEdit 恢复字段并删新增媒体。
+    private static func performRollback(_ rb: HouseUploadRollback) async -> Bool {
+        var ok = true
+        let repo = HouseRepository.shared
+        switch rb.scene {
+        case .newHouse:
+            if let house = repo.fetch(roomKey: rb.roomKey) {
+                repo.delete(house)
+                try? repo.save()
+            }
+            MediaStore.deleteHouseDirectory(roomKey: rb.roomKey)
+            do { try await repo.deleteRemote(rb.roomKey) } catch { ok = false }
+            HouseLedgerStore.purgeEventsLocal(roomKey: rb.roomKey, eventIds: Set(rb.ledgerEventIds))
+        case .rename:
+            MediaStore.migrateHouseDirectory(from: rb.roomKey, to: rb.oldRoomKey)
+            if let house = repo.fetch(roomKey: rb.roomKey), let before = rb.before {
+                apply(before, to: house)
+                try? repo.save()
+                do {
+                    _ = try await repo.push(house)
+                    try await repo.deleteRemote(rb.roomKey)
+                } catch { ok = false }
+            }
+            HouseLedgerStore.purgeEventsLocal(roomKey: rb.oldRoomKey, eventIds: Set(rb.ledgerEventIds))
+        case .plainEdit:
+            if let house = repo.fetch(roomKey: rb.roomKey) {
+                if let before = rb.before { apply(before, to: house) }
+                for ref in rb.added {
+                    if let item = house.mediaItems.first(where: { $0.fileName == ref.fileName }) {
+                        repo.delete(item)
+                    }
+                    MediaStore.delete(fileName: ref.fileName, roomKey: rb.roomKey)
+                    try? await HouseRemoteClient.shared.deleteMedia(roomKey: rb.roomKey, fileName: ref.fileName)
+                }
+                if let stashID = rb.stashID {
+                    for ref in rb.removed {
+                        if MediaStore.restoreFromRollback(fileName: ref.fileName, roomKey: rb.roomKey, stashID: stashID) {
+                            let item = MediaItem(fileName: ref.fileName, kind: ref.kind)
+                            item.house = house
+                            repo.insert(item)
+                        }
+                    }
+                    MediaStore.clearRollbackStash(stashID)
+                }
+                try? repo.save()
+                do { _ = try await repo.push(house) } catch { ok = false }
+            }
+            HouseLedgerStore.purgeEventsLocal(roomKey: rb.roomKey, eventIds: Set(rb.ledgerEventIds))
+        }
+        HouseLedgerStore.removePendingEvents(roomKey: rb.roomKey, eventIds: Set(rb.ledgerEventIds))
+        return ok
+    }
+
+    private static func apply(_ before: HouseUploadBeforeSnapshot, to house: House) {
+        house.roomNo = before.roomNo
+        house.tower = before.tower
+        house.landlord = before.landlord
+        house.layout = before.layout
+        house.price = before.price
+        house.password = before.password
+        house.remark = before.remark
+        house.statusRaw = before.statusRaw
+        house.updatedAt = Date()
     }
 
     // MARK: 临时进度（总刷新 / 整次同步，不进任务中心）
@@ -441,14 +508,6 @@ func begin(id: UUID,
         item.done = 0
         transient = item
         return item.id
-    }
-
-    func advanceTransient(id: UUID, done: Int, total: Int? = nil, note: String? = nil) {
-        guard var item = transient, item.id == id else { return }
-        item.done = max(0, done)
-        if let total { item.total = max(1, total) }
-        if let note { item.note = note }
-        transient = item
     }
 
     /// 结束临时进度：无论成败都只关闭，不写任何历史
@@ -490,11 +549,6 @@ func begin(id: UUID,
             UploadTaskRegistry.shared.register(live.id, task: work)
             return
         }
-        if item.kind == .orphan {
-            removeFailed(id: id)
-            Task { await TaskRetryPerformer.shared.orphanScan?() }
-            return
-        }
         removeFailed(id: id)
         var live = item
         live.state = .running
@@ -511,7 +565,9 @@ func begin(id: UUID,
                     self.finish(id: live.id, success: true, note: note)
                     // v2.60：新增房源/媒体上传重试成功时，最终日志由 retryHouseUpload 写一条
                     // 「新增房源 / 房号迁移 / 修改房源」，这里不再叠一条「上传媒体 成功」。
-                    if live.isHouseUpload != true {
+                    // b29：上传房源改动的成功日志由 retryPushUp → completePending 按“原待同步记录”收口，
+                    // 这里不再叠一条通用“上传房源改动 成功”，避免同一动作两条日志。
+                    if live.isHouseUpload != true && live.kind != .pushUp {
                         // 其他重试也是真实操作：写一条操作日志，账本里能看到「什么时候补传成功的」
                         BackupLogStore.log(category: "同步", action: live.title, result: "成功",
                                           detail: "手动重试成功" + (note.isEmpty ? "" : "：\(note)"),
@@ -571,16 +627,17 @@ func begin(id: UUID,
         // 2) 旧的「账本未同步」标记迁移进来（旧键只读，由中心接管）
         for key in SyncFailStore.all() {
             guard !failed.contains(where: { $0.kind == .pushUp && $0.roomKeys == [key] }) else { continue }
-            var item = TaskRecord(kind: .pushUp, title: "把本机改动传上去",
+            var item = TaskRecord(kind: .pushUp, title: "上传房源改动",
                                   roomKeys: [key], total: 1, state: .failed)
-            item.failure = "\(key) 的改动还在本机，云端没同步上；点重试"
+            let change = HousePendingRegistry.change(for: key)
+            item.failure = change.map { "\(key)：\($0.detail)" }
+                ?? "\(key) 的改动还在本机，云端没同步上；点重试"
+            item.note = change?.action ?? ""
             item.finishedAt = Date()
             failed.append(item)
         }
         // 3) 旧的待补传媒体队列整体迁移进来（队列本身保留，只做「待上传豁免」登记，不再自动补传）
         migrateMediaQueue()
-        // 3.1) 原来的草稿箱并入任务中心：草稿不再是独立入口，统一按「提交房源改动」待处理
-        migrateDrafts()
         if failed.count > maxFailed { failed = Array(failed.prefix(maxFailed)) }
         persist()
 
@@ -596,56 +653,18 @@ func begin(id: UUID,
                 Task { @MainActor in self?.migrateMediaQueue() }
             }
             .store(in: &sinks)
-        NotificationCenter.default.publisher(for: HouseDraftStore.didChange)
-            .sink { [weak self] _ in
-                Task { @MainActor in self?.migrateDrafts() }
-            }
-            .store(in: &sinks)
-    }
-
-    /// 草稿箱并入任务中心：一条草稿 = 一条「提交房源改动」待处理，重试即提交
-    private func migrateDrafts() {
-        let drafts = HouseDraftStore.shared.drafts
-        // 草稿已经提交成功/被删掉的，对应的任务同步收掉
-        let aliveKeys = Set(drafts.map { $0.roomKey })
-        failed.removeAll { $0.kind == .houseDraft && !aliveKeys.contains($0.roomKeys.first ?? "") }
-        for draft in drafts {
-            if let i = failed.firstIndex(where: { $0.kind == .houseDraft && $0.roomKeys == [draft.roomKey] }) {
-                failed[i].note = draft.changeSummary
-                failed[i].failure = "\(draft.displayRoomNo) 的改动只存本机，没提交到云端；点重试"
-                continue
-            }
-            var item = TaskRecord(kind: .houseDraft, title: "提交房源改动",
-                                  roomKeys: [draft.roomKey], total: 1, state: .failed)
-            item.note = draft.changeSummary
-            item.failure = "\(draft.displayRoomNo) 的改动只存本机，没提交到云端；点重试"
-            item.finishedAt = Date()
-            failed.insert(item, at: 0)
-        }
-        persist()
-    }
-
-    /// 一批任务结算时，把同一批房号下零散的单房记录收掉，只留总任务一条
-    /// （批量导入必然产生「整批总任务 + 每套房单独记录」，不收掉会刷一屏）
-    func absorbBatch(roomKeys: [String], kinds: [SyncTaskKind] = [.media, .pushUp], since: Date? = nil) {
-        guard !roomKeys.isEmpty else { return }
-        let keySet = Set(roomKeys)
-        failed.removeAll { item in
-            guard kinds.contains(item.kind) else { return false }
-            guard item.roomKeys.allSatisfy({ keySet.contains($0) }) else { return false }
-            guard let since else { return true }
-            return item.createdAt >= since
-        }
-        persist()
     }
 
     private func absorbNewSyncFailures() {
         var changed = false
         for key in SyncFailStore.all() {
             guard !failed.contains(where: { $0.kind == .pushUp && $0.roomKeys == [key] }) else { continue }
-            var item = TaskRecord(kind: .pushUp, title: "把本机改动传上去",
+            var item = TaskRecord(kind: .pushUp, title: "上传房源改动",
                                   roomKeys: [key], total: 1, state: .failed)
-            item.failure = "\(key) 的改动还在本机，云端没同步上；点重试"
+            let change = HousePendingRegistry.change(for: key)
+            item.failure = change.map { "\(key)：\($0.detail)" }
+                ?? "\(key) 的改动还在本机，云端没同步上；点重试"
+            item.note = change?.action ?? ""
             item.finishedAt = Date()
             failed.insert(item, at: 0)
             changed = true
@@ -743,8 +762,6 @@ final class TaskRetryPerformer {
     /// 由房源页注册：整次云端同步（cloudPull）的重试复用房源页同步流程；
     /// 入参是任务中心里的任务 id（页面确认/执行完成后用它结算真实结果）
     var cloudPull: ((UUID?) async -> CloudPullRunOutcome)?
-    /// 由设置页注册：孤儿扫描重试
-    var orphanScan: (() async -> Void)?
 
     private weak var houseContext: ModelContext?
 
@@ -758,7 +775,7 @@ final class TaskRetryPerformer {
             guard let cloudPull else {
                 completion(.failure(message: "请先到房源页，再点重试")); return
             }
-            switch await cloudPull(nil) {
+            switch await cloudPull(item.id) {
             case .finished:
                 completion(.success(note: "同步完成"))
             case .needsConfirmation:
@@ -766,20 +783,14 @@ final class TaskRetryPerformer {
             case .failed(let message):
                 completion(.failure(message: message))
             }
-        case .orphan:
-            guard let orphanScan else {
-                completion(.failure(message: "请先到设置页，再点重试")); return
-            }
-            await orphanScan()
-            completion(.success(note: "扫描完成"))
         case .cloudDelete:
             await retryCloudDelete(item, completion: completion)
         case .pushUp:
             await retryPushUp(item, completion: completion)
         case .mediaDelete:
             await retryMediaDelete(item, completion: completion)
-        case .houseDraft:
-            await retryHouseDraft(item, completion: completion)
+        case .mediaDownload:
+            await retryMediaDownload(item, completion: completion)
         case .media, .retry:
             if item.isHouseUpload == true {
                 await retryHouseUpload(item, completion: completion)
@@ -789,11 +800,53 @@ final class TaskRetryPerformer {
         }
     }
 
-    /// v2.52：保存房源的媒体上传任务（含手动取消后重试）：逐文件走 uploadHouseMedia
-    private func retryHouseUpload(_ item: TaskRecord, completion: @escaping (TaskRetryOutcome) -> Void) async {
-        guard let config = CosConfig.load(), config.isValid else {
-            completion(.failure(message: "云端配置无效，请先到「云端配置」填写")); return
+    /// 下载服务器媒体失败后重试：按任务里的房号，把本地缺的文件重新拉回落盘。
+    private func retryMediaDownload(_ item: TaskRecord,
+                                    completion: @escaping (TaskRetryOutcome) -> Void) async {
+        guard let ctx = houseContext else {
+            completion(.failure(message: "数据容器不可用，请重进 App 再试")); return
         }
+        let local = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
+        var byKey: [String: House] = [:]
+        for h in local where !h.isTrashed { byKey[h.mediaRoomKey] = h }
+        let total = max(item.total, 1)
+        var downloaded = 0
+        var failed = 0
+        SyncTaskCenter.shared.advance(id: item.id, done: item.done, total: total, note: "重新下载媒体…")
+        for key in item.roomKeys {
+            guard let house = byKey[key] else { continue }
+            let records = house.mediaItems.map { ($0.fileName, $0.kind) }
+            guard !records.isEmpty else { continue }
+            let result = await HouseRepository.shared.downloadMissingMedia(
+                roomKey: key,
+                records: records,
+                onProgress: { fileDone, _, name in
+                    Task { @MainActor in
+                        SyncTaskCenter.shared.advance(id: item.id,
+                                                     done: min(total, item.done + fileDone),
+                                                     total: total,
+                                                     note: "下载 \(name)")
+                    }
+                })
+            for f in result.files where !house.mediaItems.contains(where: { $0.fileName == f.fileName }) {
+                let media = MediaItem(fileName: f.fileName, kind: f.kind)
+                media.house = house
+                ctx.insert(media)
+            }
+            downloaded += result.files.count
+            failed += result.failedFiles.count
+            try? ctx.save()
+            NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
+        }
+        if failed == 0 {
+            completion(.success(note: downloaded > 0 ? "已下载 \(downloaded) 个媒体" : "本地已齐全，无需下载"))
+        } else {
+            completion(.failure(message: "还有 \(failed) 个媒体没下载，点重试"))
+        }
+    }
+
+    /// v2.52：保存房源的媒体上传任务（含手动取消后重试）：逐文件直传服务器磁盘
+    private func retryHouseUpload(_ item: TaskRecord, completion: @escaping (TaskRetryOutcome) -> Void) async {
         guard let roomKey = item.roomKeys.first else {
             completion(.failure(message: "缺少房号信息，请到这套房编辑页重新操作")); return
         }
@@ -809,70 +862,45 @@ final class TaskRetryPerformer {
         for (index, fileName) in files.enumerated() {
             let ext = (fileName as NSString).pathExtension.lowercased()
             let kind = ["mov", "mp4", "m4v", "avi"].contains(ext) ? "video" : "image"
-            let globalFraction = { (fileFraction: Double) -> Double in
-                let doneBase = Double(index)
-                let total = Double(files.count)
-                return max(0, min(1, (doneBase + fileFraction) / total))
-            }
+            let localURL = MediaStore.url(for: fileName, roomKey: roomKey)
             SyncTaskCenter.shared.advance(id: item.id, done: index, total: files.count, note: "上传中…", currentFileFraction: 0)
             do {
-                try await CosUploader.uploadHouseMedia(fileName: fileName, kind: kind,
-                                                       roomKey: roomKey, config: config,
-                                                       compress: shareCompressionEnabled,
-                                                       onStage: { label in
-                                                           progress.updateStage(roomKey: roomKey, direction: .upload, label: label)
-                                                           Task { @MainActor in SyncTaskCenter.shared.advance(id: item.id, done: index, note: label) }
-                                                       },
-                                                       onTranscodeProgress: { fraction in
-                                                           progress.updateTranscodeProgress(roomKey: roomKey, direction: .upload,
-                                                                                            progress: globalFraction(fraction), fraction: fraction)
-                                                           Task { @MainActor in
-                                                               SyncTaskCenter.shared.advanceWithinFile(id: item.id, fileIndex: index, fraction: fraction)
-                                                           }
-                                                       },
-                                                       onBytes: { fraction in
-                                                           progress.update(roomKey: roomKey, direction: .upload,
-                                                                            progress: globalFraction(fraction), label: "上传中…")
-                                                           Task { @MainActor in
-                                                               SyncTaskCenter.shared.advanceWithinFile(id: item.id, fileIndex: index, fraction: fraction)
-                                                           }
-                                                       },
-                                                       onSpeed: { speed in
-                                                           progress.updateSpeed(bytesPerSecond: speed)
-                                                           Task { @MainActor in SyncTaskCenter.shared.updateSpeed(id: item.id, bytesPerSecond: speed) }
-                                                       })
+                guard FileManager.default.fileExists(atPath: localURL.path),
+                      let data = try? Data(contentsOf: localURL) else {
+                    // 本地文件已失：清队列条目，不再阻塞整房重试
+                    HouseMediaUploadQueue.remove(roomKey: roomKey, fileName: fileName)
+                    SyncTaskCenter.shared.advance(id: item.id, done: index + 1, total: files.count, note: "已跳过本地缺失文件")
+                    continue
+                }
+                _ = try await HouseRepository.shared.uploadMedia(
+                    roomKey: roomKey, fileName: fileName, kind: kind, data: data)
                 HouseMediaUploadQueue.remove(roomKey: roomKey, fileName: fileName)
                 SyncTaskCenter.shared.advance(id: item.id, done: index + 1, total: files.count, note: "已上传 \(index + 1)/\(files.count)", currentFileFraction: 1)
-                progress.update(roomKey: roomKey, direction: .upload, progress: globalFraction(1), label: "已上传 \(index + 1)/\(files.count)")
+                progress.update(roomKey: roomKey, direction: .upload,
+                                progress: Double(index + 1) / Double(files.count), label: "已上传 \(index + 1)/\(files.count)")
             } catch {
                 failures.append(fileName)
-                SyncTaskCenter.shared.updateSpeed(id: item.id, bytesPerSecond: 0)
-                progress.updateSpeed(bytesPerSecond: 0)
             }
         }
         if failures.isEmpty {
-            // v2.57（P0-1/P1-7）：文件全传上后，按本地记录重写云端账本——当初保存时没敢写进账本
-            // 的文件名（防止他端误剔除），现在桶里已有对象，补上引用文件才不算桶孤儿；清单一并 flush。
+            // 文件全传上后，按本地记录重推服务器房源（带上媒体引用数组），清单与旧账本镜像不再补写
             var note = "已补传 \(files.count) 个媒体"
             var ledgerWritten = false
             if let ctx = houseContext {
                 let all = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
                 if let house = all.first(where: { $0.mediaRoomKey == roomKey && !$0.isTrashed }) {
-                    let record = CloudHouseSync.record(from: house, username: CloudUser.username)
                     do {
-                        _ = try await CloudHouseSync.uploadGuarded(record: record, removedMedia: [], config: config)
+                        _ = try await HouseRepository.shared.push(house)
                         SyncFailStore.clear(roomKey)
-                        await CloudManifestUpdater.shared.flush()
-                        LocalHouseLedger.save(house)
                         ledgerWritten = true
-                        note += "，云端账本已补上这 \(files.count) 个"
+                        note += "，服务器账本已补上这 \(files.count) 个"
                     } catch {
                         completion(.failure(message: "媒体已传上，但账本没写上（\(error.localizedDescription)）；再点一次重试即可"))
                         return
                     }
                 }
             }
-            // v2.60：重试成功只写一条最终日志，去掉原来的「上传媒体 成功」+「补传后补写账本 成功」两条。
+            // v2.60：重试成功只写一条最终日志
             let action = retryLogAction(for: item)
             BackupLogStore.log(category: "房源", action: action, result: "成功",
                               detail: HouseMediaLogFormat.retryDetail(fileCount: files.count, ledgerWritten: ledgerWritten),
@@ -897,99 +925,67 @@ final class TaskRetryPerformer {
 
     /// 删云端媒体：本地已经删了，只补删云端对象（删不存在的对象是幂等，安全）
     private func retryMediaDelete(_ item: TaskRecord, completion: @escaping (TaskRetryOutcome) -> Void) async {
-        guard let config = CosConfig.load(), config.isValid else {
-            completion(.failure(message: "云端配置无效，请先到「云端配置」填写")); return
-        }
         let files = item.files ?? []
         guard !files.isEmpty, let roomKey = item.roomKeys.first else {
             completion(.failure(message: "没有记录到具体文件名，请到这套房的编辑页再删一次")); return
         }
         var failures: [String] = []
         for fileName in files {
-            let ext = (fileName as NSString).pathExtension.lowercased()
-            let kind = ["mov", "mp4", "m4v", "avi"].contains(ext) ? "video" : "image"
             do {
-                try await CosUploader.deleteRemoteMedia(fileName: fileName, kind: kind,
-                                                       roomKey: roomKey, config: config)
+                try await HouseRepository.shared.deleteMedia(roomKey: roomKey, fileName: fileName)
             } catch {
                 failures.append(fileName)
             }
         }
         if failures.isEmpty {
-            completion(.success(note: "云端已删掉 \(files.count) 个媒体"))
+            completion(.success(note: "服务器已删掉 \(files.count) 个媒体"))
         } else {
             completion(.failure(message: "还有 \(failures.count) 个媒体没删掉，可再点重试"))
         }
     }
 
-    /// 提交房源改动（原草稿）：走原来的草稿提交逻辑，冲突时保留草稿并提示重新编辑
-    private func retryHouseDraft(_ item: TaskRecord, completion: @escaping (TaskRetryOutcome) -> Void) async {
-        guard let ctx = houseContext else {
-            completion(.failure(message: "数据容器不可用，请重进 App 再试")); return
-        }
-        guard let roomKey = item.roomKeys.first,
-              let draft = HouseDraftStore.shared.drafts.first(where: { $0.roomKey == roomKey }) else {
-            completion(.success(note: "这条改动已经提交过了"))
-            return
-        }
-        do {
-            let msg = try await HouseDraftSubmitter.submit(draft: draft, ctx: ctx, force: false)
-            completion(.success(note: msg))
-        } catch let e as HouseDraftError {
-            completion(.failure(message: e.errorDescription ?? "提交失败"))
-        } catch {
-            completion(.failure(message: error.localizedDescription))
-        }
-    }
-
     private func retryCloudDelete(_ item: TaskRecord, completion: @escaping (TaskRetryOutcome) -> Void) async {
-        guard let config = CosConfig.load(), config.isValid else {
-            completion(.failure(message: "云端配置无效，请先到「云端配置」填写")); return
-        }
         var failures: [String] = []
         var localCleaned = 0
         for key in item.roomKeys {
+            let ctx = houseContext
+            let localHouse: House? = ctx.flatMap { c in
+                ((try? c.fetch(FetchDescriptor<House>())) ?? []).first(where: { $0.mediaRoomKey == key })
+            }
             do {
-                try await CloudBackupService.deleteHouseRemoteFolder(roomKey: key, config: config, writeLog: false)
-                try await CloudHouseSync.delete(roomKey: key, config: config)
-                // v2.57（P1-2）：云端删除是「先云后本」的把关步骤——云端删成功才清本地：
-                // 数据库记录、媒体目录、状态标记、待传队列一并清掉，完成整条删除闭环
-                // （含历史挂账：当年本地已删的房这里查不到对象，只清残留目录与标记，同样安全幂等）。
-                if let ctx = houseContext {
-                    let all = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
-                    if let h = all.first(where: { $0.mediaRoomKey == key }) {
-                        MediaStore.deleteHouseDirectory(roomKey: key)
-                        SyncFailStore.clear(key)
-                        UnreadCloudHouseStore.clear(key)
-                        ctx.delete(h)
-                        try? ctx.save()
-                        localCleaned += 1
-                    } else {
-                        MediaStore.deleteHouseDirectory(roomKey: key)
-                        SyncFailStore.clear(key)
-                        UnreadCloudHouseStore.clear(key)
-                    }
-                    HouseMediaUploadQueue.removeRoom(key)
-                    NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
+                if let h = localHouse, let ctx {
+                    // 服务器硬删成功后才清本地：数据库记录、媒体目录、状态标记、待传队列一并清掉
+                    try await HouseRepository.shared.pushDelete(h)
+                    MediaStore.deleteHouseDirectory(roomKey: key)
+                    SyncFailStore.clear(key)
+                    UnreadCloudHouseStore.clear(key)
+                    ctx.delete(h)
+                    try? ctx.save()
+                    localCleaned += 1
+                } else {
+                    // 本地已无记录：服务器记录直接硬删，清残留目录与标记，同样安全幂等
+                    try await HouseRepository.shared.deleteRemote(key)
+                    MediaStore.deleteHouseDirectory(roomKey: key)
+                    SyncFailStore.clear(key)
+                    UnreadCloudHouseStore.clear(key)
                 }
+                HouseMediaUploadQueue.removeRoom(key)
+                NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
             } catch {
-                // v2.57（P3-18）：失败带完整原因（String(describing:) 含错误类型，不吃细节），标明删到哪一步失败
+                // 失败带完整原因，标明删到哪一步失败
                 failures.append("\(key)：\(String(describing: error))")
             }
         }
         if failures.isEmpty {
-            completion(.success(note: "云端已删除 \(item.roomKeys.count) 套" + (localCleaned > 0 ? "，本地残留已清 \(localCleaned) 套" : "")))
+            completion(.success(note: "服务器已删除 \(item.roomKeys.count) 套" + (localCleaned > 0 ? "，本地残留已清 \(localCleaned) 套" : "")))
         } else {
-            completion(.failure(message: "这几套云端还没删掉（本地保留）：\(failures.joined(separator: "；"))"))
+            completion(.failure(message: "这几套服务器上还没删掉（本地保留）：\(failures.joined(separator: "；"))"))
         }
     }
 
     private func retryPushUp(_ item: TaskRecord, completion: @escaping (TaskRetryOutcome) -> Void) async {
         guard let ctx = houseContext else {
             completion(.failure(message: "数据容器不可用，请重进 App 再试")); return
-        }
-        guard let config = CosConfig.load(), config.isValid else {
-            completion(.failure(message: "云端配置无效，请先到「云端配置」填写")); return
         }
         let local = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
         var byKey: [String: House] = [:]
@@ -1000,19 +996,19 @@ final class TaskRetryPerformer {
                 SyncFailStore.clear(key)
                 continue
             }
-            let record = CloudHouseSync.record(from: house, username: CloudUser.username)
-            LocalHouseLedger.save(house)
             do {
-                _ = try await CloudHouseSync.uploadGuarded(record: record, config: config)
-                SyncFailStore.clear(key)
+                let remote = try await HouseRepository.shared.push(house)
                 house.cloudStatus = .both
+                // b29：把原“待同步”日志就地收口成成功，并带上具体改动；
+                // 任务中心不再另写一条通用成功日志。
+                HouseRepository.shared.completePending(key, remoteKey: remote.roomKey)
             } catch {
                 failures.append(key)
             }
         }
         try? ctx.save()
         if failures.isEmpty {
-            completion(.success(note: "已传到云端 \(item.roomKeys.count) 套"))
+            completion(.success(note: "已传到服务器 \(item.roomKeys.count) 套"))
         } else {
             completion(.failure(message: "这几套没传上：\(failures.joined(separator: "、"))"))
         }
@@ -1022,9 +1018,6 @@ final class TaskRetryPerformer {
         guard let ctx = houseContext else {
             completion(.failure(message: "数据容器不可用，请重进 App 再试")); return
         }
-        guard let config = CosConfig.load(), config.isValid else {
-            completion(.failure(message: "云端配置无效，请先到「云端配置」填写")); return
-        }
         let local = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
         var byKey: [String: House] = [:]
         for h in local where !h.isTrashed { byKey[h.mediaRoomKey] = h }
@@ -1033,32 +1026,28 @@ final class TaskRetryPerformer {
             guard let house = byKey[key] else { continue }
             let files = house.mediaItems.map { ShareMediaFile(name: $0.fileName, kind: $0.kind) }
             guard !files.isEmpty else { continue }
-            let profile = CosUploader.loadShareProfile()
-            let info = ShareHouseInfo(
-                displayRoomNo: house.displayRoomNo, towerLabel: house.towerLabel,
-                layout: house.layout, statusLabel: house.status.label, priceText: house.priceText,
-                landlord: house.landlord, password: house.password, remark: house.remark,
-                name: profile.name, phone: profile.phone)
             do {
-                _ = try await CosUploader.autoRegenerateMaskedShare(
-                    mediaFiles: files, roomKey: key, info: info, config: config)
-                // 只把这条任务里的文件从待上传登记簿摘掉，别一把清空（同房其他文件可能还没传）
-                for fileName in (item.files ?? files.map { $0.name }) {
-                    HouseMediaUploadQueue.remove(roomKey: key, fileName: fileName)
+                for media in files {
+                    let localURL = MediaStore.url(for: media.name, roomKey: key)
+                    guard FileManager.default.fileExists(atPath: localURL.path),
+                          let data = try? Data(contentsOf: localURL) else {
+                        // 本地文件已失：清队列条目，不再阻塞整房重试
+                        HouseMediaUploadQueue.remove(roomKey: key, fileName: media.name)
+                        continue
+                    }
+                    _ = try await HouseRepository.shared.uploadMedia(
+                        roomKey: key, fileName: media.name, kind: media.kind, data: data)
+                    // 只把这条任务里的文件从待上传登记簿摘掉，别一把清空（同房其他文件可能还没传）
+                    HouseMediaUploadQueue.remove(roomKey: key, fileName: media.name)
                 }
-                // v2.57（P0-1/P1-7）：分享重传成功后同样补写账本引用（当初没敢写的名字现在补上），清单 flush
-                let record = CloudHouseSync.record(from: house, username: CloudUser.username)
+                // 媒体传完后补推房源引用；账本补写失败不判整房失败，提示再点一次
                 do {
-                    _ = try await CloudHouseSync.uploadGuarded(record: record, removedMedia: [], config: config)
+                    _ = try await HouseRepository.shared.push(house)
                     SyncFailStore.clear(key)
-                    await CloudManifestUpdater.shared.flush()
-                    LocalHouseLedger.save(house)
                 } catch {
-                    // 账本补写失败不判整个任务失败（分享页已生成）；提示用户再点一次
                     failures.append("\(key)（媒体已传上，账本没写上）")
                 }
             } catch {
-                // v2.57（P3-18）：失败带完整原因，方便定位是网络、权限还是转码问题
                 failures.append("\(key)：\(String(describing: error))")
             }
         }
@@ -1115,11 +1104,31 @@ struct TaskStrip: View {
 
 // MARK: - 任务中心全页
 
+/// b31：任务中心的“本地房源”候选。
+/// - localOnly：本机有、服务器没有（首次新增/从未上传）
+/// - mediaGap：服务器有这套房的账本，但媒体比本机少（可把本机媒体补上去）
+struct LocalHouseSyncCandidate: Identifiable {
+    enum Kind { case localOnly, mediaGap }
+    let roomKey: String
+    let kind: Kind
+    let detail: String
+    let missingFileNames: [String]
+    var id: String { roomKey + "-" + String(describing: kind) }
+}
+
 struct TaskCenterView: View {
     @ObservedObject private var center = SyncTaskCenter.shared
     @Environment(\.houseModelContext) private var houseModelContext
     // v2.54：无回滚载荷的待处理任务点「删除」时，二次确认防误删
     @State private var purgeTarget: TaskRecord?
+    /// 服务器已硬删、本机待补传：任务中心直接给「彻底删除本机房源」入口
+    @State private var localPurgeTarget: TaskRecord?
+    @State private var serverMissingKeys = Set<String>()
+    // b31：本地房源候选（只在任务中心展示，用户点同步才会上传）
+    @State private var localCandidates: [LocalHouseSyncCandidate] = []
+    @State private var candidateLoading = false
+    @State private var candidateError: String?
+    @State private var syncingCandidateKeys = Set<String>()
 
     var body: some View {
         NavigationStack {
@@ -1130,7 +1139,7 @@ struct TaskCenterView: View {
                             VStack(alignment: .leading, spacing: 6) {
                                 TaskRowView(record: record)
                                 // 撤回流程中的任务不再显示「取消上传」，避免重复操作
-                                if record.kind == .media && record.isHouseUpload == true
+                                if record.isHouseUpload == true
                                     && record.note != "正在撤回…" {
                                     Button(role: .destructive) {
                                         center.requestCancel(id: record.id)
@@ -1143,6 +1152,78 @@ struct TaskCenterView: View {
                         }
                     }
                 }
+                Section {
+                    if !HouseServerMode.ready {
+                        Text("未接入服务器；接入后这里会列出仅本机和可补媒体的房源。")
+                            .font(.footnote).foregroundColor(.secondary)
+                    } else if candidateLoading {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("正在核对本机与服务器房源…").font(.footnote).foregroundColor(.secondary)
+                        }
+                    } else if let candidateError {
+                        Text(candidateError).font(.footnote).foregroundColor(.red)
+                    } else if localCandidates.isEmpty {
+                        Text("本机房源都已同步到服务器，没有待上传项。")
+                            .font(.footnote).foregroundColor(.secondary)
+                    } else {
+                        ForEach(localCandidates) { item in
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(spacing: 8) {
+                                    Image(systemName: item.kind == .localOnly ? "internaldrive" : "photo.badge.plus")
+                                        .foregroundColor(.themeAccent)
+                                    Text(item.roomKey).font(.subheadline.weight(.semibold))
+                                    Spacer()
+                                    Text(item.kind == .localOnly ? "仅本机" : "可补媒体")
+                                        .font(.caption2.weight(.medium))
+                                        .padding(.horizontal, 7).padding(.vertical, 3)
+                                        .background((item.kind == .localOnly ? Color.orange : Color.blue).opacity(0.14))
+                                        .foregroundColor(item.kind == .localOnly ? .orange : .blue)
+                                        .clipShape(Capsule())
+                                }
+                                Text(item.detail).font(.caption2).foregroundColor(.secondary)
+                                Button {
+                                    syncLocalCandidate(item)
+                                } label: {
+                                    HStack(spacing: 6) {
+                                        if syncingCandidateKeys.contains(item.roomKey) {
+                                            ProgressView().controlSize(.small)
+                                                    Text("正在上传…")
+                                        } else {
+                                            Image(systemName: "arrow.up.circle")
+                                            Text(item.kind == .localOnly ? "同步到服务器" : "补传媒体到服务器")
+                                        }
+                                    }
+                                    .font(.footnote.weight(.medium))
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 7)
+                                    .background(Color.themeAccent.opacity(0.12))
+                                    .foregroundColor(.themeAccent)
+                                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(syncingCandidateKeys.contains(item.roomKey))
+                            }
+                        }
+                    }
+                } header: {
+                    HStack {
+                        Text("本地房源（未上传）")
+                        Spacer()
+                        if HouseServerMode.ready {
+                            Button {
+                                Task { await loadLocalCandidates() }
+                            } label: {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                            .font(.caption)
+                            .disabled(candidateLoading)
+                        }
+                    }
+                } footer: {
+                    Text("服务器没有的本地房源、或服务器有账本但缺媒体的房源会列在这里；点同步后才会上传，不会自动传。")
+                }
+
                 if !center.failed.isEmpty {
                     Section {
                         ForEach(center.failed) { record in
@@ -1184,6 +1265,19 @@ struct TaskCenterView: View {
                                             .clipShape(RoundedRectangle(cornerRadius: 8))
                                     }
                                 }
+                                if record.roomKeys.contains(where: { serverMissingKeys.contains($0) }) {
+                                    Button(role: .destructive) {
+                                        localPurgeTarget = record
+                                    } label: {
+                                        Label("彻底删除本机房源（服务器已删除）", systemImage: "trash.slash")
+                                            .font(.footnote.weight(.medium))
+                                            .frame(maxWidth: .infinity)
+                                            .padding(.vertical, 7)
+                                            .background(Color.red.opacity(0.10))
+                                            .foregroundColor(.red)
+                                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                                    }
+                                }
                             }
                         }
                     } header: {
@@ -1216,6 +1310,13 @@ struct TaskCenterView: View {
                     }
                 }
             }
+            .onAppear {
+                serverMissingKeys = HouseServerMissingStore.keys()
+                Task { await loadLocalCandidates() }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: HouseServerMissingStore.didChange)) { _ in
+                serverMissingKeys = HouseServerMissingStore.keys()
+            }
             .navigationTitle("同步任务中心")
             .navigationBarTitleDisplayMode(.inline)
             .confirmationDialog("删除这条任务？",
@@ -1232,6 +1333,135 @@ struct TaskCenterView: View {
             } message: { _ in
                 Text("仅删除这条任务记录，不会删除本地文件或云端数据。")
             }
+            .confirmationDialog("彻底删除本机房源？",
+                                isPresented: Binding(
+                                    get: { localPurgeTarget != nil },
+                                    set: { if !$0 { localPurgeTarget = nil } }
+                                ),
+                                presenting: localPurgeTarget) { target in
+                Button("彻底删除", role: .destructive) {
+                    guard let ctx = houseModelContext else {
+                        localPurgeTarget = nil
+                        return
+                    }
+                    let keys = target.roomKeys
+                    _ = HouseRepository.shared.purgeLocal(keys)
+                    // 房源已按服务器为准删除，对应失败任务不能留着再让人重试。
+                    for task in center.failed where !Set(task.roomKeys).isDisjoint(with: Set(keys)) {
+                        center.purge(id: task.id)
+                    }
+                    localPurgeTarget = nil
+                }
+                Button("取消", role: .cancel) { localPurgeTarget = nil }
+            } message: { target in
+                Text("服务器已删除 \(target.roomKeys.first ?? "这套房源")，服务器模式下以服务器为准。本机改动、图片视频和待补传记录将一并清除，不再尝试同步。")
+            }
+        }
+    }
+
+    // MARK: - b31 本地房源 / 补媒体
+
+    @MainActor
+    private func loadLocalCandidates() async {
+        guard HouseServerMode.ready else {
+            localCandidates = []
+            return
+        }
+        candidateLoading = true
+        candidateError = nil
+        defer { candidateLoading = false }
+        do {
+            let remote = try await HouseRemoteClient.shared.listHouses(since: nil)
+            let remoteByKey = Dictionary(remote.houses.map { ($0.roomKey, $0) },
+                                         uniquingKeysWith: { a, _ in a })
+            let pending = Set(HouseRepository.shared.pendingKeys())
+            var result: [LocalHouseSyncCandidate] = []
+            for h in HouseRepository.shared.fetchAllSorted() {
+                let key = h.mediaRoomKey
+                guard !h.isTrashed, !pending.contains(key) else { continue }
+                if let r = remoteByKey[key], !r.trashed {
+                    // b32：按本地映射后的文件名比对，避免服务器把 .mov 统一成 .mp4 后
+                    // 同一份视频被误判成“本地多出、缺媒体”。
+                    let remoteNames = Set((r.media ?? []).map {
+                        MediaNaming.canonicalKey(
+                            HouseSyncEngine.localFileName(objectKey: $0.objectKey,
+                                                          kind: $0.kind,
+                                                          roomKey: r.roomKey))
+                    })
+                    let missing = h.mediaItems.filter {
+                        !remoteNames.contains(MediaNaming.canonicalKey($0.fileName))
+                    }
+                    if !missing.isEmpty {
+                        result.append(LocalHouseSyncCandidate(
+                            roomKey: key, kind: .mediaGap,
+                            detail: "服务器账本已有，缺失 \(missing.count) 个媒体，可补传到服务器",
+                            missingFileNames: missing.map { $0.fileName }))
+                    }
+                } else if h.cloudStatus == .local, !HouseServerMissingStore.contains(key) {
+                    result.append(LocalHouseSyncCandidate(
+                        roomKey: key, kind: .localOnly,
+                        detail: "仅本机有，服务器没有；含 \(h.mediaItems.count) 个媒体",
+                        missingFileNames: h.mediaItems.map { $0.fileName }))
+                }
+            }
+            localCandidates = result.sorted { $0.roomKey < $1.roomKey }
+        } catch {
+            candidateError = "核对本地房源失败：\(error.localizedDescription)"
+            localCandidates = []
+        }
+    }
+
+    @MainActor
+    private func syncLocalCandidate(_ item: LocalHouseSyncCandidate) {
+        guard let ctx = houseModelContext else {
+            candidateError = "房源数据容器不可用"
+            return
+        }
+        guard !syncingCandidateKeys.contains(item.roomKey) else { return }
+        guard let house = HouseRepository.shared.fetch(roomKey: item.roomKey) else {
+            candidateError = "本机已找不到 \(item.roomKey)"
+            Task { await loadLocalCandidates() }
+            return
+        }
+        syncingCandidateKeys.insert(item.roomKey)
+        let action = item.kind == .localOnly ? "新增房源" : "补传媒体"
+        // 先把要补的媒体放进上传队列；flush 会先传媒体、再提交账本引用。
+        for name in item.missingFileNames {
+            if let media = house.mediaItems.first(where: { $0.fileName == name }) {
+                HouseMediaUploadQueue.enqueue(roomKey: item.roomKey,
+                                              fileName: media.fileName, kind: media.kind)
+            }
+        }
+        HouseRepository.shared.markPending(
+            item.roomKey, action: action, detail: item.detail,
+            changedFields: item.kind == .mediaGap ? [] : nil)
+        Task {
+            defer { Task { @MainActor in syncingCandidateKeys.remove(item.roomKey) } }
+            _ = await HousePendingUploader.shared.flush(context: ctx, onlyKeys: [item.roomKey])
+            let pendingLeft = HouseRepository.shared.pendingKeys().contains(item.roomKey)
+            let mediaLeft = HouseMediaUploadQueue.pendingItems().contains { $0.roomKey == item.roomKey }
+            if pendingLeft || mediaLeft {
+                HouseRepository.shared.markPending(
+                    item.roomKey, action: action, detail: item.detail,
+                    changedFields: item.kind == .mediaGap ? [] : nil)
+                center.reportFailure(
+                    kind: .pushUp, title: item.kind == .localOnly ? "同步本地房源" : "补传服务器媒体",
+                    roomKeys: [item.roomKey],
+                    failure: "\(item.roomKey) 上传中断（网络不通或服务器未连接），本机内容已保留，点重试",
+                    files: item.missingFileNames)
+                BackupLogStore.log(category: "房源", action: action, result: "待同步",
+                                   detail: "\(item.detail)；上传中断，已挂任务中心",
+                                   room: item.roomKey, cloud: false)
+            } else {
+                if let h = HouseRepository.shared.fetch(roomKey: item.roomKey) {
+                    h.cloudStatus = .both
+                    try? HouseRepository.shared.save()
+                }
+                BackupLogStore.log(category: "房源", action: action, result: "成功",
+                                   detail: item.detail, room: item.roomKey, cloud: true)
+                NotificationCenter.default.post(name: HouseListView.houseStoreChanged, object: nil)
+            }
+            await loadLocalCandidates()
         }
     }
 }
@@ -1239,6 +1469,15 @@ struct TaskCenterView: View {
 /// 统一行组件（顶部条 / 中心 / 其他页面复用同一个）
 struct TaskRowView: View {
     let record: TaskRecord
+
+    /// b29：待同步卡直接读登记簿里的最新改动，旧任务也能显示“改了什么”
+    private var failureText: String {
+        if record.kind == .pushUp, let key = record.roomKeys.first,
+           let change = HousePendingRegistry.change(for: key), !change.detail.isEmpty {
+            return "\(key)：\(change.detail)"
+        }
+        return record.failure
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -1261,9 +1500,9 @@ struct TaskRowView: View {
                     Text(record.note).font(.caption2).foregroundColor(.secondary)
                 }
             } else if record.state == .failed {
-                Text(record.failure).font(.caption2).foregroundColor(.secondary)
+                Text(failureText).font(.caption2).foregroundColor(.secondary)
             } else if record.state == .cancelled {
-                Text(record.failure).font(.caption2).foregroundColor(.secondary)
+                Text(failureText).font(.caption2).foregroundColor(.secondary)
             } else if !record.note.isEmpty {
                 Text(record.note).font(.caption2).foregroundColor(.secondary)
             }

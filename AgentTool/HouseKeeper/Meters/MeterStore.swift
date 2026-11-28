@@ -6,6 +6,7 @@
 
 import Foundation
 import SwiftUI
+import UIKit
 
 @MainActor
 final class MeterStore: ObservableObject {
@@ -41,6 +42,9 @@ final class MeterStore: ObservableObject {
             if let data = try? Data(contentsOf: settingsURL) {
                 settings = try JSONDecoder().decode(MeterSettings.self, from: data)
             }
+            // 非 MainActor 的 CloudOps/分享扩展需要读服务器地址：设置加载后同步到共享区。
+            SharedBridge.defaults.set(settings.cloudEndpoint, forKey: MeterCloudConfig.endpointCacheKey)
+            SharedBridge.defaults.set(settings.cloudEndpoint, forKey: SharedBridge.kEndpoint)
             if settings.openId.isEmpty, let link = parseOpenId(from: settings.queryLink) {
                 settings.openId = link
             }
@@ -66,6 +70,8 @@ final class MeterStore: ObservableObject {
         do {
             let data = try JSONEncoder().encode(settings)
             try data.write(to: settingsURL, options: .atomic)
+            SharedBridge.defaults.set(settings.cloudEndpoint, forKey: MeterCloudConfig.endpointCacheKey)
+            SharedBridge.defaults.set(settings.cloudEndpoint, forKey: SharedBridge.kEndpoint)
         } catch {
         }
         // v1.95：设置变化后立即按新开关/间隔重建定时器
@@ -78,7 +84,7 @@ final class MeterStore: ObservableObject {
     // 说明：autoRefreshEnabled 开启时，App 前台运行期间按 autoRefreshMinutes 间隔自动刷新电表并保存；
     // iOS 系统限制 App 被杀后无法后台执行——App 下次打开不会自动补刷（v2.4 起），
     // 总刷新仅手动按钮/下拉刷新，或设置页开启定时刷新后按间隔执行。
-    // 配合低电量本地通知（lowAlertEnabled）即可实现「AI 盯电表」的完整闭环。
+    // 低电量告警由服务器云端轮询经 Bark 推送；App 不能常驻后台，本机本地通知只作为历史遗留开关，不再触发。
 
     private var refreshTimer: Timer?
 
@@ -214,46 +220,6 @@ final class MeterStore: ObservableObject {
         if changed { saveMeters() }
     }
 
-    // MARK: - 低电量提醒（本地通知，每天每户最多一次，防骚扰）
-
-    private let alertDateKey = "meter.lowAlertDate"   // yyyyMMdd，全局每日一次
-
-    func sendLowAlertIfNeeded() {
-        guard settings.lowAlertEnabled else { return }
-        let center = UNUserNotificationCenter.current()
-        let cal = Calendar.current
-        let todayKey = { () -> String in
-            let f = DateFormatter(); f.dateFormat = "yyyyMMdd"; return f.string(from: Date())
-        }()
-        let last = UserDefaults.standard.string(forKey: alertDateKey)
-        guard last != todayKey else { return }
-
-        let low = meters.filter { $0.isLow(threshold: settings.lowThreshold) }
-        let off = meters.filter { $0.isOff }
-        guard !low.isEmpty || !off.isEmpty else { return }
-
-        center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
-            guard granted else { return }
-            let content = UNMutableNotificationContent()
-            content.title = "电表预警"
-            var bodyParts: [String] = []
-            if !low.isEmpty {
-                let sample = low.prefix(3).map { "\($0.room.isEmpty ? $0.uid : $0.room) \(String(format: "%.1f", $0.shengyu))度" }
-                bodyParts.append("低电量 \(low.count) 户：" + sample.joined(separator: "、"))
-            }
-            if !off.isEmpty {
-                let sample = off.prefix(3).map { $0.room.isEmpty ? $0.uid : $0.room }
-                bodyParts.append("拉闸 \(off.count) 户：" + sample.joined(separator: "、"))
-            }
-            content.body = bodyParts.joined(separator: "；") + "。请及时充值。"
-            content.userInfo = ["tab": 0]
-            content.sound = .default
-            let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
-            let req = UNNotificationRequest(identifier: "meter.lowAlert", content: content, trigger: trigger)
-            center.add(req)
-            UserDefaults.standard.set(todayKey, forKey: self.alertDateKey)
-        }
-    }
 }
 
 // MARK: - 云端值守：看板快照合并（#236 双模式）
@@ -407,9 +373,13 @@ final class MeterCloudSync {
 
     /// nonisolated 只读持久令牌（钥匙串 → 本机兜底文件），供非 MainActor 的路由/账本存储同步判定；
     /// 不依赖 MainActor 内存缓存，避免跨 actor 隔离引用。
+    nonisolated static func persistedToken() -> String? {
+        if let k = KeychainStore.load(MeterCloudConfig.tokenKey), !k.isEmpty { return k }
+        return loadPersistedFileToken()
+    }
+
     nonisolated static func hasPersistedToken() -> Bool {
-        if let k = KeychainStore.load(MeterCloudConfig.tokenKey), !k.isEmpty { return true }
-        return loadPersistedFileToken() != nil
+        (persistedToken() ?? "").isEmpty == false
     }
 
     // 测试诊断：分别读取三个来源的原始状态，不依赖 token 的缓存逻辑，用于定位真机令牌丢失环节
@@ -503,7 +473,7 @@ final class MeterCloudSync {
         }
         guard let token = token, !token.isEmpty else {
             defaults.set(true, forKey: MeterCloudConfig.dirtyKey)
-            store.cloudStatusText = "未保存云端令牌，请先填写接入码"
+            store.cloudStatusText = "未保存云端令牌，请先在云端配置填写服务器授权码"
             return false
         }
         store.cloudBusy = true
@@ -544,11 +514,11 @@ final class MeterCloudSync {
         }
     }
 
-    // MARK: 首次接入：接入码换长期令牌（成功后仅存本机钥匙串）
+    // MARK: 首次接入：授权码换长期令牌（成功后仅存本机钥匙串）
 
     func enroll(store: MeterStore, code: String) async throws -> String {
         let trimmedCode = code.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedCode.isEmpty else { throw MeterCloudError.server("请填写接入码") }
+        guard !trimmedCode.isEmpty else { throw MeterCloudError.server("请填写服务器授权码") }
         guard let endpoint = currentEndpoint(store: store),
               let url = URL(string: endpoint + "/api/meter/enroll") else { throw MeterCloudError.badEndpoint }
         var req = URLRequest(url: url)
@@ -565,7 +535,7 @@ final class MeterCloudSync {
         let httpCode = (resp as? HTTPURLResponse)?.statusCode ?? 0
         let obj = try? JSONDecoder().decode(MeterEnrollResponse.self, from: data)
         guard httpCode == 200, obj?.ok == true, let t = obj?.token, !t.isEmpty else {
-            if httpCode == 403 { throw MeterCloudError.server("接入码不正确") }
+            if httpCode == 403 { throw MeterCloudError.server("授权码不正确") }
             if httpCode == 429 { throw MeterCloudError.server("尝试过于频繁，请稍后再试") }
             throw MeterCloudError.server(obj?.error ?? "接入失败（服务器 \(httpCode)）")
         }
@@ -645,7 +615,7 @@ final class MeterCloudSync {
             }
             if code == 409 { return ack?.hint ?? "请先开启云端轮询并同步成功后，再点立即轮询" }
             if code == 429 { return "操作太频繁，请 \(ack?.retry_after ?? 10) 秒后再点" }
-            if code == 401 { return "云端令牌已失效，请重新填写电表接入码" }
+            if code == 401 { return "云端令牌已失效，请重新在云端配置填写服务器授权码" }
             let detail = ack?.error.map { "：\($0)" } ?? ""
             return "触发失败（服务器 \(code)）\(detail)"
         } catch {
@@ -704,7 +674,7 @@ final class MeterCloudSync {
 enum NotifyHubConfig {
     static let tokenKey = "notify.hub.userToken"            // Keychain：通知中心用户长期令牌
     static let usernameCacheKey = "notify.hub.username"    // UserDefaults：最近一次用户名（仅展示/预填，非凭据）
-    static let enrollCodeCacheKey = "notify.hub.enrollCode"// UserDefaults：测试期记住接入码方便回填
+    static let enrollCodeCacheKey = "notify.hub.enrollCode"// UserDefaults：测试期记住授权码方便回填
     static let lastSyncKey = "notify.hub.lastSyncAt"
     static let apiPrefix = "/api/notify"
 }
@@ -735,6 +705,8 @@ struct NotifyHubEvent: Codable, Identifiable, Equatable {
     let status: String?
     let sent: Int?
     let total: Int?
+    let count: Int?
+    let source: String?
 }
 
 struct NotifyHubPrefs: Codable, Equatable {
@@ -777,7 +749,7 @@ final class NotifyHub: ObservableObject {
     @Published var username = ""
     @Published var devices: [NotifyHubDevice] = []
     @Published var events: [NotifyHubEvent] = []
-    @Published var prefs = NotifyHubPrefs(enabled: true, modules: ["meter": true])
+    @Published var prefs = NotifyHubPrefs(enabled: true, modules: ["meter": true, "house": true, "todo": true])
     @Published var busy = false
     @Published var statusText: String?
     @Published var lastSyncAt: Date?
@@ -794,8 +766,10 @@ final class NotifyHub: ObservableObject {
     var token: String? { KeychainStore.load(NotifyHubConfig.tokenKey) }
     var channelEnabled: Bool { prefs.enabled ?? true }
     var meterModuleEnabled: Bool { prefs.modules?["meter"] ?? true }
+    var houseModuleEnabled: Bool { prefs.modules?["house"] ?? true }
+    var todoModuleEnabled: Bool { prefs.modules?["todo"] ?? true }
 
-    /// 与电表云端值守共用同一台服务器（8082 同进程挂载 /api/notify），地址在「电表监控设置」里改
+    /// 与电表云端值守共用同一台服务器（8082 同进程挂载 /api/notify），地址在「设置 → 云端配置」里改
     var endpoint: String {
         var s = MeterStore.shared.settings.cloudEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
         if s.isEmpty { s = MeterCloudConfig.defaultEndpoint }
@@ -821,7 +795,7 @@ final class NotifyHub: ObservableObject {
 
     private func zhError(_ raw: String, httpCode: Int) -> String {
         switch raw {
-        case "invalid_code": return "接入码不正确（测试期固定 123456）"
+        case "invalid_code": return "授权码不正确（测试期固定 123456）"
         case "invalid_bark_key": return "识别不到 Bark Key，请粘贴 Bark App 首页的完整推送链接（形如 http://服务器/一串字符）"
         case "username_exists": return "该用户名已被占用；若是本人换机绑定，请换一个用户名（测试期暂不支持换机找回）"
         case "device_limit": return "该账号绑定设备数已达上限（10 台）"
@@ -839,7 +813,7 @@ final class NotifyHub: ObservableObject {
                          auth: Bool = true) async throws -> NotifyHubResponse {
         guard let url = buildURL(sub) else {
             throw NSError(domain: "NotifyHub", code: -1,
-                          userInfo: [NSLocalizedDescriptionKey: "服务器地址无效，可到「电表监控设置 → 云端轮询 → 电表云端接入」检查服务器地址"])
+                          userInfo: [NSLocalizedDescriptionKey: "服务器地址无效，可到「设置 → 云端配置」检查服务器地址"])
         }
         var req = URLRequest(url: url)
         req.httpMethod = method
@@ -896,7 +870,9 @@ final class NotifyHub: ObservableObject {
             "barkKey": barkText.trimmingCharacters(in: .whitespacesAndNewlines),
             "deviceName": deviceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? "我的 iPhone" : deviceName.trimmingCharacters(in: .whitespacesAndNewlines),
-            "platform": "ios"
+            "platform": "ios",
+            // 房源广播时服务器用这个稳定安装标识排除本机，避免本机本地通知和 Bark 各弹一次。
+            "sourceDeviceId": HouseRemoteClient.shared.originDeviceId
         ]
         do {
             let obj = try await request("register", method: "POST", body: body)
@@ -915,13 +891,25 @@ final class NotifyHub: ObservableObject {
 
     /// 绑定成功后自动补一次电表全量配置，把通道 userToken 绑到电表租户；
     /// 修复“先开电表值守、后绑推送通道”时需手动再同步一次的顺序缺口。
-    /// - Returns: nil=本机还没接入电表云端（无电表令牌，跳过，之后开值守 buildPayload 会自动带 token）；true/false=补同步成败
+    /// - Returns: nil=本机还没接入服务器云端（无令牌，跳过，之后开值守 buildPayload 会自动带 token）；true/false=补同步成败
     private func syncMeterBindingAfterRegister() async -> Bool? {
         let sync = MeterCloudSync.shared
         guard sync.hasToken else { return nil }
         let store = MeterStore.shared
         // 保持用户当前值守开关状态，不借绑定动作擅自开启服务器轮询
         return await sync.pushConfig(store: store, enabled: store.settings.cloudWatchEnabled)
+    }
+
+    /// 已绑定旧账号没有本机 source 映射时，启动/进设置页补一次；不新增设备、不改 Bark。
+    /// 服务器只在账号只有一台设备（或设备名唯一匹配）时认领，多台同名设备不会乱猜。
+    func ensureSourceMapping() async {
+        guard isBound else { return }
+        let body: [String: Any] = [
+            "sourceDeviceId": HouseRemoteClient.shared.originDeviceId,
+            "deviceName": UIDevice.current.name,
+            "platform": "ios"
+        ]
+        _ = try? await request("register", method: "POST", body: body)
     }
 
     func refreshMe() async {
@@ -964,18 +952,25 @@ final class NotifyHub: ObservableObject {
         }
     }
 
-    /// 总开关 / 电表模块开关；先乐观更新再以服务器档案为准回滚
-    func updatePrefs(channelEnabled: Bool? = nil, meterEnabled: Bool? = nil) async {
+    /// 总开关 / 电表 / 房源 / 待办模块开关；先乐观更新再以服务器档案为准回滚
+    func updatePrefs(channelEnabled: Bool? = nil,
+                     meterEnabled: Bool? = nil,
+                     houseEnabled: Bool? = nil,
+                     todoEnabled: Bool? = nil) async {
         var body: [String: Any] = [:]
         if let channelEnabled {
             body["enabled"] = channelEnabled
             prefs.enabled = channelEnabled
         }
-        if let meterEnabled {
-            body["modules"] = ["meter": meterEnabled]
-            var modules = prefs.modules ?? [:]
-            modules["meter"] = meterEnabled
-            prefs.modules = modules
+        var modules: [String: Bool] = [:]
+        if let meterEnabled { modules["meter"] = meterEnabled }
+        if let houseEnabled { modules["house"] = houseEnabled }
+        if let todoEnabled { modules["todo"] = todoEnabled }
+        if !modules.isEmpty {
+            body["modules"] = modules
+            var current = prefs.modules ?? [:]
+            for (key, value) in modules { current[key] = value }
+            prefs.modules = current
         }
         guard !body.isEmpty else { return }
         do {
@@ -984,6 +979,21 @@ final class NotifyHub: ObservableObject {
         } catch {
             statusText = error.localizedDescription
             await refreshMe()
+        }
+    }
+
+    /// 上报本机待办提醒清单；服务端按 dueAt 扫描并经 Bark 投递。
+    /// source 用 App 稳定设备标识，保证同账号多台手机各自的待办不会互相覆盖。
+    func replaceTodoReminders(_ reminders: [[String: Any]]) async -> String? {
+        guard isBound else { return "推送通道未绑定" }
+        do {
+            _ = try await request("reminders", method: "POST", body: [
+                "source": HouseRemoteClient.shared.originDeviceId,
+                "reminders": reminders
+            ])
+            return nil
+        } catch {
+            return error.localizedDescription
         }
     }
 

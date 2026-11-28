@@ -33,11 +33,16 @@ final class LocalNotificationManager: NSObject, UNUserNotificationCenterDelegate
         }
     }
 
-    func rebuildAll(modelContext: ModelContext) {
+    func rebuildAll(modelContext: ModelContext, syncTodoRemote: Bool = true) {
         rebuildGeneration += 1; let generation = rebuildGeneration
         let properties = (try? modelContext.fetch(FetchDescriptor<Property>(predicate: #Predicate { !$0.isDeleted }))) ?? []
         let payouts = (try? modelContext.fetch(FetchDescriptor<PayoutRecord>(predicate: #Predicate { !$0.isDeleted }))) ?? []
         let todos = (try? modelContext.fetch(FetchDescriptor<TodoItem>(predicate: #Predicate { !$0.isDeleted }))) ?? []
+        // 待办采用「远程优先、本地兜底」：远程通道可绑定且上报成功时，未来待办只由服务器 Bark 发；
+        // 未绑定/开关关闭/上报失败时仍由本机排未来待办，已到点的待办始终保留本机每小时重复兜底。
+        if syncTodoRemote {
+            TodoReminderSync.shared.sync(todos: todos, modelContext: modelContext)
+        }
         center.getPendingNotificationRequests { [weak self] existing in
             guard let self else { return }
             self.center.removePendingNotificationRequests(withIdentifiers: existing.map(\.identifier).filter { $0.hasPrefix("zfgj-") })
@@ -65,7 +70,7 @@ final class LocalNotificationManager: NSObject, UNUserNotificationCenterDelegate
     }
 
     private func schedule(properties: [Property], payouts: [PayoutRecord], todos: [TodoItem]) {
-        let todo = todoRequests(todos)
+        let todo = todoRequests(todos, skipFuture: TodoReminderSync.shared.remoteReady)
         let business = businessRequests(properties: properties, payouts: payouts)
         let selected = Array((todo + business).prefix(60))
         var ledger: [NotificationLedgerEntry] = []
@@ -118,9 +123,16 @@ final class LocalNotificationManager: NSObject, UNUserNotificationCenterDelegate
         return result.sorted(by: requestDate)
     }
 
-    private func todoRequests(_ todos: [TodoItem]) -> [UNNotificationRequest] {
+    private func todoRequests(_ todos: [TodoItem], skipFuture: Bool = false) -> [UNNotificationRequest] {
         let now = Date()
-        return todos.filter { !$0.isCompleted && $0.reminderDate != nil }.sorted { $0.id.uuidString < $1.id.uuidString }.enumerated().map { index, item in
+        let eligible = todos.filter {
+            guard !$0.isCompleted, let date = $0.reminderDate else { return false }
+            // 远程已接管未来提醒时，本机不再排未来待办，避免 Bark 与本 App 各弹一次；
+            // 已过点的待办仍保留本机每小时兜底，防止服务器不可达时彻底漏提醒。
+            if skipFuture && date > now { return false }
+            return true
+        }
+        return eligible.sorted { $0.id.uuidString < $1.id.uuidString }.enumerated().map { index, item in
             let date = item.reminderDate!, content = UNMutableNotificationContent(); content.title = "待办提醒"; content.body = item.content; content.sound = sound(for: "todo"); content.badge = 1
             content.userInfo = ["tab": 0, "itemID": item.id.uuidString, "plannedAt": date.timeIntervalSince1970]
             if date <= now { return UNNotificationRequest(identifier: "zfgj-todo-hourly-\(item.id)", content: content, trigger: UNTimeIntervalNotificationTrigger(timeInterval: 3600, repeats: true)) }
@@ -150,4 +162,74 @@ final class LocalNotificationManager: NSObject, UNUserNotificationCenterDelegate
 
     nonisolated func userNotificationCenter(_ center:UNUserNotificationCenter,willPresent notification:UNNotification,withCompletionHandler completionHandler:@escaping(UNNotificationPresentationOptions)->Void){completionHandler([.banner,.list,.sound])}
     nonisolated func userNotificationCenter(_ center:UNUserNotificationCenter,didReceive response:UNNotificationResponse,withCompletionHandler completionHandler:@escaping()->Void){let info=response.notification.request.content.userInfo;DispatchQueue.main.async{NotificationCenter.default.post(name:Self.navigationNotification,object:nil,userInfo:info)};completionHandler()}
+}
+
+// MARK: - 待办远程提醒同步（Bark 远程优先 / 本机本地兜底）
+
+@MainActor
+final class TodoReminderSync {
+    static let shared = TodoReminderSync()
+    private var syncTask: Task<Void, Never>?
+    private var lastFingerprint: String?
+    /// 最近一次上报是否成功；只有成功且通道/模块开关打开时才让本机放弃未来待办本地通知
+    private(set) var remoteReady = false
+
+    private init() {}
+
+    /// 设置页切换总开关/待办开关、绑定/解绑后调用：强制重算一次本地与远程归属。
+    func refresh(modelContext: ModelContext) {
+        let todos = (try? modelContext.fetch(FetchDescriptor<TodoItem>(predicate: #Predicate { !$0.isDeleted }))) ?? []
+        sync(todos: todos, modelContext: modelContext, force: true)
+    }
+
+    func sync(todos: [TodoItem], modelContext: ModelContext? = nil, force: Bool = false) {
+        let available = NotifyHub.shared.isBound
+            && NotifyHub.shared.channelEnabled
+            && NotifyHub.shared.todoModuleEnabled
+        guard available else {
+            let wasReady = remoteReady
+            remoteReady = false
+            lastFingerprint = nil
+            if wasReady, let modelContext {
+                LocalNotificationManager.shared.rebuildAll(modelContext: modelContext, syncTodoRemote: false)
+            }
+            return
+        }
+
+        // 只上报未来待办；已过点的交给本机每小时兜底，避免服务器补推旧提醒
+        let payload = todos.compactMap { item -> [String: Any]? in
+            guard !item.isCompleted, let date = item.reminderDate, date > Date() else { return nil }
+            return [
+                "id": item.id.uuidString,
+                "dueAt": date.timeIntervalSince1970,
+                "title": "待办提醒",
+                "body": item.content
+            ]
+        }
+        let fingerprint = payload.map { item -> String in
+            let id = item["id"] as? String ?? ""
+            let due = item["dueAt"] as? Double ?? 0
+            return "\(id):\(due)"
+        }.joined(separator: "|")
+        if !force && fingerprint == lastFingerprint { return }
+
+        syncTask?.cancel()
+        syncTask = Task { [weak self] in
+            // 合并短时间内的连续增删改，避免每次保存都打服务器
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            guard !Task.isCancelled, let self else { return }
+            let error = await NotifyHub.shared.replaceTodoReminders(payload)
+            guard !Task.isCancelled else { return }
+            let wasReady = self.remoteReady
+            self.remoteReady = (error == nil)
+            if error == nil {
+                self.lastFingerprint = fingerprint
+            } else {
+                self.lastFingerprint = nil
+            }
+            if wasReady != self.remoteReady, let modelContext {
+                LocalNotificationManager.shared.rebuildAll(modelContext: modelContext, syncTodoRemote: false)
+            }
+        }
+    }
 }

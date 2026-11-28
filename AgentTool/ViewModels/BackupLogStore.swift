@@ -27,24 +27,46 @@ enum BackupLogStore {
     }
 
     static func log(category: String, action: String, result: String, detail: String = "", checksum: String = "", username: String? = nil, room: String = "", cloud: Bool = false) {
-        // v2.7（P1⑦ 跨账号日志公共区）：云端操作同时写本地日志——
-        // 此前 cloud:true 直接 return 不写本地，导致本机日志区只有 cloud:false 的操作，
-        // 跨账号同步回来的别人操作本机完全看不到。现在本机日志始终完整，云端日志区拉公共区。
-        if cloud {
-            CloudOps.log(category: category, action: action, result: result, detail: detail, room: room)
-        }
         writeLocal(makeEntry(category: category, action: action, result: result, detail: detail,
                              checksum: checksum, username: username, room: room))
+        // 云端区：服务器权威操作日志（2026-11-27 起不再走旧对象存储桶）。
+        if cloud {
+            CloudOps.log(category: category, action: action, result: result,
+                         detail: detail, room: room)
+        }
     }
 
-    /// v2.71：分享扩展可靠版——本地留痕同 log()，公共日志改「先入待补队→await 发送→成功出队」。
-    /// 扩展进程可能在发送途中被系统回收，fire-and-forget 会丢日志；入队在先则 App 启动/回前台必补推。
+    /// 分享扩展可靠版：本地留痕同 log()。旧对象存储公共日志上行已随旧链路下线。
     static func logAwait(category: String, action: String, result: String, detail: String = "", checksum: String = "", username: String? = nil, room: String = "", cloud: Bool = false) async {
         writeLocal(makeEntry(category: category, action: action, result: result, detail: detail,
                              checksum: checksum, username: username, room: room))
         if cloud {
-            await CloudOps.logAwait(category: category, action: action, result: result, detail: detail, room: room)
+            await CloudOps.logAwait(category: category, action: action, result: result,
+                                   detail: detail, room: room)
         }
+    }
+
+    /// b29：补传动作为一条日志收口。
+    /// 原失败路径只写本机「待同步」，补传成功后用这里把那条待同步记录替换成「成功」，
+    /// 不再追加第二条通用“把本机改动传上去”，从根上解决一次操作两条日志。
+    static func resolvePending(room: String, pendingRoom: String? = nil,
+                               action: String, result: String, detail: String,
+                               cloud: Bool = false) {
+        let pendingKey = pendingRoom ?? room
+        var list = all()
+        let before = list.count
+        list.removeAll { entry in
+            let entryRoom = entry.room ?? ""
+            return entry.result == "待同步" &&
+                (entryRoom == pendingKey || entryRoom == room)
+        }
+        if list.count != before {
+            if let data = try? JSONEncoder().encode(list) {
+                UserDefaults.standard.set(data, forKey: key)
+            }
+        }
+        log(category: "房源", action: action, result: result, detail: detail,
+            room: room, cloud: cloud)
     }
 
     private static func makeEntry(category: String, action: String, result: String, detail: String, checksum: String, username: String?, room: String) -> BackupLogEntry {

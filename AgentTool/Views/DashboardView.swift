@@ -191,6 +191,12 @@ struct DashboardView: View {
         return (meta.imageName, meta.icon, meta.label, meta.color, action)
     }
 
+    /// 服务器后台网页（8082 /admin），与房源/电表共用同一服务器端点
+    private var adminURL: URL {
+        let base = NotifyHub.shared.endpoint
+        return URL(string: base + "/admin") ?? URL(string: MeterCloudConfig.defaultEndpoint + "/admin")!
+    }
+
     private var currentMonth: Int {
         Calendar.current.component(.month, from: currentTime)
     }
@@ -804,9 +810,11 @@ struct DashboardView: View {
             QuickActionEditSheet(dashOrder: $qaDashOrder, moreOrder: $qaMoreOrder)
         }
         .sheet(isPresented: $showAdmin) {
-            // v1.37：App 内管理后台改用原生后台（获客分析/分享记录/桶管理），完全免登录、不走网页、无缓存问题；
-            // 需要手机/电脑自适应网页版时，在原生后台右上角「safari」一键跳浏览器（带免登录口令）
-            AdminDashboardView()
+            NavigationStack {
+                AdminWebView(url: adminURL)
+                    .navigationTitle("管理后台")
+                    .navigationBarTitleDisplayMode(.inline)
+            }
         }
         .sheet(isPresented: $showAddDeal) {
             NavigationStack { AddDealView() }
@@ -1570,7 +1578,7 @@ struct ImagePickerView: UIViewControllerRepresentable {
     }
 }
 
-// MARK: - v1.17 需求5 云端后台 WebView（App 内管理后台直接加载云端后台网页，免登录）
+// MARK: - 服务器后台 WebView（App 内打开服务器 admin-console 网页，登录会话 cookie 由 WKWebView 持久化维持）
 
 struct AdminWebView: UIViewRepresentable {
     let url: URL
@@ -1720,12 +1728,19 @@ struct UpdateDetailView: View {
     let update: UpdateCenter.Available
 
     @Environment(\.dismiss) private var dismiss
-    @StateObject private var downloader = UpdateDownloader()
+    @ObservedObject private var downloader = UpdateDownloader.shared
     @State private var showShareSheet = false
 
     private var sizeText: String {
         guard update.sizeBytes > 0 else { return "—" }
         return String(format: "%.1f MB", Double(update.sizeBytes) / 1_048_576)
+    }
+
+    private var downloadByteText: String {
+        let got = String(format: "%.1f MB", Double(downloader.receivedBytes) / 1_048_576)
+        guard downloader.expectedBytes > 0 else { return "已下载 \(got)" }
+        let total = String(format: "%.1f MB", Double(downloader.expectedBytes) / 1_048_576)
+        return "已下载 \(got) / \(total)"
     }
 
     private var primaryTitle: String {
@@ -1796,6 +1811,9 @@ struct UpdateDetailView: View {
                     if case .downloading = downloader.phase {
                         ProgressView(value: min(max(downloader.progress, 0), 1))
                             .tint(AppTheme.primary)
+                        Text(downloadByteText)
+                            .font(.system(size: 12))
+                            .foregroundColor(.themeText3)
                     }
                     if case let .failed(msg) = downloader.phase {
                         Text(msg)
@@ -1863,6 +1881,7 @@ struct UpdateDetailView: View {
             .background(AppTheme.background)
             .navigationTitle("发现新版本")
             .navigationBarTitleDisplayMode(.inline)
+            .onAppear { downloader.restoreIfDownloaded(update) }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("稍后") { dismiss() }

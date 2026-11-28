@@ -154,39 +154,21 @@ struct HouseLedgerView: View {
     private func reload() {
         events = HouseLedgerStore.events(roomKey: roomKey)
         sourceIsServer = false
-        sourceText = HouseServerMode.ready ? "本机镜像（待同步服务器）" : "本机镜像"
+        sourceText = "本机镜像"
     }
 
     private func refresh() async {
-        // 服务器模式：账本读服务器权威库，不再拉旧 COS ledger.json
-        if HouseServerMode.ready {
-            isSyncing = true
-            syncHint = nil
-            do {
-                let remoteEvents = try await HouseRemoteClient.shared.ledger(roomKey)
-                events = remoteEvents.map { HouseLedgerEvent(remote: $0) }
-                sourceIsServer = true
-                sourceText = "服务器账本"
-            } catch {
-                reload()
-                syncHint = "服务器账本读取失败，显示本机记录：\(error.localizedDescription)"
-            }
-            isSyncing = false
-            return
-        }
-        // 旧链路兜底：未接入服务器时走原 COS 账本
-        guard let config = CosConfig.load(), config.isValid else {
-            syncHint = "未配置存储桶，只显示本机记录"
-            return
-        }
+        // 账本读服务器权威库；未接入或读取失败时只显示本机记录
         isSyncing = true
         syncHint = nil
         do {
-            try await HouseLedgerStore.pull(roomKey: roomKey, config: config)
-            reload()
-            sourceText = "旧桶账本"
+            let remoteEvents = try await HouseRepository.shared.ledger(roomKey: roomKey)
+            events = remoteEvents.map { HouseLedgerEvent(remote: $0) }
+            sourceIsServer = true
+            sourceText = "服务器账本"
         } catch {
-            syncHint = "桶内刷新失败：\(error.localizedDescription)"
+            reload()
+            syncHint = "服务器账本读取失败，显示本机记录：\(error.localizedDescription)"
         }
         isSyncing = false
     }

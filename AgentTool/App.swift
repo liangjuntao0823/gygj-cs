@@ -9,7 +9,7 @@ final class TabRouter: ObservableObject {
     @Published var selectedTab: Int = 0
 }
 
-/// v2.41：快捷指令深链（gongyuguanjia://paste）——切到房源板块并唤起「新增房源」，进页面即解析剪贴板
+/// v2.41：快捷指令深链（gongyuguanjia-fwq://paste）——切到房源板块并唤起「新增房源」，进页面即解析剪贴板
 final class HouseImportIntent: ObservableObject {
     static let shared = HouseImportIntent()
     @Published var tick = 0
@@ -22,9 +22,8 @@ struct AgentToolApp: App {
     private let houseContainer: ModelContainer
     private let storageWarning: String?
     // v1.44：外部传入配置备份 json（文件 App「用其他 App 打开」）识别后的提示
-    @State private var configImportTip: String?
     @StateObject private var tabRouter = TabRouter()
-    // v2.51：电梯码全屏展示（gongyuguanjia://elevator 与设置页预览共用）
+    // v2.51：电梯码全屏展示（gongyuguanjia-fwq://elevator 与设置页预览共用）
     @StateObject private var elevatorCodeCenter = ElevatorCodeCenter.shared
     // b140：启动图——系统 LaunchScreen 显示静态图（不含版本号），App 首帧叠同一张图 + 动态版本号，0.5 秒内收起
     @State private var showLaunchSplash = true
@@ -44,7 +43,7 @@ struct AgentToolApp: App {
         // v1.40 第9点：本地根目录重建——启动时把 备份/Media 整体迁移到 Documents/media/（幂等，不丢数据）
         MediaStore.migrateLegacyMediaIfNeeded()
 
-        // v1.13 需求16：启动时执行一次性目录迁移——旧分区备份 JSON 迁入 备份/旧版备份/，COS 配置 json 迁入 备份/CosConfig/
+        // 启动时执行一次性目录迁移——旧分区备份 JSON 迁入 备份/旧版备份/
         DataBackupManager.migrateLegacyDirectories()
 
         // v1.8：先把此前「容器初始化失败时自动隔离」的主库文件找回原位（仅当当前默认 store 不存在时执行）。
@@ -94,6 +93,8 @@ struct AgentToolApp: App {
                 }
             }
         }
+        // b29：统一仓库层拿到 HouseStore 主 context；所有视图的房源读写都从这里进。
+        HouseRepository.shared.configure(context: houseContainer.mainContext)
     }
 
     /// v1.8：找回被隔离的主库文件（此前容器初始化失败时自动移入 backup_<时间戳> 的 store 文件）。
@@ -123,7 +124,27 @@ struct AgentToolApp: App {
         }
     }
 
-    /// 创建两个持久化 ModelContainer（主 App 经营数据 → 默认 store；房源数据 → Documents/备份/housekeeper.store）
+    /// 主库位置：钉死到本 App 容器内的独立文件，避免不同 App 共用同一份 SwiftData 默认库。
+    /// b8 起只钉路径，不再做首次启动复制：现有 AgentToolMain.store 直接打开；
+    /// 若不存在则新建空库，不再从旧共用库/其它 App 容器导入。
+    enum MainStoreLocation {
+        static let fileName = "AgentToolMain.store"
+        private static let migratedFromKey = "diag.mainStoreMigratedFrom"
+
+        /// 仅用于诊断页展示 b7 首次迁移的历史来源；b8 起不再复制。
+        static var migratedFrom: String {
+            UserDefaults.standard.string(forKey: migratedFromKey) ?? ""
+        }
+
+        static func perAppURL() -> URL {
+            let home = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+            let dir = home.appendingPathComponent("Library/Application Support", isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            return dir.appendingPathComponent(fileName)
+        }
+    }
+
+    /// 创建两个持久化 ModelContainer（主 App 经营数据 → 容器内 AgentToolMain.store；房源数据 → Documents/备份/housekeeper.store）
     private static func makePersistentContainers() throws -> (ModelContainer, ModelContainer) {
         let mainSchema = Schema([
             Property.self, RentMonthRecord.self, UtilityQuarterRecord.self, UtilitySettlementRecord.self, TodoItem.self,
@@ -131,7 +152,9 @@ struct AgentToolApp: App {
             PayoutRecord.self, PayoutMonthRecord.self, PayoutUtilityRecord.self, UtilitySettlementHistory.self
         ])
         let houseSchema = Schema([House.self, MediaItem.self])
-        let main = try ModelContainer(for: mainSchema)
+        let main = try ModelContainer(for: mainSchema, configurations: [
+            ModelConfiguration("MainStore", schema: mainSchema, url: MainStoreLocation.perAppURL())
+        ])
         let house = try ModelContainer(for: houseSchema, configurations: [
             ModelConfiguration("HouseStore", schema: houseSchema, url: DataRoot.url().appendingPathComponent("housekeeper.store"))
         ])
@@ -170,22 +193,12 @@ struct AgentToolApp: App {
                 } message: {
                     Text(storageWarning ?? "")
                 }
-                // v1.44：识别到外部传入的配置备份 json → 提示已导入，可去「云端配置 → 从备份文件恢复配置」还原
-                .alert("识别到配置备份", isPresented: Binding(
-                    get: { configImportTip != nil },
-                    set: { if !$0 { configImportTip = nil } }
-                )) {
-                    Button("去还原", role: .cancel) { }
-                } message: {
-                    Text(configImportTip ?? "")
-                }
                 // v1.13 需求17：其他 App 用「用其他 App 打开」把备份 zip 发过来时，复制进本地备份目录并提示去恢复
-                // v1.44：同时识别「备份配置到文件」生成的 json 配置备份——复制进 备份/CosConfig 并提示可还原
                 // v2.29：启动即拉一次云端配置（公告/更新记录/提示文案），不必等用户去同步房源
                 .task { _ = await RemoteConfig.refresh() }
                 .onOpenURL { url in
                     // v2.41：快捷指令「复制房源 → 录进公寓管家」深链，直接跳到新增房源并解析剪贴板
-                    if url.scheme?.lowercased() == "gongyuguanjia" {
+                    if url.scheme?.lowercased() == "gongyuguanjia-fwq" {
                         // v2.51：电梯码深链——全屏展示电梯二维码（不切房源、不触导入）
                         let host = (url.host ?? "").lowercased()
                         let path = url.path.lowercased()
@@ -197,12 +210,8 @@ struct AgentToolApp: App {
                         HouseImportIntent.shared.request()
                         return
                     }
-                    if url.pathExtension.lowercased() == "json",
-                       let tip = BackupImportHandler.handleIncomingConfigJSON(url) {
-                        configImportTip = tip
-                    } else {
-                        BackupImportHandler.handleIncomingZip(url)
-                    }
+                    // 旧对象存储配置导入已下线：只接受备份 zip
+                    BackupImportHandler.handleIncomingZip(url)
                 }
                 // v2.51：电梯码全屏页（URL Scheme / 设置页预览触发）
                 .fullScreenCover(isPresented: $elevatorCodeCenter.isPresenting) {
@@ -303,48 +312,6 @@ enum BackupImportHandler {
             BackupLogStore.log(category: "备份", action: "导入外部备份", result: "失败", detail: error.localizedDescription)
         }
     }
-
-    /// v1.44：外部传入「备份配置到文件」生成的 json 配置备份（文件 App → 用其他 App 打开 → 公寓管家）。
-    /// 识别：内容含 bucket / secretId 等配置字段 → 复制进 备份/CosConfig/ 目录 → 返回提示文本（App 弹窗）；
-    /// 非配置 json 返回 nil（忽略，不打断用户）。
-    static func handleIncomingConfigJSON(_ url: URL) -> String? {
-        let isScoped = url.startAccessingSecurityScopedResource()
-        defer { if isScoped { url.stopAccessingSecurityScopedResource() } }
-
-        guard url.pathExtension.lowercased() == "json" else { return nil }
-        guard let data = try? Data(contentsOf: url),
-              let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            print("配置导入跳过：无法解析 json \(url.lastPathComponent)")
-            return nil
-        }
-        let hasConfigFields = !(parsed["bucket"] as? String ?? "").isEmpty
-            && !(parsed["secretId"] as? String ?? "").isEmpty
-        guard hasConfigFields else {
-            print("配置导入跳过：不是配置备份 \(url.lastPathComponent)")
-            return nil
-        }
-        let fm = FileManager.default
-        let destDir = CosConfigStore.directory()
-        try? fm.createDirectory(at: destDir, withIntermediateDirectories: true)
-        var destName = url.lastPathComponent
-        var candidate = destDir.appendingPathComponent(destName)
-        var n = 2
-        while fm.fileExists(atPath: candidate.path) {
-            let stem = url.deletingPathExtension().lastPathComponent
-            destName = "\(stem)-\(n).json"
-            candidate = destDir.appendingPathComponent(destName)
-            n += 1
-        }
-        do {
-            try data.write(to: candidate, options: .atomic)
-            BackupLogStore.log(category: "配置", action: "导入配置备份", result: "成功", detail: destName)
-            return "已识别到配置备份文件并导入：\(destName)\n\n请到「设置 → 云端配置 → 从备份文件恢复配置」选择它即可一键还原存储桶 / 地域 / 密钥 / 云函数地址。"
-        } catch {
-            print("配置导入失败：写入目录出错 \(error.localizedDescription)")
-            BackupLogStore.log(category: "配置", action: "导入配置备份", result: "失败", detail: error.localizedDescription)
-            return nil
-        }
-    }
 }
 
 // 房源板块专用 ModelContext（独立 HouseStore 容器）。
@@ -371,6 +338,8 @@ struct MainTabView: View {
     @State private var showUpdateDetailFromPopup = false
     // v1.83：上次异常退出提示（检测到崩溃日志时弹一次，设置页可查看/导出）
     @State private var showCrashTip = false
+    /// b32：一次冷启动只自动检查一次更新，避免根视图 onAppear 被系统重复触发时反复弹窗。
+    @State private var didAutoCheckUpdate = false
 
     private let tabs = [
         (title: "工作台", icon: "house.fill"),
@@ -513,10 +482,15 @@ struct MainTabView: View {
         .onAppear {
             // v1.80：远程配置——先读本地缓存（断网可用），再异步拉取云端最新（联网更新缓存）
             RemoteConfig.loadCache()
+            // b34：已绑定旧账号若没有本机安装标识映射，启动时补一次，房源本机动作才不会被 Bark 重复推。
+            if NotifyHub.shared.isBound {
+                Task { await NotifyHub.shared.ensureSourceMapping() }
+            }
             // v2.21：每次进 App 都检查一次更新——先按本地缓存判断（离线也能显示），
             // 再复用同一次 config.json 拉取完成在线检查，不额外发请求。
             UpdateCenter.shared.evaluate()
-            if UpdateCenter.autoCheckEnabled {
+            if UpdateCenter.autoCheckEnabled && !didAutoCheckUpdate {
+                didAutoCheckUpdate = true
                 Task { await UpdateCenter.shared.checkOnLaunch() }
             }
             // v1.83：上次异常退出提示（崩溃日志存在时弹一次；设置→崩溃日志可导出定位）
@@ -538,13 +512,11 @@ struct MainTabView: View {
             MeterStore.shared.startAutoRefreshIfNeeded()
             refreshAutoBackupTimer()
             checkAutoBackup()
-            Task { await CloudBackupService.retryPendingUploads() }
-            Task { await CloudBackupService.enforceCloudRetention() }
-            // v2.67：补推上次没上云成功的公共操作日志
-            Task { await CloudOps.flushPending() }
             // v2.68：分享扩展配套——镜像非敏感配置进 App Group + 合并扩展写的本机日志
             SharedBridge.writeMirrors()
             BackupLogStore.mergeExtensionLogs()
+            // 补推上次因未绑定/弱网留在共享队列里的云端操作日志，成功后自动出队
+            Task { await CloudOps.flushPending() }
             // v2.71：收养分享扩展「本地待写账」——建/并房源实体、媒体搬进 Documents、
             // 写镜像与账本基线、失败挂任务中心；须在 bootstrap 前完成，重试绑定才看得到新房
             if let ctx = houseModelContext {
@@ -559,21 +531,7 @@ struct MainTabView: View {
                 TaskRetryPerformer.shared.bind(houseContext: houseModelContext)
             }
             SyncTaskCenter.shared.bootstrap()
-            // v2.45：历史日志一次性迁移到各房账本（幂等），随后合并上传待同步账本
-            // v2.46：把真实房源的房号集合传入，用于清理误建的畸形媒体目录
-            let validRoomKeys: Set<String> = {
-                guard let ctx = houseModelContext,
-                      let houses = try? ctx.fetch(FetchDescriptor<House>()) else { return [] }
-                return Set(houses.filter { !$0.isTrashed }.map { $0.mediaRoomKey })
-            }()
-            HouseLedgerMigrator.run(validRoomKeys: validRoomKeys)
-            // v2.47：清理历史账本里残留的笼统动作（如「媒体更新」），本地云端同清
-            HouseLedgerDeprecatedCleanup.run()
-            Task {
-                if let config = CosConfig.load(), config.isValid {
-                    await HouseLedgerStore.syncAll(roomKeys: HouseLedgerStore.dirtyRoomKeys(), config: config)
-                }
-            }
+            // 历史日志一次性迁移器 / 废弃动作清理器已随旧云链下线（#338）；类型定义保留，待旧类整组下线片移除。
             // b118（清单12：打开 App 轻量变更感知）：启动时轻量探测云端房源账本是否有变化
             // v2.62（A3）：同时记下「最近一次前台检测时间」，避免启动瞬间的 didBecomeActive 再补一次检测
             UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "cloudDetectLastForegroundAt")
@@ -588,13 +546,11 @@ struct MainTabView: View {
             LocalNotificationManager.shared.deliverMissedNotifications()
             LocalNotificationManager.shared.rebuildAll(modelContext: modelContext)
             checkAutoBackup()
-            // v1.12：回前台重试未上传的云端备份
-            Task { await CloudBackupService.retryPendingUploads() }
-            // v2.67：回前台补推积压的公共日志
-            Task { await CloudOps.flushPending() }
             // v2.68：回前台刷新配置镜像 + 合并分享扩展写的本机日志
             SharedBridge.writeMirrors()
             BackupLogStore.mergeExtensionLogs()
+            // 补推上次因未绑定/弱网留在共享队列里的云端操作日志，成功后自动出队
+            Task { await CloudOps.flushPending() }
             // v2.71：回前台同样收养分享待写账（分享完切回 App 即见新房，不用重启）
             if let ctx = houseModelContext {
                 let adopted = ShareLocalInbox.adoptAll(houseContext: ctx)
@@ -604,12 +560,6 @@ struct MainTabView: View {
                 }
             }
             // 房源媒体不再自动补传：失败任务留在任务中心，由用户手动点重试
-            // v2.45：回前台合并上传待同步账本
-            Task {
-                if let config = CosConfig.load(), config.isValid {
-                    await HouseLedgerStore.syncAll(roomKeys: HouseLedgerStore.dirtyRoomKeys(), config: config)
-                }
-            }
             // b118（清单12）：回前台同样做轻量变更感知
             // v2.62（A3）：加 5 分钟门槛——锁屏解锁也会触发 didBecomeActive，
             // 不设门槛会变成「一解锁就检测」；5 分钟内重复回前台直接跳过。
@@ -619,6 +569,8 @@ struct MainTabView: View {
                 UserDefaults.standard.set(nowForeground, forKey: "cloudDetectLastForegroundAt")
                 detectCloudLedgerChange()
             }
+            // b31：回前台不再自动补传/自动拉取。只保留上面的轻量变更检测（挂横幅），
+            // 服务器→本机、本机→服务器都由用户手动确认后执行。
             WidgetDataSync.sync(modelContext: modelContext)
         }
         // v2.68：退后台（含唤起共享菜单前）刷新配置镜像，保证分享扩展读到最新用户名/地址/哈希/压缩开关
@@ -767,8 +719,6 @@ struct MainTabView: View {
         Task {
             // v2.9（P1-1）：仅「云端有更新」广播提示；检测失败/无变化不广播（失败态由房源列表页 onAppear 单独提示）
             let state = await HouseListView.detectCloudLedgerChange(houseContext: houseModelContext)
-            // v2.62（B3）：检测完顺手补写积压的清单改动（队列为空时直接返回，不发请求）
-            await CloudManifestUpdater.shared.flush()
             guard state == .hasUpdate else { return }
             UserDefaults.standard.set(true, forKey: "cloudLedgerPendingHint")
             NotificationCenter.default.post(name: HouseListView.cloudLedgerChangedLight, object: nil)
@@ -864,12 +814,9 @@ struct MainTabView: View {
             defaults.set(slotKey, forKey: "autoBackupCompletedSlot")
             defaults.synchronize()
             BackupLogStore.log(category: "备份", action: "自动快速备份", result: "成功", detail: url.lastPathComponent, checksum: BackupV5Manager.sha1OfFile(at: url) ?? "")
-            // 自动上传云端（后台；失败入队下次重试）
-            Task {
-                await CloudBackupService.autoUploadFastBackup(zipURL: url, config: nil)
-                await MainActor.run {
-                    automaticBackupMessage = "自动备份成功：\(url.lastPathComponent)\n" + CloudBackupService.uploadState(of: url.lastPathComponent)
-                }
+            // 备份落本机磁盘；旧桶自动上传已下线
+            Task { @MainActor in
+                automaticBackupMessage = "自动备份成功：\(url.lastPathComponent)"
             }
             // 按保留天数清理旧自动备份（v1.12：只清理自动快速备份，手动备份不参与）
             cleanupAutoFastBackups(days: retentionDays())

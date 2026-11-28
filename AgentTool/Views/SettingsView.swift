@@ -53,7 +53,6 @@ struct SettingsView: View {
     @State private var clearType: DataBackupManager.BackupType? = nil
     @State private var showClearConfirm = false
     @State private var showVersionHistory = false
-    @State private var showMigration = false
     @State private var showBillTemplate = false
     @State private var showTrash = false   // v1.3：回收站入口从工作台移至设置页
     @State private var showTaskCenter = false   // 左上角常显按钮 → 任务中心
@@ -67,18 +66,6 @@ struct SettingsView: View {
     @State private var showBackupCenterRestore = false // 恢复选择器
     @State private var showLogsView = false           // 操作日志
     @State private var showCrashLogsView = false      // v1.17 需求2：崩溃日志查看器（内置，右上角导出 txt）
-    // v2.7（P2⑯）：手动触发桶孤儿媒体清理
-    @State private var showOrphanCleanConfirm = false
-    @State private var orphanCleanResult: String?
-    @State private var orphanCleaning = false
-    @State private var orphanList: [HouseListView.OrphanMedia] = []   // b117：扫描到的孤儿清单
-    @State private var showOrphanListConfirm = false                    // b117：列出清单后二次确认
-    // v2.47：扫描进度弹窗
-    @State private var scanFraction = 0.0
-    @State private var scanStageText = ""
-    @State private var orphanControl: HouseListView.OrphanScanControl?
-    @State private var orphanScanBackgrounded = false
-    @State private var orphanTaskID: UUID?
     @AppStorage("autoBackupRetentionDays") private var backupRetentionDays = 7   // 自动备份保留天数（默认7天，可调）
     @State private var autoBackupEnabled = false
     @State private var backupFrequency = "day"
@@ -120,7 +107,9 @@ struct SettingsView: View {
     private func updateStatusText() -> String {
         switch updateCenter.checkState {
         case .checking: return "检查中…"
-        case .failed: return "连不上云端"
+        case .failed:
+            if let d = updateCenter.failureDetail, !d.isEmpty { return "检查失败：\(d)" }
+            return "连不上云端"
         case .upToDate: return "已是最新"
         case .idle: return updateCenter.available == nil ? "" : "有新版本"
         }
@@ -139,7 +128,7 @@ struct SettingsView: View {
                 Label {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("我的用户名")
-                        Text("操作日志 / 分享 / 统计都带这个名字；在「云端配置」里可下拉选云端已有的用户名")
+                        Text("操作日志 / 分享 / 统计都带这个名字")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -152,12 +141,12 @@ struct SettingsView: View {
                     .foregroundColor(CloudUser.username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .red : .secondary)
             }
             NavigationLink {
-                CosConfigView()
+                ServerConfigView()
             } label: {
                 Label {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("云端配置")
-                        Text("COS 存储桶 / 密钥 / 自定义域名 / 云函数地址")
+                        Text("服务器配置")
+                        Text("服务器地址 / 授权 / 用户名")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -165,30 +154,16 @@ struct SettingsView: View {
                     Image(systemName: "server.rack")
                 }
             }
-            NavigationLink {
-                AdminPasswordView()
-            } label: {
-                Label {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("管理后台口令")
-                        Text("网页版登录用 · App 内自动免登录")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                } icon: {
-                    Image(systemName: "lock.shield")
-                }
-            }
         } header: {
             Text("账号与云端")
         } footer: {
-            Text("云端配置决定房源图片/视频传到哪个桶、分享卡片用哪个域名；配好后可导出部署包给别的房东自建后台。")
+            Text("服务器配置决定房源台账、图片/视频存到哪台服务器，媒体文件直接存该服务器本地磁盘。")
         }
     }
 
     // MARK: - 组 2：分享与展示
 
-    private static let shareSectionFooter = "这一组只决定「分享出去的东西长什么样、有效期多久、要不要水印和压缩」。桶、密钥、域名在上一组「账号与云端」里。"
+    private static let shareSectionFooter = "这一组只决定「分享出去的东西长什么样、有效期多久、要不要水印和压缩」。服务器地址与授权在上一组「账号与云端」里。"
     private var shareSection: some View {
         Section {
             NavigationLink {
@@ -280,8 +255,8 @@ struct SettingsView: View {
             } label: {
                 Label {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("重建全部分享链接")
-                        Text("清掉云端旧分享页后逐间重建；已经发出去的旧链接会立即失效")
+                        Text("刷新全部分享素材")
+                        Text("重传每套封面/视频首帧与二维码；旧链接继续有效，打开即最新")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -334,63 +309,6 @@ struct SettingsView: View {
                     Text(aiCacheSizeText())
                         .foregroundColor(.secondary)
                 }
-            }
-            // v2.7（P2⑯）：手动触发桶孤儿媒体清理——b117：先扫描列清单，用户确认后再删
-            Button {
-                startOrphanScan()
-            } label: {
-                Label {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(orphanCleaning ? "正在扫描云端…" : "清理桶孤儿媒体")
-                        Text("先列出孤儿名单+详细路径，确认后再删除；操作日志会记录")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                } icon: {
-                    Image(systemName: "trash.circle")
-                }
-            }
-            .disabled(orphanCleaning)
-
-            // b117：列出孤儿清单的确认弹窗
-            .alert("发现 \(orphanList.count) 个孤儿媒体", isPresented: $showOrphanListConfirm) {
-                Button("取消", role: .cancel) { orphanList = [] }
-                Button("确认删除", role: .destructive) {
-                    orphanCleaning = true
-                    Task {
-                    await MediaActivityGate.shared.beginCleanup()
-                    defer { Task { await MediaActivityGate.shared.endCleanup() } }
-                        do {
-                            guard let config = CosConfig.load() else {
-                                orphanCleanResult = "请先在「云端配置」填写 COS 配置"
-                                return
-                            }
-                            let list = orphanList
-                            let deleted = await HouseListView.deleteOrphanMedia(list, config: config)
-                            let paths = list.prefix(20).map { $0.path }.joined(separator: "\n")
-                            let more = list.count > 20 ? "\n…等共 \(list.count) 个" : ""
-                            BackupLogStore.log(category: "同步", action: "桶孤儿清理（手动）", result: deleted == list.count ? "成功" : "部分成功",
-                                               detail: "删除 \(deleted)/\(list.count) 个：\n\(paths)\(more)", cloud: true)
-                            orphanCleanResult = "已删除 \(deleted)/\(list.count) 个孤儿媒体（详见操作日志）"
-                        } catch {
-                            orphanCleanResult = "清理失败：\(error.localizedDescription)"
-                        }
-                        orphanList = []
-                        orphanCleaning = false
-                    }
-                }
-            } message: {
-                let preview = orphanList.prefix(15).map { $0.path }.joined(separator: "\n")
-                let more = orphanList.count > 15 ? "\n…等共 \(orphanList.count) 个" : ""
-                Text("以下文件不在任何房源账本名单里，将被删除：\n\(preview)\(more)")
-            }
-            .alert("桶孤儿清理", isPresented: Binding(
-                get: { orphanCleanResult != nil },
-                set: { if !$0 { orphanCleanResult = nil } }
-            )) {
-                Button("好", role: .cancel) { orphanCleanResult = nil }
-            } message: {
-                Text(orphanCleanResult ?? "")
             }
             Button {
                 openHouseDataFolder()
@@ -536,18 +454,6 @@ struct SettingsView: View {
                     }
                 } icon: {
                     Image(systemName: "folder")
-                }
-            }
-            Button { showMigration = true } label: {
-                Label {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("换机迁移")
-                        Text("导出 .zfgj 迁移包拷到新手机，一次性复制；不是日常同步")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                } icon: {
-                    Image(systemName: "iphone.and.arrow.forward")
                 }
             }
             NavigationLink {
@@ -800,6 +706,9 @@ struct SettingsView: View {
             )) {
                 Label("启动时自动检查更新", systemImage: "arrow.triangle.2.circlepath")
             }
+            Text("关闭后只是不在启动时自动查版本；上面的「检查更新」仍可手动使用。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
             HStack {
                 Label("开发者", systemImage: "person")
                 Spacer()
@@ -837,14 +746,6 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             settingsFormFull
-        }
-        .overlay {
-            if orphanCleaning && !orphanScanBackgrounded {
-                OrphanScanProgressOverlay(
-                    fraction: scanFraction, stage: scanStageText,
-                    onBackground: { orphanScanBackgrounded = true },
-                    onCancel: { Task { await orphanControl?.cancel() } })
-            }
         }
     }
 
@@ -896,82 +797,6 @@ struct SettingsView: View {
             }
     }
 
-    /// 开扫：建控制令牌与中心任务，注册重试入口（重试时整体重新建一套）
-    @MainActor
-    private func startOrphanScan() {
-        orphanCleaning = true
-        orphanScanBackgrounded = false
-        scanFraction = 0
-        let control = HouseListView.OrphanScanControl()
-        orphanControl = control
-        orphanTaskID = SyncTaskCenter.shared.begin(
-            kind: .orphan, title: "清理桶孤儿媒体", total: 1)
-        TaskRetryPerformer.shared.orphanScan = {
-            await startOrphanScanAndRun()
-        }
-        Task {
-            await MediaActivityGate.shared.beginCleanup()
-            defer { Task { await MediaActivityGate.shared.endCleanup() } }
-            await runOrphanScan(control: control)
-        }
-    }
-
-    /// 重试入口：重新建一套令牌与任务再跑
-    @MainActor
-    private func startOrphanScanAndRun() async {
-        orphanCleaning = true
-        orphanScanBackgrounded = false
-        scanFraction = 0
-        let control = HouseListView.OrphanScanControl()
-        orphanControl = control
-        orphanTaskID = SyncTaskCenter.shared.begin(
-            kind: .orphan, title: "清理桶孤儿媒体", total: 1)
-        await MediaActivityGate.shared.beginCleanup()
-        defer { Task { await MediaActivityGate.shared.endCleanup() } }
-        await runOrphanScan(control: control)
-    }
-
-    /// 孤儿扫描主流程（手动触发与任务中心重试共用）。
-    /// 取消：立即停止扫描，一个文件都不删，进最近完成并写明已取消。
-    @MainActor
-    private func runOrphanScan(control: HouseListView.OrphanScanControl) async {
-        guard let id = orphanTaskID else { return }
-        do {
-            guard let config = CosConfig.load() else {
-                orphanCleanResult = "请先在「云端配置」填写 COS 配置"
-                SyncTaskCenter.shared.finish(id: id, success: false,
-                                            failure: "没读到 COS 配置，先到「云端配置」填好再重试")
-                orphanCleaning = false
-                return
-            }
-            let list = try await HouseListView.scanOrphanMedia(config: config, control: control) { done, total, room in
-                Task { @MainActor in
-                    scanFraction = Double(done) / Double(max(1, total))
-                    scanStageText = room.isEmpty ? "正在列桶…" : "正在核对 \(room)（\(done)/\(total)）"
-                    SyncTaskCenter.shared.advance(id: id, done: done, total: max(1, total),
-                                                  note: "正在核对 \(room)")
-                }
-            }
-            if await control.isCancelled {
-                // 取消本次：停止扫描，不删任何文件
-                SyncTaskCenter.shared.cancel(id: id, note: "已取消本次扫描，未删除任何文件")
-                orphanCleanResult = "已取消本次扫描，未删除任何文件"
-            } else if list.isEmpty {
-                orphanCleanResult = "扫描完成：没有发现孤儿媒体"
-                SyncTaskCenter.shared.finish(id: id, success: true, note: "没有发现孤儿媒体")
-            } else {
-                orphanList = list
-                SyncTaskCenter.shared.finish(id: id, success: true,
-                                            note: "发现 \(list.count) 个孤儿，确认名单后再删")
-                showOrphanListConfirm = true
-            }
-        } catch {
-            orphanCleanResult = "扫描失败：\(error.localizedDescription)"
-            SyncTaskCenter.shared.finish(id: id, success: false,
-                                        failure: "扫描失败：\(error.localizedDescription)，点重试")
-        }
-        orphanCleaning = false
-    }
 
     /// 导航栏（回收站入口）与进入页面时的初始化
     private var settingsFormChrome: some View {
@@ -1036,7 +861,7 @@ struct SettingsView: View {
                 // v2.23：前 6 组改成一级菜单，内容进二级页；最下面「关于」保持原样
                 Section {
                     settingsRow("账号与云端", icon: "person.crop.circle",
-                                subtitle: "我的用户名 · 云端配置（桶/密钥/域名）· 管理后台口令") { AccountSettingsPage() }
+                                subtitle: "我的用户名 · 服务器地址") { AccountSettingsPage() }
                     settingsRow("分享与展示", icon: "square.and.arrow.up",
                                 subtitle: "名片 · 公开选房链接 · 有效期 · 水印 · 压缩 · 重建分享链接") { ShareSettingsPage() }
                     settingsRow("备份与安全", icon: "externaldrive.badge.checkmark",
@@ -1047,10 +872,12 @@ struct SettingsView: View {
                                 subtitle: "电表监控 · 安居客后台 · AI 助手") { ServicesSettingsPage() }
                     settingsRow("云端推送", icon: "bell.badge.fill",
                                 subtitle: notifyHub.isBound
-                                    ? "\(notifyHub.username.isEmpty ? "已绑定" : notifyHub.username) · \(notifyHub.devices.count) 台设备 · 电表通知\(notifyHub.channelEnabled && notifyHub.meterModuleEnabled ? "开" : "关")"
-                                    : "未绑定 · 电表告警 / 将来到期收租通知") { CloudPushSettingsView() }
+                                    ? "\(notifyHub.username.isEmpty ? "已绑定" : notifyHub.username) · \(notifyHub.devices.count) 台设备 · 业务通知\(notifyHub.channelEnabled ? "开" : "关")"
+                                    : "未绑定 · 电表 / 房源 / 待办推送") { CloudPushSettingsView() }
+                    settingsRow("后台与运营", icon: "chart.bar.xaxis",
+                                subtitle: "远程配置 · 获客分析 · 分享记录 · 后台密码") { AdminOpsSettingsPage() }
                     settingsRow("存储与清理", icon: "internaldrive",
-                                subtitle: "数据文件夹 · AI 产物 · 下载的安装包 · 桶孤儿媒体") { StorageSettingsPage() }
+                                subtitle: "数据文件夹 · AI 产物 · 下载的安装包 · 服务器孤儿媒体") { StorageSettingsPage() }
                     // v2.51：电梯码（全屏展示 + 更换 + 一键打开方式）
                     settingsRow("电梯码", icon: "qrcode",
                                 subtitle: "全屏展示 · 更换二维码 · 一键打开方式") { ElevatorCodeSettingsPage() }
@@ -1107,9 +934,6 @@ struct SettingsView: View {
             .sheet(isPresented: $showVersionHistory) {
                 VersionHistoryView()
             }
-            .sheet(isPresented: $showMigration) {
-                MigrationView()
-            }
             .sheet(isPresented: $showBillTemplate) {
                 BillTemplateSettingsView()
             }
@@ -1141,14 +965,14 @@ struct SettingsView: View {
             }
             // v1.6：房源分享缓存刷新（二级确认，防止误触导致全部链接失效）
             // v1.54：升级为「全量重建」——云端旧分享页全部删除（旧链接立即失效），并给每间房重新生成最新 H5
-            .confirmationDialog("重建全部房源分享链接", isPresented: $showHouseCacheConfirm, titleVisibility: .visible) {
-                Button("清空并重建全部", role: .destructive) {
+            .confirmationDialog("刷新全部房源分享素材", isPresented: $showHouseCacheConfirm, titleVisibility: .visible) {
+                Button("刷新全部", role: .none) {
                     ShareCacheStore.clearAll()
                     rebuildAllShareH5()
                 }
                 Button("取消", role: .cancel) {}
             } message: {
-                Text("将重建全部房源的分享链接：云端旧分享页全部删除（旧链接立即失效），并为每间房重新生成最新 H5。确定继续吗？")
+                Text("将重新上传每套的 400px 封面、640px 视频首帧和二维码到服务器；已经发出去的分享链接不会失效，打开就是最新素材。")
             }
             .alert("重建全部分享链接", isPresented: Binding(
                 get: { houseCacheTip != nil },
@@ -1173,49 +997,24 @@ struct SettingsView: View {
 
     // MARK: - 逻辑
 
-    // v1.54：全量重建全部房源的脱敏版分享 H5——
-    // 云端旧分享页全部删除（旧链接立即失效）+ 每间房重新生成最新 H5（无媒体房源只删旧页不生成）
+    // App 内分享不生成 H5 分享链接；旧桶遮罩分享页重建入口保留占位，不再回退旧桶
     private func rebuildAllShareH5() {
-        guard let ctx = houseModelContext,
-              let config = CosConfig.load(), config.isValid else {
-            houseCacheTip = "请先到「云端配置」填写 COS 配置并验证通过"
+        guard houseModelContext != nil else {
+            houseCacheTip = "数据容器不可用，请重启 App 后重试"
             return
         }
-        let houses = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
-        let active = houses.filter { !($0.isDeleted ?? false) }
-        let profile = CosUploader.loadShareProfile()
-        // 主线程先拷贝全部值类型，Task 内不再触碰 SwiftData 模型
-        let items = active.map { h -> (files: [ShareMediaFile], roomKey: String, info: ShareHouseInfo) in
-            (
-                h.mediaItems.map { ShareMediaFile(name: $0.fileName, kind: $0.kind) },
-                h.mediaRoomKey,
-                ShareHouseInfo(
-                    displayRoomNo: h.displayRoomNo,
-                    towerLabel: h.towerLabel,
-                    layout: h.layout,
-                    statusLabel: h.status.label,
-                    priceText: h.priceText,
-                    landlord: h.landlord,
-                    password: h.password,
-                    remark: h.remark,
-                    name: profile.name,
-                    phone: profile.phone
-                )
-            )
+        // 新架构 H5 由服务器按签名实时渲染，无需重建页面；这里刷新每套的分享封面/视频首帧与二维码，
+        // 已经发出去的旧链接继续有效，打开即看到最新图片和名片。
+        let houses = HouseRepository.shared.fetchAllSorted().filter { !$0.mediaItems.isEmpty }
+        let keys = houses.map { $0.mediaRoomKey }
+        let media = houses.map { h in
+            h.mediaItems.map { ShareMediaFile(name: $0.fileName, kind: $0.kind) }
         }
-        houseCacheTip = "正在重建 \(active.count) 套房源的分享链接…"
         Task {
-            var ok = 0, fail = 0
-            for it in items {
-                do {
-                    _ = try await CosUploader.autoRegenerateMaskedShare(mediaFiles: it.files, roomKey: it.roomKey, info: it.info, config: config)
-                    ok += 1
-                } catch {
-                    fail += 1
-                }
-            }
+            await ShareAssetUploader.prepare(roomKeys: keys, mediaByRoom: media)
+            _ = await ShareAssetUploader.ensureQRCode()
             await MainActor.run {
-                houseCacheTip = "分享链接已全部重建：\(ok) 间成功" + (fail > 0 ? "，\(fail) 间失败（可再次刷新重试）" : "") + "\n旧分享链接已全部失效"
+                houseCacheTip = keys.isEmpty ? "本机还没有带照片/视频的房源" : "已刷新 \(keys.count) 套的分享封面/首帧与二维码；旧链接继续有效"
             }
         }
     }
@@ -1248,10 +1047,7 @@ struct SettingsView: View {
         if kind == .fast {
             if let url = BackupV5Manager.createFastBackup(mainContext: modelContext, houseContext: houseCtx) {
                 BackupLogStore.log(category: "备份", action: "快速备份", result: "成功", detail: url.lastPathComponent, checksum: BackupV5Manager.sha1OfFile(at: url) ?? "")
-                Task {
-                    await CloudBackupService.autoUploadFastBackup(zipURL: url, config: nil)
-                }
-                showMessage = RemoteConfig.tip("quickBackupOk", "快速备份成功：{file}\n已自动上传云端（若网络失败会在下次打开 App 时自动重试）").replacingOccurrences(of: "{file}", with: url.lastPathComponent)
+                showMessage = RemoteConfig.tip("quickBackupOk", "快速备份成功：{file}").replacingOccurrences(of: "{file}", with: url.lastPathComponent)
             } else {
                 showMessage = "快速备份失败，请检查存储空间"
             }
@@ -1454,72 +1250,6 @@ struct CrashLogDetailView: View {
         }
     }
 }
-
-// MARK: - v1.17 需求10 三端互通详细介绍及使用说明
-
-struct InterconnectionInfoView: View {
-    var body: some View {
-        Form {
-            Section {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("你的公寓管家由三个端协同工作：")
-                        .font(.subheadline)
-                    Text("① 手机 App（本地经营数据 + 房源分享）\n② 腾讯云函数 gongyu-stats（云端统计与后台网关）\n③ 云端后台网页（网页 / App 内打开的后台）")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
-            } header: {
-                Text("三端是什么")
-            }
-
-            Section {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("• 每次生成新的分享 H5 链接，访客点开时页面会自动、静默地向云函数发一次访问记录（房号 + 模式 + 来源）。").font(.footnote)
-                    Text("• 云函数把记录追加写入云端桶 statistics/ 下的按日文件，后台的获客统计由这些真实记录聚合而来。").font(.footnote)
-                    Text("• 房源文字 + 媒体存云端桶 h/；云端操作记录（带用户名）存 h/_ops.json，同桶多用户可见是谁在操作。").font(.footnote)
-                    Text("• 后台可「清空访问统计」一键删除所有埋点记录（含 test101 等测试数据）。").font(.footnote)
-                }
-            } header: {
-                Text("数据是怎么流动的")
-            }
-
-            Section {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("• App 内「管理后台」= 云端后台网页，直接用 App 打开，免登录（自动带口令哈希）。").font(.footnote)
-                    Text("• 网页版打开同一地址需输入后台口令。口令可在 App 设置里修改，保存后自动同步到云函数与云端后台。").font(.footnote)
-                    Text("• 分享记录按用户名隔离存云端桶（h/_share_records_<用户名>.json），各用户只看自己发的分享。").font(.footnote)
-                    Text("• 桶文件管理逐级浏览，点进房源文件夹会自动展开 media/ 直接看媒体文件；顶部有「储存用量」卡片显示总占用与分项。").font(.footnote)
-                }
-            } header: {
-                Text("后台怎么打开")
-            }
-
-            Section {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("• 单用户：填好云函数地址 + 桶配置 + 用户名即可，房源/备份自动上传云端，后台看统计与用量。").font(.footnote)
-                    Text("• 多用户：几台手机填同一套桶配置、各自填不同用户名，房源云端共享（一台录入另一台下拉同步可见）；名片/水印/统计/备份按用户名隔离，互不读取。").font(.footnote)
-                    Text("• 操作日志分「本机 / 云端」两区：本机操作记本地，本机发起的云端操作记到云端区；云端区显示操作者用户名。").font(.footnote)
-                }
-            } header: {
-                Text("单用户 / 多用户")
-            }
-
-            Section {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("• 分享 H5 的缓存存在本地，「刷新分享缓存」只清理本机缓存，不影响云端。").font(.footnote)
-                    Text("• 房源板块下拉刷新 / 左上角手动同步都是拉取云端房源到本地，效果一致。").font(.footnote)
-                    Text("• 云端后台每个板块顶部有「刷新」按钮；操作日志云端区可下拉刷新。").font(.footnote)
-                    Text("• 版本更新记录在「设置 → 关于」查看；本说明随 v1.37 提供。").font(.footnote)
-                }
-            } header: {
-                Text("缓存与刷新")
-            }
-        }
-        .navigationTitle("三端互通说明")
-        .navigationBarTitleDisplayMode(.inline)
-    }
-}
-
 // MARK: - 版本更新介绍
 struct VersionHistoryView: View {
     // v2.29：进页面先拉一次云端配置再渲染——此前只在「同步云端房源」和“检查更新”时刷新，
@@ -1531,6 +1261,14 @@ struct VersionHistoryView: View {
     @State private var cloudFailed = false
     @State private var didLoadCloud = false
     let versions: [(version: String, date: String, changes: [String])] = [
+        ("v1.0-b29", "2026-11-28", [
+            "修复：名片保存后返回再进被清空——保存后回读钥匙串校验，进页面同时刷新姓名/电话，不再只刷新二维码",
+            "修复：隐藏版 H5 分享跳微信无内容——分享面板改为从最顶层控制器直呈，不再套在 SwiftUI sheet 内",
+            "修复：设置页“检查更新”误报连不上云端——增加公开在线更新接口兜底，并显示真实失败原因",
+            "修复：离线待同步日志写明具体改动（如“修改备注 空 改 测试”），补传成功后就地收口为一条成功日志；任务中心“上传房源改动”卡片显示改了什么",
+            "新增：设置 > 账号与云端显示服务器磁盘已用/剩余/房源媒体占用，可手动刷新",
+            "重构：房源视图与任务中心统一走 HouseRepository 仓库层，数据读写和服务器同步不再各写一套",
+        ]),
         ("v2.72", "2026-11-22", [
             "修复：【首期晚于当前月的房源，首期打勾后卡片仍挂「待收」、工作台还催上一月】——未收判定和应收期全部改为直接读取收租计划（月度收租记录），计划没覆盖的月份不再被当成欠租：首期之前不催租，首期已交、下期尚远显示已收；同时对齐桌面小组件未收计数、本地推送提醒、AI 欠租清单和导出表的本月状态，口径与收租计划一致",
             "修复：【账单带附加费时首次弹出的分享面板一片空白，关掉重开第二次才正常】——账单分享面板改为从最顶层控制器直呈（与房源分享视频同一套直呈写法），不再套在刚收起的附加费表单弹层上；账单图仍先压成 JPEG 临时文件再交给系统分享，大图不卡死",
@@ -2222,92 +1960,6 @@ struct BillTemplateSettingsView: View {
     }
 }
 
-// MARK: - v1.36 管理后台口令（网页版登录用；App 内免登录直接带哈希）
-
-struct AdminPasswordView: View {
-    @Environment(\.dismiss) private var dismiss
-    @State private var password = CloudConfig.adminPassword
-    @State private var confirm = ""
-    @State private var savedFlash = false
-    @State private var resultMsg: String?
-    @State private var errorMsg: String?
-
-    var body: some View {
-        Form {
-            Section {
-                SecureField("后台口令", text: $password)
-                SecureField("再次输入确认", text: $confirm)
-            } header: {
-                Text("口令设置")
-            } footer: {
-                Text("网页版管理后台用此口令登录；App 内打开后台免登录。默认口令 12345678，建议修改为不易猜的字符。v1.17 需求6：保存后会自动同步到云函数（云端后台、网页后台同用此口令）。")
-            }
-            Section {
-                Button("保存") { save() }
-            }
-            if let errorMsg {
-                Section {
-                    Text(errorMsg).foregroundStyle(.red)
-                }
-            }
-        }
-        .navigationTitle("管理后台口令")
-        .navigationBarTitleDisplayMode(.inline)
-        .alert("已保存", isPresented: Binding(
-            get: { savedFlash },
-            set: { if !$0 { savedFlash = false } }
-        )) {
-            Button("好", role: .cancel) { dismiss() }
-        } message: {
-            Text(resultMsg ?? "后台口令已更新：\(password)")
-        }
-    }
-
-    private func save() {
-        let trimmed = password.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.count >= 6 else {
-            errorMsg = "口令至少 6 位"
-            return
-        }
-        guard trimmed == confirm else {
-            errorMsg = "两次输入不一致"
-            return
-        }
-        // v1.17 需求6：记录旧口令哈希用于云函数鉴权，再更新本地
-        let oldHash = CloudConfig.passwordHash
-        CloudConfig.adminPassword = trimmed
-        resultMsg = "本地口令已更新：\(trimmed)"
-        savedFlash = true
-        // 异步同步到云函数（改桶内 h/_admin_pwd.json）
-        Task {
-            let tip = await syncCloud(oldHash: oldHash, new: trimmed)
-            await MainActor.run { resultMsg = tip }
-        }
-    }
-
-    /// v1.17 需求6：调用云函数 setPwd 把新口令同步到云端（成功后云端后台与网页后台立即用新口令）
-    private func syncCloud(oldHash: String, new: String) async -> String {
-        guard let encoded = new.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-              let url = URL(string: "\(CloudConfig.functionURL)?act=setPwd&k=\(oldHash)&new=\(encoded)") else {
-            return "已保存到本地，但同步云函数失败（云函数地址无效）。\n网页版后台仍用旧口令，请稍后在设置页重试。"
-        }
-        do {
-            let (data, resp) = try await URLSession.shared.data(from: url)
-            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-            if code == 401 {
-                return "已保存到本地；但云端同步被拒绝（口令校验失败）。\n请确认云函数已部署后重试。"
-            }
-            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any], obj["ok"] as? Bool == true {
-                return "本地 + 云端后台口令均已更新：\(new)"
-            }
-            return "已保存到本地；云端同步未确认，请稍后重试。"
-        } catch {
-            return "已保存到本地；云端同步失败（网络错误：\(error.localizedDescription)）"
-        }
-    }
-}
-
-
 // MARK: - v2.18：全量备份进度枢纽
 /// 全量备份打包耗时可达几十秒（含照片视频），进度只在这里写、View 只读。
 /// 写入口径：BackupV5Manager.createFullBackup 的 progress 回调本身已切回主线程。
@@ -2322,6 +1974,26 @@ final class FullBackupProgressHub: ObservableObject {
 
 // MARK: 组 1 账号与云端
 struct AccountSettingsPage: View {
+    @State private var storage: RemoteStorageStats?
+    @State private var storageError: String?
+    @State private var loadingStorage = false
+
+    private func loadStorage() async {
+        loadingStorage = true
+        storageError = nil
+        do {
+            storage = try await HouseRepository.shared.fetchStorageStats()
+        } catch {
+            storage = nil
+            storageError = error.localizedDescription
+        }
+        loadingStorage = false
+    }
+
+    private func bytes(_ n: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: n, countStyle: .file)
+    }
+
     var body: some View {
         Form {
             Section {
@@ -2329,7 +2001,7 @@ struct AccountSettingsPage: View {
                     Label {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("我的用户名")
-                            Text("操作日志 / 分享 / 统计都带这个名字；在「云端配置」里可下拉选云端已有的用户名")
+                            Text("操作日志 / 分享 / 统计都带这个名字")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
@@ -2342,12 +2014,12 @@ struct AccountSettingsPage: View {
                         .foregroundColor(CloudUser.username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .red : .secondary)
                 }
                 NavigationLink {
-                    CosConfigView()
+                    ServerConfigView()
                 } label: {
                     Label {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("云端配置")
-                            Text("COS 存储桶 / 密钥 / 自定义域名 / 云函数地址")
+                            Text("服务器配置")
+                            Text("服务器地址 / 授权 / 用户名")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
@@ -2355,28 +2027,59 @@ struct AccountSettingsPage: View {
                         Image(systemName: "server.rack")
                     }
                 }
-                NavigationLink {
-                    AdminPasswordView()
+                // b29：服务器磁盘用量（已用 / 剩余 / 媒体占用），点整行刷新
+                Button {
+                    Task { await loadStorage() }
                 } label: {
-                    Label {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("管理后台口令")
-                            Text("网页版登录用 · App 内自动免登录")
-                                .font(.caption2)
+                    HStack {
+                        Label {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("服务器磁盘")
+                                if let storage, storage.diskTotal > 0 {
+                                    Text("已用 \(bytes(storage.diskUsed)) / 共 \(bytes(storage.diskTotal))")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                    Text("剩余 \(bytes(storage.diskFree))" + (storage.mediaBytes.map { " · 房源媒体 \(bytes($0))" } ?? ""))
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                } else if loadingStorage {
+                                    Text("读取中…")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                } else if let storageError {
+                                    Text("读取失败：\(storageError)")
+                                        .font(.caption2)
+                                        .foregroundStyle(.red)
+                                        .lineLimit(2)
+                                } else {
+                                    Text("点此读取服务器磁盘用量")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        } icon: {
+                            Image(systemName: "internaldrive")
+                        }
+                        Spacer()
+                        if loadingStorage {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.footnote)
                                 .foregroundStyle(.secondary)
                         }
-                    } icon: {
-                        Image(systemName: "lock.shield")
                     }
                 }
+                .buttonStyle(.plain)
             } header: {
                 Text("账号与云端")
             } footer: {
-                Text("云端配置决定房源图片/视频传到哪个桶、分享卡片用哪个域名；配好后可导出部署包给别的房东自建后台。")
+                Text("服务器配置决定房源台账、图片/视频存到哪台服务器，媒体文件直接存该服务器本地磁盘。")
             }
         }
         .navigationTitle("账号与云端")
         .navigationBarTitleDisplayMode(.inline)
+        .task { await loadStorage() }
     }
 }
 
@@ -2466,6 +2169,8 @@ struct ShareSettingsPage: View {
                     set: { newValue in
                         compressOnShare = newValue
                         UserDefaults.standard.set(newValue, forKey: "compressOnShare")
+                        // 分享扩展与主 App 上传保持同一压缩口径
+                        SharedBridge.defaults.set(newValue, forKey: SharedBridge.kCompress)
                     }
                 )) {
                     VStack(alignment: .leading, spacing: 2) {
@@ -2508,14 +2213,14 @@ struct ShareSettingsPage: View {
         } message: {
             Text(showMessage)
         }
-        .confirmationDialog("重建全部房源分享链接", isPresented: $showHouseCacheConfirm, titleVisibility: .visible) {
-            Button("清空并重建全部", role: .destructive) {
+        .confirmationDialog("刷新全部房源分享素材", isPresented: $showHouseCacheConfirm, titleVisibility: .visible) {
+            Button("刷新全部", role: .none) {
                 ShareCacheStore.clearAll()
                 rebuildAllShareH5()
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("将重建全部房源的分享链接：云端旧分享页全部删除（旧链接立即失效），并为每间房重新生成最新 H5。确定继续吗？")
+            Text("将重新上传每套的 400px 封面、640px 视频首帧和二维码到服务器；已经发出去的分享链接不会失效，打开就是最新素材。")
         }
         .alert("重建全部分享链接", isPresented: Binding(
             get: { houseCacheTip != nil },
@@ -2528,45 +2233,22 @@ struct ShareSettingsPage: View {
     }
 
     private func rebuildAllShareH5() {
-        guard let ctx = houseModelContext,
-              let config = CosConfig.load(), config.isValid else {
-            houseCacheTip = "请先到「云端配置」填写 COS 配置并验证通过"
+        guard houseModelContext != nil else {
+            houseCacheTip = "数据容器不可用，请重启 App 后重试"
             return
         }
-        let houses = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
-        let active = houses.filter { !($0.isDeleted ?? false) }
-        let profile = CosUploader.loadShareProfile()
-        let items = active.map { h -> (files: [ShareMediaFile], roomKey: String, info: ShareHouseInfo) in
-            (
-                h.mediaItems.map { ShareMediaFile(name: $0.fileName, kind: $0.kind) },
-                h.mediaRoomKey,
-                ShareHouseInfo(
-                    displayRoomNo: h.displayRoomNo,
-                    towerLabel: h.towerLabel,
-                    layout: h.layout,
-                    statusLabel: h.status.label,
-                    priceText: h.priceText,
-                    landlord: h.landlord,
-                    password: h.password,
-                    remark: h.remark,
-                    name: profile.name,
-                    phone: profile.phone
-                )
-            )
+        // 新架构 H5 由服务器按签名实时渲染，无需重建页面；这里刷新每套的分享封面/视频首帧与二维码，
+        // 已经发出去的旧链接继续有效，打开即看到最新图片和名片。
+        let houses = HouseRepository.shared.fetchAllSorted().filter { !$0.mediaItems.isEmpty }
+        let keys = houses.map { $0.mediaRoomKey }
+        let media = houses.map { h in
+            h.mediaItems.map { ShareMediaFile(name: $0.fileName, kind: $0.kind) }
         }
-        houseCacheTip = "正在重建 \(active.count) 套房源的分享链接…"
         Task {
-            var ok = 0, fail = 0
-            for it in items {
-                do {
-                    _ = try await CosUploader.autoRegenerateMaskedShare(mediaFiles: it.files, roomKey: it.roomKey, info: it.info, config: config)
-                    ok += 1
-                } catch {
-                    fail += 1
-                }
-            }
+            await ShareAssetUploader.prepare(roomKeys: keys, mediaByRoom: media)
+            _ = await ShareAssetUploader.ensureQRCode()
             await MainActor.run {
-                houseCacheTip = "分享链接已全部重建：\(ok) 间成功" + (fail > 0 ? "，\(fail) 间失败（可再次刷新重试）" : "") + "\n旧分享链接已全部失效"
+                houseCacheTip = keys.isEmpty ? "本机还没有带照片/视频的房源" : "已刷新 \(keys.count) 套的分享封面/首帧与二维码；旧链接继续有效"
             }
         }
     }
@@ -2697,7 +2379,6 @@ struct BackupSettingsPage: View {
     @State private var showBackupKindSheet = false
     @State private var showOfflineRestoreConfirm = false
     @State private var showBackupCenterBrowse = false
-    @State private var showMigration = false
     @State private var showBackupCenterRestore = false
     @State private var showLogsView = false
     @State private var showCrashLogsView = false
@@ -2831,18 +2512,6 @@ struct BackupSettingsPage: View {
                         Image(systemName: "folder")
                     }
                 }
-                Button { showMigration = true } label: {
-                    Label {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("换机迁移")
-                            Text("导出 .zfgj 迁移包拷到新手机，一次性复制；不是日常同步")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                    } icon: {
-                        Image(systemName: "iphone.and.arrow.forward")
-                    }
-                }
                 NavigationLink {
                     MediaPendingView()
                 } label: {
@@ -2930,9 +2599,6 @@ struct BackupSettingsPage: View {
         .sheet(isPresented: $showLogsView) {
             BackupLogsView()
         }
-        .sheet(isPresented: $showMigration) {
-            MigrationView()
-        }
         .sheet(isPresented: $showCrashLogsView) {
             CrashLogsView()
         }
@@ -3013,10 +2679,7 @@ struct BackupSettingsPage: View {
         if kind == .fast {
             if let url = BackupV5Manager.createFastBackup(mainContext: modelContext, houseContext: houseCtx) {
                 BackupLogStore.log(category: "备份", action: "快速备份", result: "成功", detail: url.lastPathComponent, checksum: BackupV5Manager.sha1OfFile(at: url) ?? "")
-                Task {
-                    await CloudBackupService.autoUploadFastBackup(zipURL: url, config: nil)
-                }
-                showMessage = RemoteConfig.tip("quickBackupOk", "快速备份成功：{file}\n已自动上传云端（若网络失败会在下次打开 App 时自动重试）").replacingOccurrences(of: "{file}", with: url.lastPathComponent)
+                showMessage = RemoteConfig.tip("quickBackupOk", "快速备份成功：{file}").replacingOccurrences(of: "{file}", with: url.lastPathComponent)
             } else {
                 showMessage = "快速备份失败，请检查存储空间"
             }
@@ -3082,15 +2745,6 @@ struct StorageSettingsPage: View {
     @State private var showAlert = false
     @State private var showAICacheConfirm = false
     @State private var showIpaClearConfirm = false
-    @State private var orphanCleaning = false
-    @State private var orphanCleanResult: String?
-    @State private var orphanList: [HouseListView.OrphanMedia] = []
-    @State private var showOrphanListConfirm = false
-    @State private var scanFraction = 0.0
-    @State private var scanStageText = ""
-    @State private var orphanControl: HouseListView.OrphanScanControl?
-    @State private var orphanTaskID: UUID?
-    @State private var orphanScanBackgrounded = false
 
     /// v2.23：已下载的安装包占用文案（个数 · 大小）
     private func downloadedPackagesText() -> String {
@@ -3156,10 +2810,38 @@ struct StorageSettingsPage: View {
                             .foregroundColor(.secondary)
                     }
                 }
+                NavigationLink {
+                    HouseOrphanMediaView()
+                } label: {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("清理服务器孤儿媒体")
+                            Text("扫描 media_v2/houses 下没有房源引用的文件；先列名单，确认后才删")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: "server.rack")
+                    }
+                }
                 Button {
                     openHouseDataFolder()
                 } label: {
                     Label("打开「文件」App 查看数据文件夹", systemImage: "folder")
+                }
+                NavigationLink {
+                    DataPathDiagnosticsView()
+                } label: {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("数据路径诊断")
+                            Text("主库/房源库真实路径、SHA256 指纹、App Group 与跨 App 探针")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: "doc.text.magnifyingglass")
+                    }
                 }
             } header: {
                 Text("存储与清理")
@@ -3167,38 +2849,9 @@ struct StorageSettingsPage: View {
                 Text("数据存放在「公寓管家」文件夹内的 backups / media 两个子文件夹；换机或重装时整个文件夹拷回原位即可还原。")
             }
 
-            Section {
-                Button {
-                    startOrphanScan()
-                } label: {
-                    Label {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(orphanCleaning ? "正在扫描云端…" : "清理桶孤儿媒体")
-                            Text("先列出孤儿名单+详细路径，确认后再删除；操作日志会记录")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                    } icon: {
-                        Image(systemName: "trash.circle")
-                    }
-                }
-                .disabled(orphanCleaning)
-            } header: {
-                Text("云端清理")
-            } footer: {
-                Text("只删不在任何房源账本名单里的桶内媒体对象，不影响正在使用的照片视频。")
-            }
         }
         .navigationTitle("存储与清理")
         .navigationBarTitleDisplayMode(.inline)
-        .overlay {
-            if orphanCleaning && !orphanScanBackgrounded {
-                OrphanScanProgressOverlay(
-                    fraction: scanFraction, stage: scanStageText,
-                    onBackground: { orphanScanBackgrounded = true },
-                    onCancel: { Task { await orphanControl?.cancel() } })
-            }
-        }
         .alert("提示", isPresented: $showAlert) {
             Button("确定", role: .cancel) { }
         } message: {
@@ -3224,45 +2877,6 @@ struct StorageSettingsPage: View {
         } message: {
             Text("将删除 Updates 文件夹里已下载的全部 .ipa（不影响已安装的 App，也不影响下次更新下载）。")
         }
-        .alert("发现 \(orphanList.count) 个孤儿媒体", isPresented: $showOrphanListConfirm) {
-            Button("取消", role: .cancel) { orphanList = [] }
-            Button("确认删除", role: .destructive) {
-                orphanCleaning = true
-                Task {
-                await MediaActivityGate.shared.beginCleanup()
-                defer { Task { await MediaActivityGate.shared.endCleanup() } }
-                    do {
-                        guard let config = CosConfig.load() else {
-                            orphanCleanResult = "请先在「云端配置」填写 COS 配置"
-                            return
-                        }
-                        let list = orphanList
-                        let deleted = await HouseListView.deleteOrphanMedia(list, config: config)
-                        let paths = list.prefix(20).map { $0.path }.joined(separator: "\n")
-                        let more = list.count > 20 ? "\n…等共 \(list.count) 个" : ""
-                        BackupLogStore.log(category: "同步", action: "桶孤儿清理（手动）", result: deleted == list.count ? "成功" : "部分成功",
-                                           detail: "删除 \(deleted)/\(list.count) 个：\n\(paths)\(more)", cloud: true)
-                        orphanCleanResult = "已删除 \(deleted)/\(list.count) 个孤儿媒体（详见操作日志）"
-                    } catch {
-                        orphanCleanResult = "清理失败：\(error.localizedDescription)"
-                    }
-                    orphanList = []
-                    orphanCleaning = false
-                }
-            }
-        } message: {
-            let preview = orphanList.prefix(15).map { $0.path }.joined(separator: "\n")
-            let more = orphanList.count > 15 ? "\n…等共 \(orphanList.count) 个" : ""
-            Text("以下文件不在任何房源账本名单里，将被删除：\n\(preview)\(more)")
-        }
-        .alert("桶孤儿清理", isPresented: Binding(
-            get: { orphanCleanResult != nil },
-            set: { if !$0 { orphanCleanResult = nil } }
-        )) {
-            Button("好", role: .cancel) { orphanCleanResult = nil }
-        } message: {
-            Text(orphanCleanResult ?? "")
-        }
     }
 
     private func openHouseDataFolder() {
@@ -3274,135 +2888,10 @@ struct StorageSettingsPage: View {
         }
     }
 
-    /// 开扫：建令牌与中心任务，注册重试入口
-    @MainActor
-    private func startOrphanScan() {
-        orphanCleaning = true
-        orphanScanBackgrounded = false
-        scanFraction = 0
-        let control = HouseListView.OrphanScanControl()
-        orphanControl = control
-        orphanTaskID = SyncTaskCenter.shared.begin(
-            kind: .orphan, title: "清理桶孤儿媒体", total: 1)
-        TaskRetryPerformer.shared.orphanScan = {
-            await startOrphanScanAndRun()
-        }
-        Task {
-            await MediaActivityGate.shared.beginCleanup()
-            defer { Task { await MediaActivityGate.shared.endCleanup() } }
-            await runOrphanScan(control: control)
-        }
-    }
-
-    /// 重试入口：重新建一套再跑
-    @MainActor
-    private func startOrphanScanAndRun() async {
-        orphanCleaning = true
-        orphanScanBackgrounded = false
-        scanFraction = 0
-        let control = HouseListView.OrphanScanControl()
-        orphanControl = control
-        orphanTaskID = SyncTaskCenter.shared.begin(
-            kind: .orphan, title: "清理桶孤儿媒体", total: 1)
-        await MediaActivityGate.shared.beginCleanup()
-        defer { Task { await MediaActivityGate.shared.endCleanup() } }
-        await runOrphanScan(control: control)
-    }
-
-    /// 孤儿扫描主流程（手动触发与任务中心重试共用）；取消即停止扫描，一个文件都不删
-    @MainActor
-    private func runOrphanScan(control: HouseListView.OrphanScanControl) async {
-        guard let id = orphanTaskID else { return }
-        do {
-            guard let config = CosConfig.load() else {
-                orphanCleanResult = "请先在「云端配置」填写 COS 配置"
-                SyncTaskCenter.shared.finish(id: id, success: false,
-                                            failure: "没读到 COS 配置，先到「云端配置」填好再重试")
-                orphanCleaning = false
-                return
-            }
-            let list = try await HouseListView.scanOrphanMedia(config: config, control: control) { done, total, room in
-                Task { @MainActor in
-                    scanFraction = Double(done) / Double(max(1, total))
-                    scanStageText = room.isEmpty ? "正在列桶…" : "正在核对 \(room)（\(done)/\(total)）"
-                    SyncTaskCenter.shared.advance(id: id, done: done, total: max(1, total),
-                                                  note: "正在核对 \(room)")
-                }
-            }
-            if await control.isCancelled {
-                SyncTaskCenter.shared.cancel(id: id, note: "已取消本次扫描，未删除任何文件")
-                orphanCleanResult = "已取消本次扫描，未删除任何文件"
-            } else if list.isEmpty {
-                orphanCleanResult = "扫描完成：没有发现孤儿媒体"
-                SyncTaskCenter.shared.finish(id: id, success: true, note: "没有发现孤儿媒体")
-            } else {
-                orphanList = list
-                SyncTaskCenter.shared.finish(id: id, success: true,
-                                            note: "发现 \(list.count) 个孤儿，确认名单后再删")
-                showOrphanListConfirm = true
-            }
-        } catch {
-            orphanCleanResult = "扫描失败：\(error.localizedDescription)"
-            SyncTaskCenter.shared.finish(id: id, success: false,
-                                        failure: "扫描失败：\(error.localizedDescription)，点重试")
-        }
-        orphanCleaning = false
-    }
 }
 
 
-// v2.47：桶孤儿媒体扫描进度弹窗
-struct OrphanScanProgressOverlay: View {
-    let fraction: Double
-    let stage: String
-    var onBackground: () -> Void = {}
-    var onCancel: () -> Void = {}
-
-    var body: some View {
-        ZStack {
-            Color.black.opacity(0.35).ignoresSafeArea()
-            VStack(spacing: 14) {
-                ProgressView(value: max(0, min(1, fraction)))
-                    .progressViewStyle(.linear)
-                    .tint(.white)
-                Text(stage.isEmpty ? "正在扫描云端…" : stage)
-                    .font(.footnote.weight(.medium))
-                    .foregroundColor(.white)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
-                Text("\(Int(max(0, min(1, fraction)) * 100))%")
-                    .font(.caption)
-                    .foregroundColor(.white.opacity(0.85))
-                HStack(spacing: 12) {
-                    Button {
-                        onBackground()
-                    } label: {
-                        Text("后台运行")
-                            .font(.footnote.weight(.medium))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 12).padding(.vertical, 7)
-                            .background(Color.white.opacity(0.18), in: Capsule())
-                    }
-                    Button {
-                        onCancel()
-                    } label: {
-                        Text("取消本次")
-                            .font(.footnote.weight(.medium))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 12).padding(.vertical, 7)
-                            .background(Color.white.opacity(0.18), in: Capsule())
-                    }
-                }
-            }
-            .padding(22)
-            .frame(maxWidth: 300)
-            .background(Color.black.opacity(0.65))
-            .clipShape(RoundedRectangle(cornerRadius: 14))
-        }
-    }
-}
-
-// MARK: - v2.51 电梯码快捷入口（gongyuguanjia://elevator）
+// MARK: - v2.51 电梯码快捷入口（gongyuguanjia-fwq://elevator）
 
 /// 全局电梯码展示状态：URL Scheme / 设置页预览 都走这里
 final class ElevatorCodeCenter: ObservableObject {
@@ -3553,7 +3042,7 @@ struct ElevatorCodeSettingsPage: View {
     @State private var reloadTick = 0
     @State private var alertText: String?
 
-    private let deepLink = "gongyuguanjia://elevator"
+    private let deepLink = "gongyuguanjia-fwq://elevator"
 
     var body: some View {
         Form {
@@ -3693,5 +3182,242 @@ struct ElevatorCodeSettingsPage: View {
         } message: {
             Text(alertText ?? "")
         }
+    }
+}
+
+// MARK: - b30：App 内后台管理（远程配置 / 获客分析 / 分享记录 / 改后台密码）
+
+struct ShareInsightView: View {
+    @State private var days = 30
+    @State private var stats: [String: Any] = [:]
+    @State private var loading = false
+    @State private var tip = ""
+
+    var body: some View {
+        Form {
+            Section {
+                Picker("统计范围", selection: $days) {
+                    Text("近 7 天").tag(7)
+                    Text("近 30 天").tag(30)
+                    Text("近 90 天").tag(90)
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: days) { _, _ in Task { await load() } }
+            }
+            Section("概览") {
+                metricRow("访问量", stats["visits"])
+                metricRow("访客数", stats["visitors"])
+                metricRow("生成分享", stats["shares"])
+            }
+            listSection("按天", key: "daily", nameKey: "date", countKey: "visits", title: "日期")
+            listSection("分享方式", key: "modes", nameKey: "mode", countKey: "visits", title: "方式")
+            listSection("房源热度", key: "rooms", nameKey: "roomKey", countKey: "visits", title: "房号")
+            listSection("访问来源", key: "refs", nameKey: "ref", countKey: "visits", title: "来源")
+            if loading { Section { ProgressView() } }
+            if !tip.isEmpty { Section { Text(tip).font(.footnote).foregroundStyle(.secondary) } }
+        }
+        .navigationTitle("获客分析")
+        .onAppear { Task { await load() } }
+    }
+
+    private func metricRow(_ title: String, _ value: Any?) -> some View {
+        HStack { Text(title); Spacer(); Text("\(intValue(value))").bold() }
+    }
+
+    private func listSection(_ title: String, key: String, nameKey: String,
+                             countKey: String, title column: String) -> some View {
+        let rows = (stats[key] as? [[String: Any]]) ?? []
+        return Section(title) {
+            if rows.isEmpty {
+                Text("暂无数据").font(.footnote).foregroundStyle(.secondary)
+            } else {
+                ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                    HStack {
+                        Text("\(row[nameKey] as? String ?? "-")").font(.footnote)
+                        Spacer()
+                        Text("\(intValue(row[countKey])) 次").font(.footnote).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+    private func intValue(_ any: Any?) -> Int {
+        if let i = any as? Int { return i }
+        if let n = any as? NSNumber { return n.intValue }
+        if let s = any as? String { return Int(s) ?? 0 }
+        return 0
+    }
+
+    private func load() async {
+        guard HouseServerMode.ready else { tip = "未连接服务器"; return }
+        loading = true
+        defer { loading = false }
+        do {
+            stats = try await HouseRemoteClient.shared.fetchShareStats(days: days)
+            tip = "统计从新版分享上线后开始累计；不含访客原始 IP。"
+        } catch {
+            tip = "加载失败：\(error.localizedDescription)"
+        }
+    }
+}
+
+struct ShareRecordsView: View {
+    @State private var records: [[String: Any]] = []
+    @State private var loading = false
+    @State private var tip = ""
+
+    var body: some View {
+        List {
+            if records.isEmpty, !loading {
+                Text("还没有分享记录").foregroundStyle(.secondary)
+            }
+            ForEach(Array(records.enumerated()), id: \.offset) { _, r in
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text(kindLabel(r["kind"] as? String ?? ""))
+                            .font(.footnote).bold()
+                        Text(r["mode"] as? String == "full" ? "完整版" : "隐藏版")
+                            .font(.caption2).foregroundStyle(.secondary)
+                        Spacer()
+                        if r["revoked"] as? Bool == true {
+                            Text("已失效").font(.caption2).foregroundStyle(.red)
+                        }
+                    }
+                    Text(roomsText(r)).font(.caption2).foregroundStyle(.secondary)
+                    if let url = r["url"] as? String, !url.isEmpty {
+                        Text(url).font(.caption2).lineLimit(1).textSelection(.enabled)
+                    }
+                    Text("\(r["ts"] as? String ?? "") · 到期 \(r["expiresAt"] as? String ?? "-")")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            if loading { ProgressView() }
+            if !tip.isEmpty { Text(tip).font(.footnote).foregroundStyle(.secondary) }
+        }
+        .navigationTitle("分享记录")
+        .onAppear { Task { await load() } }
+    }
+
+    private func kindLabel(_ kind: String) -> String {
+        switch kind {
+        case "collection": return "合集"
+        case "list": return "公开选房页"
+        default: return "单房"
+        }
+    }
+
+    private func roomsText(_ r: [String: Any]) -> String {
+        if let keys = r["roomKeys"] as? [String], !keys.isEmpty {
+            return keys.joined(separator: "、")
+        }
+        return r["roomKey"] as? String ?? "-"
+    }
+
+    private func load() async {
+        guard HouseServerMode.ready else { tip = "未连接服务器"; return }
+        loading = true
+        defer { loading = false }
+        do { records = try await HouseRemoteClient.shared.fetchShareRecords() }
+        catch { tip = "加载失败：\(error.localizedDescription)" }
+    }
+}
+
+struct AdminPasswordView: View {
+    @State private var current = ""
+    @State private var newPassword = ""
+    @State private var confirm = ""
+    @State private var saving = false
+    @State private var tip = ""
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        Form {
+            Section {
+                SecureField("当前后台密码", text: $current)
+                SecureField("新密码", text: $newPassword)
+                SecureField("再次输入新密码", text: $confirm)
+            } footer: {
+                Text("改的是网页管理后台（/admin）的密码，初始为 admin/admin。App 登录只用于验证身份，不改服务器授权码。")
+            }
+            Section {
+                Button {
+                    Task { await save() }
+                } label: {
+                    Label(saving ? "正在修改…" : "修改后台密码", systemImage: "key.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .disabled(saving || current.isEmpty || newPassword.isEmpty)
+            }
+            if !tip.isEmpty { Section { Text(tip) } }
+        }
+        .navigationTitle("后台密码")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func save() async {
+        guard newPassword == confirm else { tip = "两次输入的新密码不一致"; return }
+        guard newPassword.count >= 4 else { tip = "新密码至少 4 位"; return }
+        guard HouseServerMode.ready else { tip = "未连接服务器"; return }
+        saving = true; defer { saving = false }
+        do {
+            try await HouseRemoteClient.shared.adminChangePassword(current: current, newPassword: newPassword)
+            tip = "后台密码已更新 ✅ 请用新密码登录网页后台。"
+            current = ""; newPassword = ""; confirm = ""
+        } catch { tip = error.localizedDescription }
+    }
+}
+
+
+struct AdminOpsSettingsPage: View {
+    var body: some View {
+        List {
+            NavigationLink {
+                RemoteConfigAdminView()
+            } label: {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("远程配置")
+                        Text("公告 · 功能开关 · 数值参数 · 提示文案 · 在线更新 · AI 模型 · 版本记录")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                } icon: { Image(systemName: "slider.horizontal.3") }
+            }
+            NavigationLink {
+                ShareInsightView()
+            } label: {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("获客分析")
+                        Text("访问量 · 访客数 · 分享数 · 来源与房源热度")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                } icon: { Image(systemName: "chart.line.uptrend.xyaxis") }
+            }
+            NavigationLink {
+                ShareRecordsView()
+            } label: {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("分享记录")
+                        Text("单房 / 合集 / 公开选房页的链接、有效期与失效状态")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                } icon: { Image(systemName: "link.badge.plus") }
+            }
+            NavigationLink {
+                AdminPasswordView()
+            } label: {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("后台密码")
+                        Text("修改网页管理后台 admin 的登录密码")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                } icon: { Image(systemName: "key.fill") }
+            }
+        }
+        .navigationTitle("后台与运营")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }

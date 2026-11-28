@@ -2,10 +2,10 @@ import Foundation
 import CryptoKit
 
 // MARK: - v1.80 远程配置中心
-/// 三级兜底：云端 config.json（COS 桶根，权威）→ 本地缓存（Documents/Config/config_cache.json）→ 代码内置默认值
+/// 三级兜底：服务器远程配置（/api/house/config，权威）→ 本地缓存（Documents/Config/config_cache.json）→ 代码内置默认值
 /// 联网时 App 启动 / 每次云端同步成功调用 refresh() 拉取最新并更新缓存；
 /// 断网时读本地缓存；首次安装无缓存时用内置默认值（= 与现状完全一致）。
-/// 后台可视化编辑入口：云端后台「远程配置」页（云函数 config_save 写桶根 config.json）。
+/// 后台可视化编辑入口：服务器管理后台「远程配置」页。
 enum RemoteConfig {
     struct Announcement: Codable {
         var enabled: Bool
@@ -39,6 +39,26 @@ enum RemoteConfig {
         var aiModels: [AIModelInfo]? = nil
         /// v2.21：App 在线更新（云端后台「App 更新」填写；桶里只存最新一个包）
         var update: UpdateInfo? = nil
+
+        /// b29：公开更新接口只返回 update/changelog/minimumVersion 三块，
+        /// 合成 Decodable 对缺失的非可选字段会抛 keyNotFound；这里统一按缺省值解码。
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            version = try c.decodeIfPresent(Int.self, forKey: .version) ?? 0
+            updatedAt = try c.decodeIfPresent(String.self, forKey: .updatedAt)
+            updatedBy = try c.decodeIfPresent(String.self, forKey: .updatedBy)
+            announcement = try c.decodeIfPresent(Announcement.self, forKey: .announcement)
+            minimumVersion = try c.decodeIfPresent(String.self, forKey: .minimumVersion)
+            tips = try c.decodeIfPresent([String: String].self, forKey: .tips) ?? [:]
+            features = try c.decodeIfPresent([String: Bool].self, forKey: .features) ?? [:]
+            params = try c.decodeIfPresent([String: Double].self, forKey: .params) ?? [:]
+            helpTexts = try c.decodeIfPresent([String: String].self, forKey: .helpTexts) ?? [:]
+            changelog = try c.decodeIfPresent([ChangelogEntry].self, forKey: .changelog)
+            aiModels = try c.decodeIfPresent([AIModelInfo].self, forKey: .aiModels)
+            update = try c.decodeIfPresent(UpdateInfo.self, forKey: .update)
+        }
+
+        init() {}
     }
 
     /// v2.21：App 更新信息（云端 config.json 的 update 块）
@@ -48,7 +68,7 @@ enum RemoteConfig {
         var releasedAt: String?
         var sizeBytes: Int?
         var notes: [String]?
-        /// 桶内对象路径（优先），如 update/公寓管家2.21-b144.ipa
+        /// 服务器媒体路径（优先），如 update/公寓管家2.21-b144.ipa
         var objectKey: String?
         /// 备用 https 直链（objectKey 为空时使用）
         var downloadURL: String?
@@ -59,6 +79,8 @@ enum RemoteConfig {
 
     private static var _current = Payload()
     static var current: Payload { _current }
+    /// 最近一次配置/更新拉取的错误原文，设置页用于区分“令牌失效 / 超时 / 网络断”
+    private(set) static var lastRefreshError: String?
 
     /// 配置缓存目录：Documents/Config/（随「备份」体系一起被文件 App 备份）
     private static var cacheDir: URL {
@@ -83,64 +105,54 @@ enum RemoteConfig {
         }
     }
 
-    /// 拉取云端最新配置并更新缓存（联网时调用：App 启动 + 每次云端同步成功后）
-    /// v2.21：改为返回是否拉取成功（在线更新检查要用它区分「已是最新」与「连不上云端」）
+    /// 拉取服务器最新配置并更新缓存（联网时调用：App 启动 + 每次云端同步成功后）
+    /// 返回是否拉取成功（在线更新检查据此区分「已是最新」与「连不上服务器」）
     @discardableResult
     static func refresh() async -> Bool {
-        // v2.31：三重兜底——① 默认域名签名拉 config.json（自定义域名签名一旦不通，以前会一直读旧缓存，
-        //        表现就是「版本更新介绍」永远停在旧版本）；② 自定义域名；③ 云函数 configGet（不需要签名）
-        if let config = CosConfig.load() {
-            let plain = CosConfig(bucket: config.bucket, region: config.region,
-                                  secretId: config.secretId, secretKey: config.secretKey, customDomain: "")
-            if await fetchConfig(using: plain) { return true }
-            if !config.customDomain.isEmpty, await fetchConfig(using: config) { return true }
-        }
-        return await fetchConfigFromFunction()
-    }
-
-    /// 走 COS 预签名拉 config.json
-    private static func fetchConfig(using config: CosConfig) async -> Bool {
+        #if !APP_EXTENSION
         do {
-            let url = try CosUploader.presignedGetURL(for: "config.json", expires: 300, config: config)
-            var request = URLRequest(url: url)
-            request.httpMethod = "GET"
-            request.timeoutInterval = 12
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse else { return false }
-            if http.statusCode == 404 { return false }   // 云端未配置：保持默认/缓存
-            guard (200...299).contains(http.statusCode) else { return false }
+            let client = HouseRemoteClient.shared
+            let dict = try await client.fetchConfig()
+            let data = try JSONSerialization.data(withJSONObject: dict)
             let p = try JSONDecoder().decode(Payload.self, from: data)
             _current = p
-            try? Data(data).write(to: cacheURL, options: .atomic)
+            try? data.write(to: cacheURL, options: .atomic)
+            lastRefreshError = nil
             return true
         } catch {
+            lastRefreshError = error.localizedDescription
             return false
         }
+        #else
+        return false
+        #endif
     }
 
-    /// 走云函数 configGet（填了云函数地址就能用，不受 COS 签名影响）
-    private static func fetchConfigFromFunction() async -> Bool {
-        let base = CloudConfig.functionURL
-        guard !base.isEmpty else { return false }
-        let u = CloudUser.username.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-        guard let url = URL(string: "\(base)?act=configGet&k=\(CloudConfig.passwordHash)&u=\(u)") else { return false }
+    /// b29：检查更新的兜底通道。
+    /// /api/house/config 需要房源库授权，令牌过期/权限收紧时会把“只是查更新”误报成“连不上云端”；
+    /// 公开更新块只含非敏感的 update/changelog/minimumVersion，可独立完成检查。
+    @discardableResult
+    static func refreshPublicUpdate() async -> Bool {
+        #if !APP_EXTENSION
         do {
-            var request = URLRequest(url: url)
-            request.httpMethod = "GET"
-            request.timeoutInterval = 12
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else { return false }
-            struct Resp: Decodable { let ok: Bool?; let config: Payload? }
-            let r = try JSONDecoder().decode(Resp.self, from: data)
-            guard r.ok == true, let p = r.config else { return false }
-            _current = p
-            if let raw = try? JSONEncoder().encode(p) {
-                try? raw.write(to: cacheURL, options: .atomic)
+            let dict = try await HouseRemoteClient.shared.fetchPublicUpdate()
+            let data = try JSONSerialization.data(withJSONObject: dict)
+            let p = try JSONDecoder().decode(Payload.self, from: data)
+            if let update = p.update { _current.update = update }
+            if let changelog = p.changelog { _current.changelog = changelog }
+            if let minimumVersion = p.minimumVersion { _current.minimumVersion = minimumVersion }
+            if let cached = try? JSONEncoder().encode(_current) {
+                try? cached.write(to: cacheURL, options: .atomic)
             }
+            lastRefreshError = nil
             return true
         } catch {
+            lastRefreshError = error.localizedDescription
             return false
         }
+        #else
+        return false
+        #endif
     }
 
     // MARK: - 便捷读取（内置默认兜底，未配置时与 v1.79 行为完全一致）
@@ -199,6 +211,8 @@ final class UpdateCenter: ObservableObject {
     @Published private(set) var available: Available?
     @Published private(set) var checkState: CheckState = .idle
     @Published private(set) var lastCheckedAt: Date?
+    /// 检查失败的原始原因（设置页副标题显示，避免一律归成“连不上云端”）
+    @Published private(set) var failureDetail: String?
     /// v2.22：启动弹窗（只在每次冷启动检查出有新版本时置一次；关掉即清空）
     @Published private(set) var launchPopupVersion: String?
 
@@ -281,7 +295,11 @@ final class UpdateCenter: ObservableObject {
 
     private func runCheck(showPopup: Bool) async {
         checkState = .checking
-        let ok = await RemoteConfig.refresh()
+        // b32：检查更新先走公开更新块。它不依赖房源库授权，令牌过期/未绑定时
+        // 也能真实判断有没有新版本；公开块失败才回退到需要授权的完整配置接口。
+        var ok = await RemoteConfig.refreshPublicUpdate()
+        if !ok { ok = await RemoteConfig.refresh() }
+        failureDetail = ok ? nil : (RemoteConfig.lastRefreshError ?? "网络请求超时")
         evaluate()
         if available != nil {
             checkState = .idle
@@ -294,30 +312,38 @@ final class UpdateCenter: ObservableObject {
             launchPopupVersion = a.version
         }
     }
-
-    /// 回前台节流检查（6 小时内不重复联网）
-    @MainActor
-    static func checkIfDue() {
-        guard autoCheckEnabled else { return }
-        let last = UserDefaults.standard.double(forKey: lastCheckKey)
-        guard Date().timeIntervalSince1970 - last > 6 * 3600 else { return }
-        Task { await UpdateCenter.shared.runCheck(showPopup: false) }
-    }
 }
 
-/// 安装包下载器：桶内取（优先）或直链下载 → 存到 Documents/Updates/ → 可选 sha256 校验
+/// 安装包下载器：服务器媒体取（优先）或直链下载 → 存到 Documents/Updates/ → 可选 sha256 校验
 @MainActor
 final class UpdateDownloader: ObservableObject {
+    /// 更新详情页可能被「稍后」关闭或从设置页重新进入；下载器和已下载文件必须跨页面保留。
+    static let shared = UpdateDownloader()
+
     enum Phase: Equatable {
         case idle, downloading, verifying, ready, failed(String)
     }
 
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var progress: Double = 0
+    @Published private(set) var receivedBytes: Int64 = 0
+    @Published private(set) var expectedBytes: Int64 = 0
     @Published private(set) var localURL: URL?
 
     private var task: URLSessionDownloadTask?
-    private var timer: Timer?
+    private var progressTimer: Timer?
+    private var pendingURLs: [URL] = []
+    private var activeUpdate: UpdateCenter.Available?
+    private var lastFailure = ""
+    private let progressDelegate = UpdateDownloadProgressDelegate()
+    private lazy var session: URLSession = {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+        cfg.timeoutIntervalForRequest = 120
+        cfg.timeoutIntervalForResource = 300
+        return URLSession(configuration: cfg, delegate: progressDelegate,
+                          delegateQueue: nil)
+    }()
 
     var isBusy: Bool {
         if case .downloading = phase { return true }
@@ -325,49 +351,146 @@ final class UpdateDownloader: ObservableObject {
         return false
     }
 
+    /// 重新进入详情页时优先复用已下载好的包；文件被清理/不完整才重新下载。
+    func restoreIfDownloaded(_ update: UpdateCenter.Available) {
+        guard !isBusy else { return }
+        let name = update.objectKey.isEmpty
+            ? "公寓管家\(update.version).ipa"
+            : (update.objectKey as NSString).lastPathComponent
+        let dest = Self.downloadsDirectory().appendingPathComponent(name)
+        if case .ready = phase, localURL?.lastPathComponent == name { return }
+        if case .ready = phase {
+            phase = .idle
+            progress = 0
+            localURL = nil
+        }
+        guard FileManager.default.fileExists(atPath: dest.path) else { return }
+        let actualSize = (try? dest.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        if update.sizeBytes > 0, actualSize != update.sizeBytes { return }
+        if !update.sha256.isEmpty, let data = try? Data(contentsOf: dest) {
+            let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            if hash.lowercased() != update.sha256.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+                return
+            }
+        }
+        localURL = dest
+        progress = 1
+        receivedBytes = Int64(actualSize)
+        expectedBytes = Int64(update.sizeBytes)
+        phase = .ready
+    }
+
     func start(_ update: UpdateCenter.Available) {
         guard !isBusy else { return }
-        var url: URL?
-        if !update.objectKey.isEmpty, let config = CosConfig.load(), config.isValid {
-            url = try? CosUploader.presignedGetURL(for: update.objectKey, expires: 3600, config: config)
+        var urls: [URL] = []
+        // 服务器配置里的 downloadURL 是完整绝对地址，优先使用；objectKey 只作兜底。
+        // 这样即使本机保存的服务器地址和安装包实际所在端口不一致，也不会下到别的服务。
+        let direct = update.downloadURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !direct.isEmpty, let u = URL(string: direct) {
+            urls.append(u)
         }
-        if url == nil, !update.downloadURL.isEmpty {
-            url = URL(string: update.downloadURL)
+        if !update.objectKey.isEmpty {
+            #if !APP_EXTENSION
+            let base = NotifyHub.shared.endpoint
+            let objectKey = update.objectKey
+            let url: URL?
+            if objectKey.hasPrefix("releases/") {
+                // b31：新架构安装包落服务器 releases/ 目录，走专用公开下载接口；
+                // 旧版 objectKey 仍兼容 /api/public/media/ 路径。
+                let name = (objectKey as NSString).lastPathComponent
+                let encoded = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name
+                url = URL(string: "\(base)/api/public/release/\(encoded)")
+            } else {
+                let rel = objectKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? objectKey
+                url = URL(string: "\(base)/api/public/media/\(rel)")
+            }
+            if let url { urls.append(url) }
+            #endif
         }
-        guard let finalURL = url else {
-            phase = .failed("云端还没有安装包，请在后台填 objectKey 或 downloadURL")
+        // 去重，避免 direct 与 objectKey 拼出同一条地址后重复下载一遍。
+        var seen = Set<String>()
+        pendingURLs = urls.filter { seen.insert($0.absoluteString).inserted }
+        guard !pendingURLs.isEmpty else {
+            phase = .failed("服务器还没有安装包，请在后台填 objectKey 或 downloadURL")
             return
         }
+        activeUpdate = update
+        lastFailure = ""
+        beginNextDownload()
+    }
 
+    private func beginNextDownload() {
+        guard let update = activeUpdate, !pendingURLs.isEmpty else {
+            phase = .failed(lastFailure.isEmpty ? "没有可用的安装包地址" : lastFailure)
+            return
+        }
+        let url = pendingURLs.removeFirst()
+        progressTimer?.invalidate()
+        progressTimer = nil
         phase = .downloading
         progress = 0
-        let t = URLSession.shared.downloadTask(with: finalURL) { [weak self] tmp, resp, err in
+        receivedBytes = 0
+        expectedBytes = Int64(update.sizeBytes)
+
+        var req = URLRequest(url: url)
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        req.timeoutInterval = 120
+        req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        // didWriteData 比 task.progress 轮询可靠：小包/快网下后者经常一直是 0，完成才跳到 100%。
+        progressDelegate.expect(Int64(update.sizeBytes))
+        progressDelegate.onProgress = { [weak self] received, total in
+            Task { @MainActor in
+                self?.applyProgress(received: received, total: total)
+            }
+        }
+        progressDelegate.onFinish = { [weak self] tmp, resp, err in
             Task { @MainActor in
                 self?.finish(tmp: tmp, response: resp, error: err, update: update)
             }
         }
+        let t = session.downloadTask(with: req)
         task = t
         t.resume()
 
-        timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
-            let p = t.progress.fractionCompleted
+        // 双保险：delegate 的 didWriteData 在部分 iOS/网络栈组合下可能不回调，
+        // 再用 task.countOfBytesReceived 每 0.1 秒取一次；两者取较大值，进度不会停在 0。
+        progressTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self, weak t] _ in
+            guard let self, let t else { return }
+            let got = t.countOfBytesReceived
+            let total = t.countOfBytesExpectedToReceive > 0
+                ? t.countOfBytesExpectedToReceive : self.expectedBytes
             Task { @MainActor in
-                guard let self else { return }
-                if case .downloading = self.phase { self.progress = p }
+                self.applyProgress(received: got, total: total)
             }
         }
     }
 
+    private func applyProgress(received: Int64, total: Int64) {
+        guard case .downloading = phase else { return }
+        let got = max(received, 0)
+        let expected = total > 0 ? total : expectedBytes
+        guard expected > 0 else { return }
+        receivedBytes = max(receivedBytes, got)
+        expectedBytes = expected
+        progress = min(max(Double(receivedBytes) / Double(expected), 0), 1)
+    }
+
     private func finish(tmp: URL?, response: URLResponse?, error: Error?, update: UpdateCenter.Available) {
-        timer?.invalidate()
-        timer = nil
+        progressTimer?.invalidate()
+        progressTimer = nil
+        task = nil
+
         if let error {
-            phase = .failed("下载失败：\(error.localizedDescription)")
+            retryOrFail("下载失败：\(error.localizedDescription)")
             return
         }
         guard let tmp else {
-            phase = .failed("下载失败：没有拿到文件")
+            retryOrFail("下载失败：没有拿到文件")
+            return
+        }
+        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            try? FileManager.default.removeItem(at: tmp)
+            retryOrFail("服务器返回 HTTP \(http.statusCode)，不是安装包")
             return
         }
         phase = .verifying
@@ -383,25 +506,96 @@ final class UpdateDownloader: ObservableObject {
         do {
             try FileManager.default.moveItem(at: tmp, to: dest)
         } catch {
-            phase = .failed("保存失败：\(error.localizedDescription)")
+            retryOrFail("保存失败：\(error.localizedDescription)")
+            return
+        }
+
+        let actualSize = (try? dest.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        if update.sizeBytes > 0, actualSize != update.sizeBytes {
+            try? FileManager.default.removeItem(at: dest)
+            retryOrFail("下载不完整：实际 \(actualSize) 字节，应为 \(update.sizeBytes) 字节")
             return
         }
 
         if !update.sha256.isEmpty, let data = try? Data(contentsOf: dest) {
             let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-            if hash.lowercased() != update.sha256.lowercased() {
+            if hash.lowercased() != update.sha256.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
                 try? FileManager.default.removeItem(at: dest)
-                phase = .failed("安装包校验失败（文件可能不完整），请重新下载")
+                retryOrFail("安装包校验失败：已下载 \(actualSize) 字节，SHA256 与服务器配置不一致")
                 return
             }
         }
 
         // v2.23：校验通过后清掉目录里其它旧安装包——只留刚下载的这一个（每版约 10MB，不清理会一直堆）
         Self.pruneOldPackages(keep: dest)
-
+        pendingURLs.removeAll()
+        activeUpdate = nil
         localURL = dest
         progress = 1
+        receivedBytes = Int64(actualSize)
+        expectedBytes = Int64(update.sizeBytes)
         phase = .ready
+    }
+
+    /// 当前地址失败时自动换下一条；全部失败才把最后一个真实原因交给界面。
+    private func retryOrFail(_ message: String) {
+        lastFailure = message
+        if !pendingURLs.isEmpty {
+            beginNextDownload()
+        } else {
+            phase = .failed(message)
+        }
+    }
+}
+
+/// URLSessionDownloadDelegate 版进度：didWriteData 按字节回调，避免 10MB 包在快网下
+/// task.progress 仍为 0、完成时直接跳到 100%。临时文件在 didFinish 里先复制，防被系统回收。
+private final class UpdateDownloadProgressDelegate: NSObject, URLSessionDownloadDelegate {
+    var onProgress: ((Int64, Int64) -> Void)?
+    var onFinish: ((URL?, URLResponse?, Error?) -> Void)?
+
+    private var expectedBytes: Int64 = 0
+    private var finishedURL: URL?
+    private var copyError: Error?
+    private var response: URLResponse?
+
+    func expect(_ bytes: Int64) {
+        expectedBytes = max(bytes, 0)
+        finishedURL = nil
+        copyError = nil
+        response = nil
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didWriteData bytesWritten: Int64,
+                    totalBytesWritten: Int64,
+                    totalBytesExpectedToWrite: Int64) {
+        let total = totalBytesExpectedToWrite > 0 ? totalBytesExpectedToWrite : expectedBytes
+        guard total > 0 else { return }
+        onProgress?(max(totalBytesWritten, 0), total)
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didFinishDownloadingTo location: URL) {
+        response = downloadTask.response
+        let name = downloadTask.currentRequest?.url?.lastPathComponent ?? "update.ipa"
+        let dst = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString + "-" + name)
+        do {
+            try FileManager.default.copyItem(at: location, to: dst)
+            finishedURL = dst
+        } catch {
+            copyError = error
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    didCompleteWithError error: Error?) {
+        let err = error ?? copyError
+        onFinish?(finishedURL, response, err)
+        if err != nil, let finishedURL {
+            try? FileManager.default.removeItem(at: finishedURL)
+        }
     }
 }
 

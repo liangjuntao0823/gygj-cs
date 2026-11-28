@@ -192,11 +192,6 @@ final class AjkPublicStore: ObservableObject {
         }
     }
 
-    /// 用户在验证弹窗里过完码后，继续补抓剩余经纪人（不重抓列表）
-    func resumeAgentEnrichIfNeeded() {
-        startAgentEnrich()
-    }
-
     // MARK: - 缩略图（与 58 同机制）
 
     static var coversDirectory: URL {

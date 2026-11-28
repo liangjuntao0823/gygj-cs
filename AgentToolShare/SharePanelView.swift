@@ -3,7 +3,7 @@ import UIKit
 import AVKit
 
 /// v2.71 分享面板轻流程：开场零网络，只给房号输入框；
-/// 点「查重」单 GET 一个房号（CloudHouseSync.fetchOne，秒回，不再拉全量房号等十几秒）：
+/// 点「查重」单 GET 一个房号（ExtensionHouseClient.fetchOne，秒回，不再拉全量房号等十几秒）：
 /// - 云端没有 → 展开与 App 内新增同要素的表单（座号/房号/租金/房东/户型/密码/备注/状态）→ 新增上传；
 /// - 云端已有 → 提示有无媒体：无媒体直接补传；有媒体先「调取预览」再决定保留补传或清旧传新。
 /// 表单带「从剪贴板识别导入」（复用 HouseClipboardParser 与确认卡，只填空白字段）。
@@ -29,6 +29,8 @@ struct SharePanelView: View {
     @State private var videoPayload: VideoPayload?
     @State private var replaceConfirm = false
     @State private var submitError: String?
+    @State private var previewFiles: [String: URL] = [:]
+    @State private var previewError: String?
 
     private struct ClipboardPayload: Identifiable {
         let id = UUID()
@@ -67,9 +69,32 @@ struct SharePanelView: View {
     }
 
     private func previewURL(_ name: String, video: Bool) -> URL? {
-        guard let cfg = CosConfig.load() else { return nil }
-        let remote = video ? ((name as NSString).deletingPathExtension) + ".mp4" : name
-        return URL(string: "https://\(CosUploader.host(for: cfg))/h/\(existingRec?.roomKey ?? "")/\(remote)")
+        previewFiles[name]
+    }
+
+    /// 进入预览前把服务器媒体二进制下载到扩展临时目录（服务器媒体需鉴权，不能直链）
+    private func loadPreview() async {
+        guard let rec = existingRec, !rec.mediaNames.isEmpty else { return }
+        previewError = nil
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("share-preview", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var files: [String: URL] = [:]
+        var failed = 0
+        for name in rec.mediaNames {
+            do {
+                let data = try await ExtensionHouseClient.downloadMedia(roomKey: rec.roomKey, fileName: name)
+                let target = dir.appendingPathComponent(name)
+                try data.write(to: target, options: .atomic)
+                files[name] = target
+            } catch {
+                failed += 1
+            }
+        }
+        previewFiles = files
+        if failed > 0 && files.isEmpty {
+            previewError = "预览加载失败：\(failed) 个媒体无法读取"
+        }
     }
 
     var body: some View {
@@ -274,17 +299,22 @@ struct SharePanelView: View {
                         Text(name).font(.caption).lineLimit(1)
                         Spacer()
                         Button("播放") { if let u = previewURL(name, video: true) { videoPayload = VideoPayload(url: u) } }
+                            .disabled(previewURL(name, video: true) == nil)
                             .font(.caption)
                     }
                     .padding(10)
                     .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 8))
                 }
-                Text("预览来自云端公共读地址；确认后再选保留补传或清旧传新。")
+                if let previewError {
+                    Text(previewError).font(.caption2).foregroundStyle(.red)
+                }
+                Text("预览来自服务器；确认后再选保留补传或清旧传新。")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
             .padding(16)
         }
+        .onAppear { Task { await loadPreview() } }
     }
 
     private var savingContent: some View {
@@ -408,9 +438,7 @@ struct SharePanelView: View {
         checkError = nil
         phase = .checking
         do {
-            _ = try await CosConfig.fetchForExtension()
-            guard let cfg = CosConfig.load() else { throw CosUploader.CosError.invalidConfig }
-            let rec = try await CloudHouseSync.fetchOne(roomKey: inputForm.roomKey, config: cfg)
+            let rec = try await ExtensionHouseClient.fetchOne(roomKey: inputForm.roomKey)
             HouseActionNotifier.shared.prepare()
             if let rec {
                 existingRec = rec
@@ -435,15 +463,14 @@ struct SharePanelView: View {
         submitError = nil
         phase = .checking
         do {
-            guard let cfg = CosConfig.load() else { throw CosUploader.CosError.invalidConfig }
-            if let rec = try await CloudHouseSync.fetchOne(roomKey: form.roomKey, config: cfg) {
+            if let rec = try await ExtensionHouseClient.fetchOne(roomKey: form.roomKey) {
                 existingRec = rec
                 submitError = "「\(rec.roomKey)」已存在，改为补传媒体。"
                 phase = .existing
                 return
             }
         } catch {
-            // 查重失败不挡新增：uploadGuarded 的 CAS/合并兜底
+            // 查重失败不挡新增：upsert 乐观锁在保存阶段兜底冲突
         }
         await start(.newHouse)
     }
@@ -505,14 +532,14 @@ struct SharePanelView: View {
     }
 }
 
-/// 预览视频播放页（公共读地址直 plays）
+/// 预览视频播放页（本地临时目录文件）
 private struct VideoPlaySheet: View {
     let url: URL
     @Environment(\.dismiss) private var dismiss
     var body: some View {
         NavigationStack {
             VideoPlayer(player: AVPlayer(url: url))
-                .navigationTitle("云端视频预览")
+                .navigationTitle("视频预览")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .confirmationAction) {

@@ -12,13 +12,15 @@
   * self：推给对应绑定用户（电表账户操作用），需 notifyUser（hub userToken 或脱敏串）；
   * all：广播给所有参与该模块管理的用户（房源删除/改数据等）；
   * none：不推送。
-- 模块归属：电表改动 module="meter"，房源改动 module="house"。
+- 模块归属：电表改动 module="meter"。
+- 房源改动只写 outbox，由 house_api.deliver_pending 统一投递；后台不再二次直推。
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import threading
 import urllib.parse
 from pathlib import Path
 from typing import Any
@@ -66,6 +68,45 @@ def _send_file(handler: Any, status: int, body: bytes, filename: str,
         f"attachment; filename*=UTF-8''{urllib.parse.quote(filename)}")
     handler.end_headers()
     handler.wfile.write(body)
+
+
+def _send_inline_file(handler: Any, status: int, body: bytes, filename: str,
+                      content_type: str) -> None:
+    """浏览器内联预览：图片/视频直接渲染，不触发下载；视频支持 Range 以便拖进度/取首帧。"""
+    total = len(body)
+    start, end = 0, total - 1
+    partial = False
+    range_header = handler.headers.get("Range", "")
+    if range_header.startswith("bytes=") and total > 0:
+        try:
+            spec = range_header[len("bytes="):].split(",", 1)[0]
+            a, _, b = spec.partition("-")
+            if a:
+                start = int(a)
+                end = int(b) if b else total - 1
+            elif b:
+                start = max(0, total - int(b))
+                end = total - 1
+            if start <= end and start < total:
+                end = min(end, total - 1)
+                partial = True
+            else:
+                start, end = 0, total - 1
+        except Exception:
+            start, end, partial = 0, total - 1, False
+    payload = body[start:end + 1] if partial else body
+    handler.send_response(206 if partial else status)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(len(payload)))
+    handler.send_header("Accept-Ranges", "bytes")
+    if partial:
+        handler.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+    handler.send_header(
+        "Content-Disposition",
+        f"inline; filename*=UTF-8''{urllib.parse.quote(filename)}")
+    handler.send_header("Cache-Control", "private, max-age=300")
+    handler.end_headers()
+    handler.wfile.write(payload)
 
 
 def _read_body(handler: Any) -> dict[str, Any]:
@@ -130,6 +171,17 @@ def _resolve_user_token(admin: Any, hint: str) -> str:
 # 路由
 # ---------------------------------------------------------------------------
 
+def _spawn_house_delivery(admin: Any, notify_scope: str) -> None:
+    """后台房源写完后只触发 outbox 投递，不直接调用 hub 广播。"""
+    if notify_scope == "none":
+        return
+    house = getattr(admin, "house", None)
+    if house is None:
+        return
+    t = threading.Thread(target=house.deliver_pending, daemon=True)
+    t.start()
+
+
 def route_request(handler: Any, method: str, path: str, admin: Any) -> bool:
     """返回 True 表示已处理；False 表示路径不属于后台，交给上层 404。"""
     if not path.startswith(PREFIX):
@@ -188,6 +240,31 @@ def route_request(handler: Any, method: str, path: str, admin: Any) -> bool:
         _send_json(handler, 200 if res.get("ok") else 400, res)
         return True
 
+    # ---- 远程配置 / 获客分析 / 分享记录（后台与 App 同源）----
+    if path == PREFIX + "/api/config" and method == "GET":
+        _send_json(handler, 200, admin.house.config_get())
+        return True
+    if path == PREFIX + "/api/config" and method == "PUT":
+        body = _read_body(handler)
+        _send_json(handler, 200, admin.house.config_set(body))
+        return True
+    if path == PREFIX + "/api/share-stats" and method == "GET":
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query)
+        try:
+            days = int((q.get("days") or ["30"])[0])
+        except ValueError:
+            days = 30
+        _send_json(handler, 200, admin.house.share_stats(days))
+        return True
+    if path == PREFIX + "/api/share-records" and method == "GET":
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query)
+        try:
+            limit = int((q.get("limit") or ["200"])[0])
+        except ValueError:
+            limit = 200
+        _send_json(handler, 200, admin.house.share_records(limit))
+        return True
+
     # ---- 服务器管理 ----
     if path == PREFIX + "/api/sys/overview" and method == "GET":
         _send_json(handler, 200, {"ok": True, "overview": admin.sys.overview()})
@@ -244,6 +321,43 @@ def route_request(handler: Any, method: str, path: str, admin: Any) -> bool:
         _send_json(handler, 200 if res.get("ok") else 400, res)
         return True
 
+    # ---- 推送中心 ----
+    if path == PREFIX + "/api/push/overview" and method == "GET":
+        _send_json(handler, 200, admin.push.overview())
+        return True
+
+    rest = path[len(PREFIX + "/api/push"):]
+    segs = [urllib.parse.unquote(s) for s in rest.strip("/").split("/") if s]
+    if len(segs) == 3 and segs[0] == "users" and segs[2] == "prefs" and method == "POST":
+        body = _read_body(handler)
+        res = admin.push.set_user(segs[1], enabled=body.get("enabled"),
+                                  modules=body.get("modules"))
+        _send_json(handler, 200 if res.get("ok") else 400, res)
+        return True
+    if len(segs) == 4 and segs[0] == "users" and segs[2] == "devices" and method == "POST":
+        body = _read_body(handler)
+        res = admin.push.set_device(segs[1], segs[3], enabled=body.get("enabled"),
+                                    modules=body.get("modules"), name=body.get("name"))
+        _send_json(handler, 200 if res.get("ok") else 400, res)
+        return True
+    if len(segs) == 5 and segs[0] == "users" and segs[2] == "devices" \
+            and segs[4] == "remove" and method == "POST":
+        res = admin.push.remove_device(segs[1], segs[3])
+        _send_json(handler, 200 if res.get("ok") else 400, res)
+        return True
+
+    # ---- 房源板块接入用户 ----
+    if path == PREFIX + "/api/house/users" and method == "GET":
+        _send_json(handler, 200, admin.push.house_users())
+        return True
+    rest = path[len(PREFIX + "/api/house/users"):]
+    segs = [urllib.parse.unquote(s) for s in rest.strip("/").split("/") if s]
+    if len(segs) == 2 and segs[1] == "access" and method == "POST":
+        body = _read_body(handler)
+        res = admin.push.set_house_access(segs[0], bool(body.get("enabled")))
+        _send_json(handler, 200 if res.get("ok") else 400, res)
+        return True
+
     # ---- 房源管理 ----
     if path == PREFIX + "/api/house/export" and method == "GET":
         q = urllib.parse.urlparse(handler.path).query
@@ -253,6 +367,22 @@ def route_request(handler: Any, method: str, path: str, admin: Any) -> bool:
         ctype = "text/csv; charset=utf-8" if fmt == "csv" else "application/json; charset=utf-8"
         _send_file(handler, 200, data, fname, ctype)
         return True
+    if path.startswith(PREFIX + "/api/house/media/"):
+        if method != "GET":
+            _send_json(handler, 405, {"ok": False, "error": "method_not_allowed"})
+            return True
+        rest = path[len(PREFIX + "/api/house/media/"):]
+        segs = [urllib.parse.unquote(s) for s in rest.strip("/").split("/") if s]
+        if len(segs) != 2:
+            _send_json(handler, 404, {"ok": False, "error": "not_found"})
+            return True
+        body, ctype = admin.house.media_bytes(segs[0], segs[1])
+        if body is None:
+            _send_json(handler, 404, {"ok": False, "error": "not_found"})
+        else:
+            _send_inline_file(handler, 200, body, segs[1], ctype or "application/octet-stream")
+        return True
+
     if path == PREFIX + "/api/house/houses" and method == "GET":
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query)
         _send_json(handler, 200, admin.house.list(
@@ -271,25 +401,38 @@ def route_request(handler: Any, method: str, path: str, admin: Any) -> bool:
         return True
     if len(segs) == 1 and method == "PUT":
         body = _read_body(handler)
-        res = admin.house.update(segs[0], body.get("fields") or {})
+        scope = str(body.get("notifyScope") or "all").lower()
+        notify_user_token = ""
+        if scope == "self":
+            notify_user_token = _resolve_user_token(admin, body.get("notifyUser", ""))
+            if not notify_user_token:
+                scope = "none"
+        res = admin.house.update(
+            segs[0], body.get("fields") or {},
+            notify_scope=scope, notify_user_token=notify_user_token)
         if res.get("ok"):
-            notify = _notify(admin, body.get("notifyScope", "all"), "house",
-                             "房源信息已更新", f"{segs[0]} 的资料由后台修改",
-                             body.get("notifyUser", ""), {"action": "update"})
-            res["notify"] = notify
+            _spawn_house_delivery(admin, scope)
+            res["notify"] = {"queued": scope != "none", "scope": scope}
         _send_json(handler, 200 if res.get("ok") else 400, res)
         return True
-    if len(segs) == 2 and segs[1] in ("delete", "restore") and method == "POST":
+    if len(segs) == 2 and segs[1] == "delete" and method == "POST":
         body = _read_body(handler)
-        deleted = segs[1] == "delete"
-        res = admin.house.set_deleted(segs[0], deleted)
+        scope = str(body.get("notifyScope") or "all").lower()
+        notify_user_token = ""
+        if scope == "self":
+            notify_user_token = _resolve_user_token(admin, body.get("notifyUser", ""))
+            if not notify_user_token:
+                scope = "none"
+        res = admin.house.delete(
+            segs[0], notify_scope=scope, notify_user_token=notify_user_token)
         if res.get("ok"):
-            notify = _notify(admin, body.get("notifyScope", "all"), "house",
-                             "房源已删除" if deleted else "房源已恢复",
-                             f"{segs[0]} 由后台{'删除' if deleted else '恢复'}",
-                             body.get("notifyUser", ""), {"action": segs[1]})
-            res["notify"] = notify
+            _spawn_house_delivery(admin, scope)
+            res["notify"] = {"queued": scope != "none", "scope": scope}
         _send_json(handler, 200 if res.get("ok") else 400, res)
+        return True
+    if len(segs) == 2 and segs[1] == "restore" and method == "POST":
+        _send_json(handler, 410, {"ok": False, "error": "recycle_bin_removed",
+                                  "note": "后台删除已改为永久删除，不再提供恢复"})
         return True
     if len(segs) == 2 and segs[1] == "ledger" and method == "GET":
         _send_json(handler, 200, {"ok": True, "ledger": admin.house.ledger(segs[0])})
@@ -308,6 +451,7 @@ def _serve_static(handler: Any) -> None:
         body = b"<h1>admin console missing</h1>"
     handler.send_response(200)
     handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Cache-Control", "no-store, max-age=0")
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)

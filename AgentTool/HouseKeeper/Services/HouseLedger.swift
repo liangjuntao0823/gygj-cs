@@ -178,7 +178,11 @@ enum HouseLedgerStore {
                        action: String,
                        detail: String = "",
                        fieldChanges: [HouseLedgerFieldChange] = [],
-                       date: Date = Date()) -> HouseLedgerEvent {
+                       date: Date = Date(),
+                       cloudLog: Bool = true,
+                       logAction: String? = nil,
+                       logDetail: String? = nil,
+                       writeOpLog: Bool = true) -> HouseLedgerEvent {
         let event = HouseLedgerEvent(date: date, action: action, detail: detail, fieldChanges: fieldChanges)
         fileLock.lock()
         var pending = loadPendingUnlocked(roomKey: roomKey)
@@ -186,6 +190,21 @@ enum HouseLedgerStore {
         savePendingUnlocked(roomKey: roomKey, events: pending)
         fileLock.unlock()
         scheduleSync(roomKey: roomKey)
+        // 操作日志沿用旧正式版规则：一次动作只走 BackupLogStore.log(cloud:true)，
+        // 同时写本机「本机操作」和服务器 ops「云端操作」，两侧动作名、结果、明细完全一致。
+        // 旧版房源页面也是这个写法，不再直接调 CloudOps.log 只写云端、漏掉本机。
+        // 各页面若需要“服务器成功后再落日志”，传 writeOpLog:false，由推送结果统一写。
+        let changeText = fieldChanges.map { "\($0.field)：\($0.oldValue) → \($0.newValue)" }
+            .joined(separator: "；")
+        let finalDetail = logDetail ?? (detail.isEmpty ? changeText : detail)
+        if cloudLog && writeOpLog {
+            BackupLogStore.log(category: "房源",
+                               action: logAction ?? action,
+                               result: "成功",
+                               detail: finalDetail,
+                               room: roomKey,
+                               cloud: true)
+        }
         return event
     }
 
@@ -301,26 +320,58 @@ enum HouseLedgerStore {
         try? FileManager.default.removeItem(at: sharedPending)
     }
 
-    /// v2.52：有云配置就后台合并上传；无配置/无效配置也标记待同步，配置好后启动自动补
+    /// 账本权威源在 8082 服务器库：待确认事件逐条 POST 服务器上行；
+    /// 成功并入本地正式账本，失败/未绑定令牌时保留 pending 并记 dirty，启动后自动补传。
+    /// 旧对象存储直连兜底已下线，账本只走服务器权威接口。
     static func scheduleSync(roomKey: String) {
-        // 服务器模式：账本权威源在 8082 服务器库，切割期旧 COS 桶只作回退底、不回写；
-        // 待确认事件保留本机 pending 兜底，不向旧桶发起账本写请求。
-        // 分享扩展不含服务器模式判定，条件编译剔除该分支，保持旧链路兜底。
+        markDirty(roomKey)
         #if !APP_EXTENSION
-        if HouseServerMode.ready {
-            markDirty(roomKey)
-            return
-        }
+        guard HouseServerMode.ready else { return }
+        Task { await syncPending(roomKey: roomKey) }
         #endif
-        guard let config = CosConfig.load(), config.isValid else {
-            markDirty(roomKey)
-            return
+    }
+
+    #if !APP_EXTENSION
+    /// 读取某房待确认事件（持锁；供上行补传使用）
+    static func pendingEvents(roomKey: String) -> [HouseLedgerEvent] {
+        fileLock.lock()
+        defer { fileLock.unlock() }
+        return loadPendingUnlocked(roomKey: roomKey)
+    }
+
+    /// 把某房待确认事件逐条上报服务器；成功并入本地正式账本并清 pending，失败保留 + markDirty
+    static func syncPending(roomKey: String) async {
+        guard HouseServerMode.ready else { markDirty(roomKey); return }
+        guard await HouseLedgerSyncGate.shared.begin(roomKey) else { return }
+        defer { Task { await HouseLedgerSyncGate.shared.end(roomKey) } }
+        let pending = pendingEvents(roomKey: roomKey)
+        guard !pending.isEmpty else { clearDirty(roomKey); return }
+        var uploaded: [HouseLedgerEvent] = []
+        var failed = false
+        for ev in pending {
+            do {
+                try await HouseRepository.shared.appendLedger(roomKey: roomKey, event: ev)
+                uploaded.append(ev)
+            } catch {
+                failed = true
+            }
         }
-        Task {
-            do { try await sync(roomKey: roomKey, config: config) }
-            catch { markDirty(roomKey) }
+        if !uploaded.isEmpty {
+            _ = mergeAndSave(roomKey: roomKey, events: uploaded)
+            removePendingEvents(roomKey: roomKey, eventIds: Set(uploaded.map { $0.id }))
+        }
+        if failed {
+            markDirty(roomKey)
+        } else {
+            clearDirty(roomKey)
         }
     }
+
+    /// 补传所有 dirty 房号的待确认账本事件（全量同步时调用）
+    static func flushPendingAll() async {
+        for k in dirtyRoomKeys() { await syncPending(roomKey: k) }
+    }
+    #endif
 
     // MARK: 云端合并（append-only 按事件 id 取并集）
 
@@ -344,391 +395,15 @@ enum HouseLedgerStore {
         return HouseLedgerFile(roomKey: roomKey, revision: max(baseRevision + 1, local.revision + 1), events: events)
     }
 
-    /// 单房合并上传：拉远端 → 正式账本+待确认事件一并并集 → 写回；
-    /// 弱网/写失败重试一轮，仍失败上抛。成功后待确认事件才并入正式账本并清 pending。
-    static func sync(roomKey: String, config: CosConfig) async throws {
-        // v2.68：先收养扩展留在共享容器的待确认事件，再走原有合并上传
-        adoptSharedPending(roomKey: roomKey)
-        // 目录已被删除（如删房后云端失败残留的 dirty 名单）：正式账本与 pending 都不在才清标记，
-        // 只剩 pending 时必须继续同步，否则待确认事件永远无法落地
-        let hasLedger = FileManager.default.fileExists(atPath: localURL(roomKey: roomKey).path)
-        let hasPending = FileManager.default.fileExists(atPath: pendingURL(roomKey: roomKey).path)
-        if !hasLedger && !hasPending {
-            clearDirty(roomKey)
-            return
-        }
-        guard await HouseLedgerSyncGate.shared.begin(roomKey) else { return }
-        defer { Task { await HouseLedgerSyncGate.shared.end(roomKey) } }
-        var lastError: Error?
-        for attempt in 0..<2 {
-            do {
-                let remote = try await fetchRemote(roomKey: roomKey, config: config)
-                fileLock.lock()
-                let local = loadUnlocked(roomKey: roomKey)
-                let pending = loadPendingUnlocked(roomKey: roomKey)
-                fileLock.unlock()
-                // 待确认事件并入本次上传的本地副本（按 id 去重），但先不写正式文件
-                var combined = local
-                let known = Set(local.events.map { $0.id })
-                combined.events = local.events + pending.filter { !known.contains($0.id) }
-                let mergedFile = merged(roomKey: roomKey, local: combined, remote: remote)
-                // v2.58（#9）：上传前再读一次 revision，与刚合并用的 remote 比对
-                // （与 CosUploader.uploadGuarded 同一套 CAS 思路）：刚被别人写过 → 本轮不写，
-                // 进入下一轮用最新远端重新合并；两轮都变化说明对方持续在写，抛冲突不再静默覆盖。
-                let fresh = try await fetchRemote(roomKey: roomKey, config: config)
-                if (fresh?.revision ?? 0) != (remote?.revision ?? 0) {
-                    if attempt == 0 { continue }
-                    throw CloudSyncConflict.recordChanged(roomKey: roomKey, by: "另一台设备")
-                }
-                let data = try JSONEncoder().encode(mergedFile)
-                try await CosUploader.upload(data: data, to: cloudPath(roomKey: roomKey),
-                                            contentType: "application/json", config: config)
-                // 云端确认成功：事件才落正式账本，并清空 pending
-                fileLock.lock()
-                writeLocked(roomKey: roomKey, file: mergedFile)
-                savePendingUnlocked(roomKey: roomKey, events: [])
-                fileLock.unlock()
-                clearDirty(roomKey)
-                return
-            } catch {
-                lastError = error
-                if attempt == 0 {
-                    try? await Task.sleep(nanoseconds: 800_000_000)
-                }
-            }
-        }
-        markDirty(roomKey)
-        if let lastError { throw lastError }
-    }
 
-    /// 批量同步（启动/同步页收尾）：逐房串行，失败不影响其他
-    static func syncAll(roomKeys: [String], config: CosConfig) async {
-        for key in roomKeys {
-            do { try await sync(roomKey: key, config: config) }
-            catch { markDirty(key) }
-        }
-    }
-
-    /// 只拉远端合并到本地（别人操作的事件），不上传
-    static func pull(roomKey: String, config: CosConfig) async throws {
-        let remote = try await fetchRemote(roomKey: roomKey, config: config)
-        guard let remote, !remote.events.isEmpty else { return }
-        fileLock.lock()
-        let local = loadUnlocked(roomKey: roomKey)
-        let mergedFile = merged(roomKey: roomKey, local: local, remote: remote)
-        writeLocked(roomKey: roomKey, file: mergedFile)
-        fileLock.unlock()
-    }
-
-    /// 改名场景：删旧云端目录前，把旧远端账本合并进新房号本地账本（随后由 sync 一并上传）
-    static func adoptRemoteLedger(from oldRoomKey: String, to newRoomKey: String, config: CosConfig) async throws {
-        guard oldRoomKey != newRoomKey,
-              let remote = try await fetchRemote(roomKey: oldRoomKey, config: config) else { return }
-        mergeAndSave(roomKey: newRoomKey, events: remote.events)
-    }
-
-    private static func fetchRemote(roomKey: String, config: CosConfig) async throws -> HouseLedgerFile? {
-        do {
-            let data = try await CosUploader.fetchObjectData(path: cloudPath(roomKey: roomKey), config: config)
-            return try JSONDecoder().decode(HouseLedgerFile.self, from: data)
-        } catch let e as CosObjectNotFoundError {
-            return nil
-        }
-    }
-
-    /// v2.46：迁移器专用——以「真实事件 + 新一批迁移事件」整体重写本地与云端账本。
-    /// 普通 sync 是按 id 取并集，删不掉云端残留的旧迁移事件；这里把两端的迁移事件全部丢弃、
-    /// 只保留真实事件（migrated == false），再换上新生成的迁移事件，云端同写同清。
-    static func replaceMigratedSync(roomKey: String,
-                                   newMigratedEvents: [HouseLedgerEvent],
-                                   config: CosConfig) async throws {
-        guard await HouseLedgerSyncGate.shared.begin(roomKey) else {
-            markDirty(roomKey)
-            return
-        }
-        defer { Task { await HouseLedgerSyncGate.shared.end(roomKey) } }
-        let remote = try await fetchRemote(roomKey: roomKey, config: config)
-        fileLock.lock()
-        let local = loadUnlocked(roomKey: roomKey)
-        fileLock.unlock()
-
-        var realEvents: [HouseLedgerEvent] = []
-        var seen = Set<String>()
-        for e in local.events + (remote?.events ?? []) where !e.migrated {
-            if seen.insert(e.id).inserted { realEvents.append(e) }
-        }
-        var events = realEvents + newMigratedEvents
-        events.sort { lhs, rhs in
-            if lhs.date != rhs.date { return lhs.date < rhs.date }
-            return lhs.id < rhs.id
-        }
-        let baseRevision = max(remote?.revision ?? 0, local.revision)
-        let file = HouseLedgerFile(roomKey: roomKey, revision: baseRevision + 1, events: events)
-        let data = try JSONEncoder().encode(file)
-        try await CosUploader.upload(data: data, to: cloudPath(roomKey: roomKey),
-                                    contentType: "application/json", config: config)
-        fileLock.lock()
-        writeLocked(roomKey: roomKey, file: file)
-        fileLock.unlock()
-        clearDirty(roomKey)
-    }
-
-    /// v2.47：一次性清理已废弃的笼统动作（如「媒体更新」）——本地与云端同时删除，
-    /// 走同步门串行，基于两端最新 revision 整体重写，避免并集合并又把它拉回来
-    static func purgeDeprecatedActionsSync(roomKey: String,
-                                          actions: Set<String>,
-                                          config: CosConfig) async throws {
-        guard await HouseLedgerSyncGate.shared.begin(roomKey) else {
-            markDirty(roomKey)
-            return
-        }
-        defer { Task { await HouseLedgerSyncGate.shared.end(roomKey) } }
-        let remote = try await fetchRemote(roomKey: roomKey, config: config)
-        fileLock.lock()
-        let local = loadUnlocked(roomKey: roomKey)
-        fileLock.unlock()
-
-        var seen = Set<String>()
-        var kept: [HouseLedgerEvent] = []
-        for e in local.events + (remote?.events ?? []) {
-            if seen.insert(e.id).inserted && !actions.contains(e.action) {
-                kept.append(e)
-            }
-        }
-        kept.sort { lhs, rhs in
-            if lhs.date != rhs.date { return lhs.date < rhs.date }
-            return lhs.id < rhs.id
-        }
-        let baseRevision = max(remote?.revision ?? 0, local.revision)
-        let file = HouseLedgerFile(roomKey: roomKey, revision: baseRevision + 1, events: kept)
-        let data = try JSONEncoder().encode(file)
-        try await CosUploader.upload(data: data, to: cloudPath(roomKey: roomKey),
-                                    contentType: "application/json", config: config)
-        fileLock.lock()
-        writeLocked(roomKey: roomKey, file: file)
-        fileLock.unlock()
-        clearDirty(roomKey)
-    }
-
-    /// v2.53：全量撤回——按事件 id 从本地与云端整体重写移除（事件可能已同步落地）。
-    /// 走同步门串行，基于两端最新 revision 整体重写，避免并集合并又把被删事件拉回来。
-    static func purgeEventsSync(roomKey: String,
-                                eventIds: Set<String>,
-                                config: CosConfig) async throws {
-        guard !eventIds.isEmpty else { return }
-        guard await HouseLedgerSyncGate.shared.begin(roomKey) else {
-            markDirty(roomKey)
-            return
-        }
-        defer { Task { await HouseLedgerSyncGate.shared.end(roomKey) } }
-        let remote = try await fetchRemote(roomKey: roomKey, config: config)
-        fileLock.lock()
-        let local = loadUnlocked(roomKey: roomKey)
-        fileLock.unlock()
-
-        var seen = Set<String>()
-        var kept: [HouseLedgerEvent] = []
-        for e in local.events + (remote?.events ?? []) {
-            if seen.insert(e.id).inserted && !eventIds.contains(e.id) {
-                kept.append(e)
-            }
-        }
-        kept.sort { lhs, rhs in
-            if lhs.date != rhs.date { return lhs.date < rhs.date }
-            return lhs.id < rhs.id
-        }
-        let baseRevision = max(remote?.revision ?? 0, local.revision)
-        let file = HouseLedgerFile(roomKey: roomKey, revision: baseRevision + 1, events: kept)
-        let data = try JSONEncoder().encode(file)
-        try await CosUploader.upload(data: data, to: cloudPath(roomKey: roomKey),
-                                    contentType: "application/json", config: config)
-        fileLock.lock()
-        writeLocked(roomKey: roomKey, file: file)
-        fileLock.unlock()
-    }
 }
 
-// MARK: - v2.47 废弃动作一次性清理（幂等）
 
-enum HouseLedgerDeprecatedCleanup {
-    /// 已从代码移除、历史账本里残留的笼统动作
-    static let deprecatedActions: Set<String> = ["媒体更新"]
-    private static let flagKey = "houseLedger.cleanup.deprecated.v1"
-
-    static func run() {
-        guard !UserDefaults.standard.bool(forKey: flagKey) else { return }
-        let rooms = HouseLedgerStore.allLocalRoomKeys()
-        guard !rooms.isEmpty else {
-            UserDefaults.standard.set(true, forKey: flagKey)
-            return
-        }
-        let config = CosConfig.load()
-        Task {
-            if let config, config.isValid {
-                for roomKey in rooms {
-                    do {
-                        try await HouseLedgerStore.purgeDeprecatedActionsSync(
-                            roomKey: roomKey, actions: deprecatedActions, config: config)
-                    } catch {
-                        HouseLedgerStore.markDirty(roomKey)
-                    }
-                }
-            } else {
-                // 无云配置：只做本地清理
-                for roomKey in rooms {
-                    HouseLedgerStore.purgeDeprecatedActionsLocal(
-                        roomKey: roomKey, actions: deprecatedActions)
-                }
-            }
-            UserDefaults.standard.set(true, forKey: flagKey)
-        }
-    }
-}
-
-// MARK: - v2.45 历史日志迁移（一次性，幂等）
+// MARK: - 房号解析工具
 
 enum HouseLedgerMigrator {
-    // v2.46：v3——修复 v2 只清本地、云端旧迁移事件被并集合并拉回导致新旧成对的问题；
-    // 同时对云端公共记录与本机日志的同一动作去重
-    private static let flagKey = "houseLedger.migration.v3"
     /// 当前代迁移事件的 id 前缀，旧代事件不再接收
     static let currentHistPrefix = "hist3-"
-    static var hasRun: Bool { UserDefaults.standard.bool(forKey: flagKey) }
-
-    /// 启动时调用：把云端公共操作记录 + 本机操作日志里能识别房号的动作，迁到各房账本。
-    /// validRoomKeys：当前真实房源的媒体目录名集合，用于保护真实目录、清理误建的畸形目录
-    static func run(validRoomKeys: Set<String>) {
-        guard !hasRun else { return }
-        let localEntries = BackupLogStore.all()
-        if CloudOps.isConfigured {
-            CloudOps.fetch { cloudEntries in
-                Task { await build(cloud: cloudEntries, local: localEntries, validRoomKeys: validRoomKeys) }
-            }
-        } else {
-            Task { await build(cloud: [], local: localEntries, validRoomKeys: validRoomKeys) }
-        }
-    }
-
-    /// 合法房号目录名：1-/2- 前缀 + 房号数字（可带「上/下/测/层」等中文或字母后缀），
-    /// 不含空格、括号、点号、文件名等
-    static func isValidRoomKey(_ key: String) -> Bool {
-        guard let regex = try? NSRegularExpression(pattern: #"^(1|2)-[0-9]+[0-9A-Za-z\u4e00-\u9fa5]*$"#) else { return false }
-        let range = NSRange(key.startIndex..., in: key)
-        return regex.firstMatch(in: key, range: range) != nil
-    }
-
-    /// 清掉迁移器误建的畸形目录：名字不符合房号规则、且当前没有任何房源记录引用。
-    /// 这些目录是旧迁移器从日志文本里误解析房号、写账本时连带创建的；云端若同步过也一并删除
-    private static func cleanupMalformedFolders(validRoomKeys: Set<String>, config: CosConfig?) async {
-        for key in HouseLedgerStore.allLocalRoomKeys() {
-            guard !validRoomKeys.contains(key), !isValidRoomKey(key) else { continue }
-            let dir = MediaStore.houseDirectory(roomKey: key)
-            try? FileManager.default.removeItem(at: dir)
-            HouseLedgerStore.clearDirty(key)
-            if let config {
-                try? await CloudBackupService.deleteRemoteObject(
-                    name: HouseLedgerStore.cloudPath(roomKey: key), config: config)
-            }
-        }
-    }
-
-    private static func build(cloud: [CloudOpEntry], local: [BackupLogEntry],
-                             validRoomKeys: Set<String>) async {
-        // 0) 先清掉历史上误建的畸形目录（本地 + 云端）
-        await cleanupMalformedFolders(validRoomKeys: validRoomKeys, config: CosConfig.load())
-
-        var grouped: [String: [HouseLedgerEvent]] = [:]
-        // 同一动作可能同时存在于云端公共记录和本机日志，按「房号+分钟+动作+明细」去重
-        var dedupKeys = Set<String>()
-
-        // 1) 云端公共记录（带 room 字段；旧记录 room 为空时从 detail 解析）
-        for e in cloud {
-            let roomKey = e.room.isEmpty ? parseRoomKey(in: e.detail) : e.room
-            guard let roomKey, !roomKey.isEmpty, isValidRoomKey(roomKey) else { continue }
-            let parts = e.op.components(separatedBy: "·")
-            let rawAction = parts.count >= 2 ? "\(parts[0])·\(parts[1])" : e.op
-            let date = parseDate(e.t) ?? Date()
-            guard let normalized = normalize(action: rawAction, detail: e.detail) else { continue }
-            let dk = dedupKey(roomKey: roomKey, date: date, action: normalized.action, detail: normalized.detail)
-            guard dedupKeys.insert(dk).inserted else { continue }
-            let event = HouseLedgerEvent(
-                id: historicalID("cloud|\(e.id)"),
-                date: date,
-                operatorName: e.user.isEmpty ? "未知用户" : e.user,
-                action: normalized.action,
-                detail: normalized.detail,
-                migrated: true
-            )
-            grouped[roomKey, default: []].append(event)
-        }
-
-        // 2) 本机日志（无 room 字段，从 detail 解析房号；解析不出的无法归属，跳过）
-        for e in local {
-            guard let roomKey = parseRoomKey(in: e.detail), isValidRoomKey(roomKey) else { continue }
-            let rawAction = "\(e.category)·\(e.action)"
-            guard let normalized = normalize(action: rawAction, detail: e.detail) else { continue }
-            let dk = dedupKey(roomKey: roomKey, date: e.date, action: normalized.action, detail: normalized.detail)
-            guard dedupKeys.insert(dk).inserted else { continue }
-            let event = HouseLedgerEvent(
-                id: historicalID("local|\(e.date.timeIntervalSinceReferenceDate)|\(e.category)|\(e.action)|\(e.detail)"),
-                date: e.date,
-                operatorName: e.username ?? "本机",
-                action: normalized.action,
-                detail: normalized.detail,
-                migrated: true
-            )
-            grouped[roomKey, default: []].append(event)
-        }
-
-        // 3) 所有本机账本房号逐房整体重写（含本次没有新迁移事件的房，也要清掉云端旧条目）
-        let allRooms = HouseLedgerStore.allLocalRoomKeys()
-        if let config = CosConfig.load(), config.isValid {
-            for roomKey in allRooms {
-                do {
-                    try await HouseLedgerStore.replaceMigratedSync(
-                        roomKey: roomKey,
-                        newMigratedEvents: grouped[roomKey] ?? [],
-                        config: config)
-                } catch {
-                    HouseLedgerStore.markDirty(roomKey)
-                }
-            }
-        } else {
-            // 无云配置：本地逐房清迁移事件，再并入新事件
-            for roomKey in allRooms {
-                HouseLedgerStore.purgeMigrated(roomKey: roomKey)
-                HouseLedgerStore.mergeAndSave(roomKey: roomKey, events: grouped[roomKey] ?? [])
-            }
-        }
-        UserDefaults.standard.set(true, forKey: flagKey)
-    }
-
-    /// 去重键：时间精确到分钟（云端记录本身只到分钟），同房同分钟同动作同明细视为同一动作
-    private static func dedupKey(roomKey: String, date: Date, action: String, detail: String) -> String {
-        let c = Calendar(identifier: .gregorian).dateComponents([.year, .month, .day, .hour, .minute], from: date)
-        return "\(roomKey)|\(c.year!)-\(c.month!)-\(c.day!) \(c.hour!):\(c.minute!)|\(action)|\(detail)"
-    }
-
-    /// v2.46：迁移条目按新口径归一——去「同步」后缀、技术词改名；明细为空的「修改房源」直接丢弃
-    private static func normalize(action rawAction: String, detail: String) -> (action: String, detail: String)? {
-        let trimmedDetail = detail.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmedDetail.isEmpty && rawAction.contains("修改房源") { return nil }
-        var action = rawAction
-        if action.hasSuffix("同步") { action = String(action.dropLast(2)) }
-        let renames: [String: String] = [
-            "重建本地账本镜像": "本地数据刷新",
-            "云端覆盖本地": "云端更新本机",
-            "跳过云端覆盖": "保留本机修改",
-            "清理账本失效媒体引用": "清理失效媒体记录",
-            "冲突合并": "合并云端更新"
-        ]
-        for (old, new) in renames where action.contains(old) {
-            action = action.replacingOccurrences(of: old, with: new)
-        }
-        return (action, detail)
-    }
-
-    // MARK: 解析工具
 
     /// 从文本里提取房号 key（1-/2- 开头，到空格或斜杠为止），如「1-2059/xxx」「1-7899测：更新…」
     static func parseRoomKey(in text: String) -> String? {
@@ -737,20 +412,6 @@ enum HouseLedgerMigrator {
         guard let m = regex.firstMatch(in: text, range: range), let r = Range(m.range, in: text) else { return nil }
         let key = String(text[r])
         return key.isEmpty ? nil : key
-    }
-
-    private static func parseDate(_ s: String) -> Date? {
-        let fmt = DateFormatter()
-        fmt.locale = Locale(identifier: "en_US_POSIX")
-        fmt.dateFormat = "yyyy-MM-dd HH:mm"
-        return fmt.date(from: s)
-    }
-
-    private static func historicalID(_ source: String) -> String {
-        let digest = SHA256.hash(data: Data(source.utf8))
-        let hex = digest.map { String(format: "%02x", $0) }.joined()
-        // v2.46：换前缀，与旧迁移事件区分
-        return "hist3-" + String(hex.prefix(20))
     }
 }
 

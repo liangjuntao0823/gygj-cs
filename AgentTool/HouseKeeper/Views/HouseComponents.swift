@@ -40,28 +40,20 @@ enum UnreadCloudHouseStore {
 
 // MARK: - v2.24 同步失败标记
 
-/// 房源「账本推送云端失败」的轻量标记（存 UserDefaults，成功推送后自动清除）。
-/// 用途：卡片上标「未同步」，让用户知道这次编辑只落在本机、云端还没收到。
+/// 房源「推送服务器失败」的轻量标记——已收编进统一待补传登记簿 HousePendingRegistry，
+/// 本类型保留为兼容门面：任务中心与卡片红点继续走原接口，底层与 HousePendingUploader 同一份集合。
 enum SyncFailStore {
-    private static let storageKey = "house_sync_failed_keys"
-    static let didChange = Notification.Name("houseSyncFailedKeysChanged")
+    static let didChange = HousePendingRegistry.didChange
 
-    static func all() -> Set<String> { Set(UserDefaults.standard.stringArray(forKey: storageKey) ?? []) }
+    static func all() -> Set<String> { HousePendingRegistry.keys() }
     static func isFailed(_ roomKey: String) -> Bool { all().contains(roomKey) }
 
     static func mark(_ roomKey: String) {
-        guard !roomKey.isEmpty else { return }
-        var set = all(); set.insert(roomKey)
-        UserDefaults.standard.set(Array(set), forKey: storageKey)
-        NotificationCenter.default.post(name: didChange, object: nil)
+        HousePendingRegistry.insert(roomKey)
     }
 
     static func clear(_ roomKey: String) {
-        var set = all()
-        guard set.contains(roomKey) else { return }
-        set.remove(roomKey)
-        UserDefaults.standard.set(Array(set), forKey: storageKey)
-        NotificationCenter.default.post(name: didChange, object: nil)
+        HousePendingRegistry.remove(roomKey)
     }
 }
 
@@ -202,24 +194,35 @@ final class HouseSyncProgress: ObservableObject {
     /// v2.4 修复：此前「保存上传媒体」与「同步云端账本」两个并发 Task 共用单例，
     /// 先完成的 Task 调 clear() 会把仍在进行中的媒体上传进度误清 → 卡片底部进度条「不见了」。
     private var activeTasks = 0
+    /// v1.1：每个任务独立令牌，避免媒体下载完成后迟到的进度回调把已结束的任务重新点亮。
+    private var nextTaskToken = 0
+    private var activeTokens: Set<Int> = []
 
-    /// 任务开始：计数 +1 并写入初始值（线程安全，内部切主线程）
-    func begin(roomKey: String?, direction: Direction, progress: Double = 0, label: String = "") {
-        Task { @MainActor in
-            activeTasks += 1
-            self.roomKey = roomKey
-            self.direction = direction
-            self.progress = max(0, min(1, progress))
-            self.label = label
-            self.bytesPerSecond = 0
-            self.indeterminate = false
-        }
+    /// 任务开始：计数 +1 并写入初始值；返回令牌，结束/推进时带上它可防止迟到回调复活进度条。
+    @discardableResult
+    func begin(roomKey: String?, direction: Direction, progress: Double = 0, label: String = "") -> Int {
+        nextTaskToken += 1
+        let token = nextTaskToken
+        activeTokens.insert(token)
+        activeTasks += 1
+        self.roomKey = roomKey
+        self.direction = direction
+        self.progress = max(0, min(1, progress))
+        self.label = label
+        self.bytesPerSecond = 0
+        self.indeterminate = false
+        return token
     }
 
     /// 推进：写入最新进度。若无活跃任务则视为任务开始（自动计数 1），保证旧调用点语义兼容。
-    func update(roomKey: String?, direction: Direction, progress: Double, label: String = "") {
+    /// 带 token 的调用若任务已结束则直接忽略，避免“下载完 4/4 后进度条还挂着”。
+    func update(roomKey: String?, direction: Direction, progress: Double, label: String = "", token: Int? = nil) {
         Task { @MainActor in
-            if activeTasks == 0 { activeTasks = 1 }
+            if let token {
+                guard self.activeTokens.contains(token) else { return }
+            } else if self.activeTasks == 0 {
+                self.activeTasks = 1
+            }
             self.roomKey = roomKey
             self.direction = direction
             self.progress = max(0, min(1, progress))
@@ -265,14 +268,19 @@ final class HouseSyncProgress: ObservableObject {
     }
 
     /// 任务结束：计数 -1；仅当全部活跃任务都结束时才真正清空（并发的另一任务进度不被误清）
-    func end() {
+    /// v1.1：可带 begin 返回的 token；任务已结束时重复 end 不再重复扣计数。
+    func end(token: Int? = nil) {
         Task { @MainActor in
-            activeTasks = max(0, activeTasks - 1)
-            if activeTasks == 0 {
-                roomKey = nil
-                label = ""
-                bytesPerSecond = 0
-                indeterminate = false
+            if let token {
+                guard self.activeTokens.remove(token) != nil else { return }
+            }
+            self.activeTasks = max(0, self.activeTasks - 1)
+            if self.activeTasks == 0 {
+                self.activeTokens.removeAll()
+                self.roomKey = nil
+                self.label = ""
+                self.bytesPerSecond = 0
+                self.indeterminate = false
             }
         }
     }
@@ -280,10 +288,12 @@ final class HouseSyncProgress: ObservableObject {
     /// 直接清空（兼容旧调用；新代码统一用 begin/end）
     func clear() {
         Task { @MainActor in
-            roomKey = nil
-            label = ""
-            bytesPerSecond = 0
-            indeterminate = false
+            self.activeTasks = 0
+            self.activeTokens.removeAll()
+            self.roomKey = nil
+            self.label = ""
+            self.bytesPerSecond = 0
+            self.indeterminate = false
         }
     }
 }
@@ -303,6 +313,8 @@ struct HouseCardView: View {
 
     @State private var previewRoute: PhotoPreviewRoute? = nil
     @State private var playingVideo: MediaItem? = nil
+    /// 媒体文件落盘/补下载后强制重建封面，避免视频首帧只在重启后才出现
+    @State private var coverReloadToken = 0
     // v2.20：云端同步新增/修改过、还没点开详情 → 红框
     @State private var isUnread = false
     // v2.24：账本推云端失败的房源 → 标「未同步」
@@ -321,6 +333,7 @@ struct HouseCardView: View {
                 openCover()
             } label: {
                 coverView
+                    .id(coverReloadToken)
             }
             .buttonStyle(.plain)
             .frame(width: 92, height: 76)
@@ -457,6 +470,10 @@ struct HouseCardView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: SyncFailStore.didChange)) { _ in
             syncFailed = SyncFailStore.isFailed(house.mediaRoomKey)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: HouseListView.houseStoreChanged)) { _ in
+            // 媒体下载完成会先落文件、再广播；封面按文件重新生成，不能等重启
+            coverReloadToken += 1
         }
         .fullScreenCover(item: $previewRoute) { route in
             PhotoPreviewView(photos: house.photos, startIndex: route.index, roomKey: house.mediaRoomKey)
@@ -767,14 +784,6 @@ enum VideoShareError: LocalizedError {
 }
 
 enum VideoOnlyShare {
-    /// 分享用的转码 preset 顺序：先无损转封装，失败再逐级缩小重编码（都是 H.264/AAC 的 mp4）。
-    private static let exportPresets: [String] = [
-        AVAssetExportPresetPassthrough,
-        AVAssetExportPreset1920x1080,
-        AVAssetExportPreset1280x720,
-        AVAssetExportPreset960x540
-    ]
-
     /// 本地视频 → 可直接交给系统分享面板的文件地址。
     /// v2.35：不再转码。实测所有「点微信没反应」的都是 .mov，而同一个 .mov 存到相簿后从相簿
     /// 分享到微信完全正常（微信自己会转成 mp4 存回相簿），所以相簿给微信的就是**原文件本身**。
@@ -863,52 +872,6 @@ enum VideoOnlyShare {
         } catch {
             // 相册保存失败不影响主流程（分享），静默忽略
         }
-    }
-
-    // MARK: - 转码
-
-    /// 把任意本地视频转成经过校验的 mp4；preset 逐级兜底，全部失败抛错。
-    static func exportToMP4(_ url: URL) async throws -> URL {
-        var lastError: Error?
-        for preset in exportPresets {
-            do {
-                let output = try await runExport(source: url, preset: preset)
-                if try await validateVideo(output) {
-                    return output
-                }
-            } catch {
-                lastError = error
-            }
-        }
-        if let error = lastError {
-            BackupLogStore.log(category: "分享", action: "视频转码", result: "失败",
-                              detail: "\(url.lastPathComponent) \(error.localizedDescription)")
-        }
-        throw VideoShareError.allExportsFailed(url.lastPathComponent)
-    }
-
-    /// 单次 AVAssetExportSession 导出；preset 不适用或失败都抛错。
-    private static func runExport(source: URL, preset: String) async throws -> URL {
-        let asset = AVURLAsset(url: source)
-        guard await AVAssetExportSession.exportPresets(compatibleWith: asset).contains(preset) else {
-            throw VideoShareError.unreadable(source.lastPathComponent)
-        }
-        guard let session = AVAssetExportSession(asset: asset, presetName: preset) else {
-            throw VideoShareError.unreadable(source.lastPathComponent)
-        }
-        let output = FileManager.default.temporaryDirectory
-            .appendingPathComponent("share_video_\(UUID().uuidString).mp4")
-        session.outputURL = output
-        session.outputFileType = .mp4
-        // 微信扩展跨进程读取，网络优化标记让 moov 前置，扩展不用先拖完整文件
-        session.shouldOptimizeForNetworkUse = true
-
-        await session.export()
-        if session.status != .completed {
-            try? FileManager.default.removeItem(at: output)
-            throw session.error ?? VideoShareError.allExportsFailed(source.lastPathComponent)
-        }
-        return output
     }
 
     /// 回读校验：文件存在、非空、能加载、有视频轨、时长 > 0。

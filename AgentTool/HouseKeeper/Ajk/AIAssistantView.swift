@@ -450,8 +450,8 @@ struct AIAssistantView: View {
                 ForEach(quickScenes, id: \.label) { scene in
                     Button {
                         input = scene.prompt
-                        // v1.95：电表盯防场景一键开启「App 原生定时刷新」——AI 无法在后台自行定时执行
-                        //（iOS 系统限制），盯防落地为：每 2 小时自动刷新电表 + 低电量本地通知；
+                        // b34：电表盯防 = 本机前台每 2 小时刷新 + 服务器云端轮询 Bark 推送
+                        //（iOS 不允许 App 常驻后台，本机定时只在 App 运行时生效）；
                         // AI 对话时读取的即是最新电表数据（快照已接入）
                         if scene.label == "电表盯防" {
                             enableMeterWatch()
@@ -694,14 +694,13 @@ struct AIAssistantView: View {
 
     // MARK: - 发送
 
-    /// v1.95：电表盯防场景一键开启——App 原生定时刷新（2 小时）+ 低电量本地通知
+    /// b34：电表盯防场景一键开启——本机前台 2 小时刷新 + 服务器云端轮询 Bark 推送
     private func enableMeterWatch() {
         let store = MeterStore.shared
         store.settings.autoRefreshEnabled = true
         store.settings.autoRefreshMinutes = 120
-        store.settings.lowAlertEnabled = true
         store.saveSettings() // 内部会重建定时器并立即补刷一次
-        manager.errorText = "已开启电表盯防：每 2 小时自动刷新一次，低电量会本地通知提醒。注意：iOS 限制 App 被杀后无法后台执行，保持 App 在后台运行即可持续盯防；重新打开会立即补刷最新数据。"
+        manager.errorText = "已开启电表盯防：本机前台每 2 小时刷新一次；低电量/拉闸告警由服务器云端轮询经 Bark 推送。iOS 不允许 App 常驻后台，本机定时刷新只在 App 运行时生效，真正的持续盯防靠服务器。"
     }
 
     private func handlePhotoItems(_ items: [PhotosPickerItem]) {
@@ -1232,8 +1231,8 @@ struct AIAssistantSettingsView: View {
     /// v1.97：房产中介场景默认偏好模板（用户可自行修改完善；首次进入 AI 设置自动写入）
     static let recommendedTemplate = """
 【身份与口径】
-- 我是佛山顺德龙江利保米兰公馆的二房东/房产中介（梁涛），管理米兰公馆 1 座、2 座的多套出租房源。
-- 对外沟通一律自称/代称"梁涛"，语气口语化、简体中文，先结论后依据，不用"好的呢"这类敷衍词。
+- 我是佛山顺德龙江利保米兰公馆的二房东/房产中介，管理米兰公馆 1 座、2 座的多套出租房源。
+- 对外沟通语气口语化、简体中文，先结论后依据，不用"好的呢"这类敷衍词。
 
 【房号规则】
 - 房号带"2-"前缀 = 2 座（如 2-1006），不带前缀 = 1 座（如 1006、2334）；上下层等细分按用户原话保留。

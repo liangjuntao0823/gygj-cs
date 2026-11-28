@@ -43,6 +43,10 @@ log = logging.getLogger("notify-hub")
 MAX_DEVICES_PER_USER = 10
 MAX_EVENTS_PER_USER = 50       # 磁盘每用户最多保留事件
 EVENTS_RETURN = 20             # API 最近事件返回条数
+MAX_REMINDERS_PER_SOURCE = 100 # 每台设备最多上报的未来待办提醒
+REMINDER_EXPIRE_SEC = 6 * 3600 # 到点超过 6 小时未投递则视为过期，避免离线补推轰炸
+REMINDER_INFLIGHT_SEC = 180    # 投递中的租约，进程异常后 3 分钟可重试
+REMINDER_MAX_ATTEMPTS = 5      # 单条提醒最多尝试 5 轮，避免 Bark 故障时无限重试
 DEDUP_WINDOW_SEC = 300         # 同用户同文案 5 分钟内指纹去重（防重启/多出口重复推）
 DEDUP_LOOKBACK = 10
 ENROLL_WINDOW_SEC = 600
@@ -263,6 +267,9 @@ class HubRuntime:
         # 直接持有 meter Store.svc dict 引用：服务器配置变更 restart 后生效；测试可传普通 dict
         self.config = config if isinstance(config, dict) else {}
         self._sender = sender or default_bark_sender
+        # 业务板块准入校验：由服务启动时注入（如房源板块 house_access=False 时禁止 house 通知）。
+        # 签名 (notify_user_token, module) -> allowed；未注入时一律放行（兼容旧部署）。
+        self.access_checker: Callable[[str, str], bool] | None = None
 
     # ---- 配置（复用 meter service.json 的 enroll_code / bark_base，也支持 notify_ 前缀覆盖）----
 
@@ -285,9 +292,12 @@ class HubRuntime:
     def public_view(self, user: dict[str, Any], include_events: bool = True) -> dict[str, Any]:
         devices = [{
             "deviceId": d.get("device_id", ""),
+            "sourceDeviceId": d.get("source_device_id", ""),
             "name": d.get("name", ""),
             "platform": d.get("platform", ""),
             "serverBase": d.get("server_base", ""),
+            "enabled": d.get("enabled", True) is not False,
+            "modules": d.get("modules", {}) if isinstance(d.get("modules"), dict) else {},
             "keyMasked": mask_key(d.get("bark_key")),
             "addedAt": d.get("added_at", ""),
             "lastOkAt": d.get("last_ok_at", 0),
@@ -311,8 +321,37 @@ class HubRuntime:
     # ---- 注册 / 更新 ----
 
     @staticmethod
+    def _map_device_source_locked(user: dict[str, Any], source_device_id: str,
+                                  device_name: str = "") -> bool:
+        """把 App 的本机安装标识（house originDeviceId）映射到一台 Bark 设备。
+
+        绑定/新增设备时由 _upsert_device 直接写入；已绑定但旧数据没有映射时，
+        这里做一次兼容补齐：优先按同名设备，其次在账号只有一台设备时直接认领。
+        多台设备且同名时不猜，避免把 A 手机的房源动作错排到 B 手机上。
+        """
+        src = str(source_device_id or "").strip()[:64]
+        if not src:
+            return False
+        devices = [d for d in user.get("devices", []) if isinstance(d, dict)]
+        for d in devices:
+            if str(d.get("source_device_id") or "") == src:
+                return True
+        name = str(device_name or "").strip()[:60]
+        if name:
+            matched = [d for d in devices if str(d.get("name") or "") == name]
+            if len(matched) == 1:
+                matched[0]["source_device_id"] = src
+                return True
+        if len(devices) == 1:
+            devices[0]["source_device_id"] = src
+            return True
+        return False
+
+    @staticmethod
     def _upsert_device(user: dict[str, Any], key: str, name: str,
-                       platform: str, server_base: str) -> str | None:
+                       platform: str, server_base: str,
+                       source_device_id: str = "") -> str | None:
+        src = str(source_device_id or "").strip()[:64]
         for d in user.setdefault("devices", []):
             if isinstance(d, dict) and d.get("bark_key") == key:
                 if name:
@@ -321,15 +360,20 @@ class HubRuntime:
                     d["platform"] = platform
                 if server_base:
                     d["server_base"] = server_base
+                if src:
+                    d["source_device_id"] = src
                 return None
         if len(user["devices"]) >= MAX_DEVICES_PER_USER:
             return "device_limit"
         user["devices"].append({
             "device_id": "dv_" + secrets.token_hex(6),
             "bark_key": key,
+            "source_device_id": src,
             "name": name or "我的 iPhone",
             "platform": platform or "ios",
             "server_base": server_base or "",
+            "enabled": True,
+            "modules": {},
             "added_at": iso_now(),
             "last_ok_at": 0,
             "last_error": "",
@@ -354,7 +398,7 @@ class HubRuntime:
 
     def register(self, code: str = "", token: str = "", username: str = "",
                  bark_key: str = "", device_name: str = "", platform: str = "",
-                 server_base: str = "") -> tuple[dict[str, Any] | None, str | None]:
+                 server_base: str = "", source_device_id: str = "") -> tuple[dict[str, Any] | None, str | None]:
         """返回 (脱敏用户档案, 错误码)。token 有效=已登录更新（加/换设备、改名）；否则凭接入码新建。"""
         username = str(username or "").strip()[:40]
         key = parse_bark_key(bark_key)
@@ -374,9 +418,13 @@ class HubRuntime:
                 if bark_key and not key:
                     return None, "invalid_bark_key"
                 if key:
-                    err = self._upsert_device(existing, key, dname, plat, sbase)
+                    err = self._upsert_device(existing, key, dname, plat, sbase,
+                                              source_device_id)
                     if err:
                         return None, err
+                elif source_device_id:
+                    # 已绑定但未重绑的旧设备：带 token 调 register 即可补上本机映射。
+                    self._map_device_source_locked(existing, source_device_id, dname)
                 existing["updated_at"] = iso_now()
                 users[token] = existing
                 self.store.save(doc)
@@ -401,10 +449,10 @@ class HubRuntime:
                 "created_at": now,
                 "updated_at": now,
                 "devices": [],
-                "prefs": {"enabled": True, "modules": {"meter": True}},
+                "prefs": {"enabled": True, "modules": {"meter": True, "house": True, "todo": True}},
                 "events": [],
             }
-            self._upsert_device(user, key, dname, plat, sbase)
+            self._upsert_device(user, key, dname, plat, sbase, source_device_id)
             users[nt] = user
             idx[username.lower()] = nt
             self.store.save(doc)
@@ -433,10 +481,169 @@ class HubRuntime:
                     if isinstance(v, bool):
                         cur[kk] = v
                 prefs["modules"] = cur
+            # 待办模块或通道总开关关闭时，清掉本账号所有设备的待发提醒；
+            # 重新打开后由 App 的待办同步重新上报，避免关闭期间/重开后补推旧提醒。
+            if enabled is False or (isinstance(modules, dict) and modules.get("todo") is False):
+                user["reminders"] = {}
             user["updated_at"] = iso_now()
             doc["users"][token] = user
             self.store.save(doc)
             return self.public_view(user), None
+
+    # ---- 待办提醒：App 上报未来到点的提醒，服务端到点经 Bark 投递 ----
+    def replace_reminders(self, token: str, source: str, raw: Any) -> tuple[dict[str, Any] | None, str | None]:
+        """按设备来源替换提醒清单；同一账号多台手机互不覆盖各自待办。"""
+        if not isinstance(raw, list):
+            return None, "bad_reminders"
+        src = str(source or "").strip()[:64] or "default"
+        now = now_ts()
+        clean: list[dict[str, Any]] = []
+        with self.store.lock:
+            doc = self.store.doc()
+            user = doc["users"].get(token)
+            if not isinstance(user, dict):
+                return None, "unauthorized"
+            all_rem = user.get("reminders")
+            if not isinstance(all_rem, dict):
+                all_rem = {}
+            existing = {
+                str(r.get("id")): r for r in (all_rem.get(src) or [])
+                if isinstance(r, dict) and r.get("id")
+            }
+            for item in raw[:MAX_REMINDERS_PER_SOURCE]:
+                if not isinstance(item, dict):
+                    continue
+                rid = str(item.get("id") or "").strip()[:80]
+                if not rid:
+                    continue
+                try:
+                    due = float(item.get("dueAt") or item.get("due_at") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if due <= 0:
+                    continue
+                # 已经过去太久的提醒不再补推，避免用户离线几天后一次收到一堆旧待办
+                if due < now - REMINDER_EXPIRE_SEC:
+                    continue
+                body = str(item.get("body") or "").strip()[:1000]
+                if not body:
+                    continue
+                title = str(item.get("title") or "待办提醒").strip()[:120] or "待办提醒"
+                old = existing.get(rid)
+                sent_at = None
+                if old and abs(float(old.get("due_at") or 0) - due) <= 1:
+                    sent_at = old.get("sent_at")
+                clean.append({"id": rid, "due_at": due, "title": title, "body": body,
+                              "sent_at": sent_at, "updated_at": now})
+            all_rem[src] = clean
+            user["reminders"] = all_rem
+            # 待办上报也带本机 source；旧账号只有一台设备时可顺手补上房源去重映射。
+            if src != "default":
+                self._map_device_source_locked(user, src)
+            user["updated_at"] = iso_now()
+            doc["users"][token] = user
+            self.store.save(doc)
+        return {"ok": True, "count": len(clean), "source": src}, None
+
+    def run_due_reminders(self, now: float | None = None, limit: int = 50) -> int:
+        """到点扫描待办提醒并投递；由 meter-watch 常驻 worker 每 tick 调用。"""
+        now = float(now if now is not None else time.time())
+        claimed: list[tuple[str, str, str, str]] = []
+        with self.store.lock:
+            doc = self.store.doc()
+            changed = False
+            for token, user in doc["users"].items():
+                if not isinstance(user, dict):
+                    continue
+                prefs = user.get("prefs") if isinstance(user.get("prefs"), dict) else {}
+                if prefs.get("enabled") is False:
+                    continue
+                modules = prefs.get("modules") if isinstance(prefs.get("modules"), dict) else {}
+                if modules.get("todo", True) is False:
+                    continue
+                all_rem = user.get("reminders")
+                if not isinstance(all_rem, dict):
+                    continue
+                for src, items in all_rem.items():
+                    if not isinstance(items, list):
+                        continue
+                    for r in items:
+                        if not isinstance(r, dict) or r.get("sent_at"):
+                            continue
+                        try:
+                            due = float(r.get("due_at") or 0)
+                        except (TypeError, ValueError):
+                            due = 0
+                        if due <= 0 or due > now:
+                            continue
+                        if now - due > REMINDER_EXPIRE_SEC:
+                            r["sent_at"] = now
+                            r["status"] = "expired"
+                            changed = True
+                            continue
+                        inflight = float(r.get("in_flight_at") or 0)
+                        if inflight and now - inflight < REMINDER_INFLIGHT_SEC:
+                            continue
+                        attempts = int(r.get("attempts") or 0) + 1
+                        if attempts > REMINDER_MAX_ATTEMPTS:
+                            r["sent_at"] = now
+                            r["status"] = "failed_too_many_attempts"
+                            changed = True
+                            continue
+                        r["in_flight_at"] = now
+                        r["attempts"] = attempts
+                        r["status"] = "sending"
+                        changed = True
+                        claimed.append((token, str(r.get("id") or ""),
+                                        str(r.get("title") or "待办提醒"),
+                                        str(r.get("body") or "")))
+                        break  # 每 tick 每个来源只取一条，避免一次 tick 长时间阻塞
+                    if len(claimed) >= limit:
+                        break
+                if len(claimed) >= limit:
+                    break
+            if changed:
+                self.store.save(doc)
+
+        sent = 0
+        for token, rid, title, body in claimed:
+            try:
+                # event_type 带上提醒 ID，避免两条同文案待办被 5 分钟指纹去重
+                res = self.dispatch(token, "todo", "todo_" + rid[:20], title, body,
+                                    data={"reminderId": rid})
+            except Exception:
+                log.exception("待办提醒投递异常 user=%s id=%s", mask_key(token), rid)
+                res = {"ok": False, "reason": "exception"}
+            ok = bool(res.get("ok"))
+            if ok:
+                sent += 1
+            with self.store.lock:
+                doc = self.store.doc()
+                user = doc["users"].get(token)
+                if isinstance(user, dict):
+                    all_rem = user.get("reminders")
+                    if isinstance(all_rem, dict):
+                        for items in all_rem.values():
+                            if not isinstance(items, list):
+                                continue
+                            for r in items:
+                                if not isinstance(r, dict) or str(r.get("id") or "") != rid:
+                                    continue
+                                r.pop("in_flight_at", None)
+                                if ok:
+                                    r["sent_at"] = now
+                                    r["status"] = "sent"
+                                elif res.get("reason") in ("unknown_user", "no_device", "user_disabled",
+                                                            "module_disabled", "module_access_denied"):
+                                    r["sent_at"] = now
+                                    r["status"] = "suppressed:" + str(res.get("reason"))
+                                else:
+                                    r["status"] = "retry"
+                                break
+                        self.store.save(doc)
+        if claimed:
+            log.info("待办提醒本轮处理 %d 条，成功 %d 条", len(claimed), sent)
+        return sent
 
     def remove_device(self, token: str, device_id: str = "", bark_key: str = "") -> dict[str, Any] | None:
         key = parse_bark_key(bark_key) if bark_key else ""
@@ -460,6 +667,65 @@ class HubRuntime:
                 user["updated_at"] = iso_now()
                 self.store.save(doc)
             return self.public_view(user)
+
+    # ---- 设备级模块开关 / 板块准入 ----
+
+    @staticmethod
+    def device_allows(device: dict[str, Any], module: str) -> bool:
+        """单台设备是否接收某板块：设备总开关 + 设备自己的模块开关（缺省=允许）。"""
+        if not isinstance(device, dict) or not device.get("bark_key"):
+            return False
+        if device.get("enabled") is False:
+            return False
+        modules = device.get("modules") if isinstance(device.get("modules"), dict) else {}
+        return modules.get(str(module), True) is not False
+
+    def set_device_prefs(self, token: str, device_id: str,
+                         enabled: Any = _UNSET, modules: dict | None = None,
+                         name: Any = _UNSET) -> tuple[dict[str, Any] | None, str | None]:  # type: ignore[assignment]
+        """后台管理单台设备：总开关 / 按板块开关 / 备注名。"""
+        device_id = str(device_id or "").strip()
+        if not device_id:
+            return None, "device_id_required"
+        with self.store.lock:
+            doc = self.store.doc()
+            user = doc["users"].get(token)
+            if not isinstance(user, dict):
+                return None, "unauthorized"
+            target = None
+            for d in user.get("devices", []):
+                if isinstance(d, dict) and str(d.get("device_id") or "") == device_id:
+                    target = d
+                    break
+            if target is None:
+                return None, "device_not_found"
+            if enabled is not _UNSET:
+                target["enabled"] = bool(enabled)
+            if name is not _UNSET:
+                new_name = str(name or "").strip()[:60]
+                if new_name:
+                    target["name"] = new_name
+            if isinstance(modules, dict):
+                cur = target.get("modules") if isinstance(target.get("modules"), dict) else {}
+                for k, v in list(modules.items())[:32]:
+                    kk = str(k)[:32]
+                    if isinstance(v, bool):
+                        cur[kk] = v
+                target["modules"] = cur
+            user["updated_at"] = iso_now()
+            doc["users"][token] = user
+            self.store.save(doc)
+            return self.public_view(user), None
+
+    def _module_access_allowed(self, user_token: str, module: str) -> bool:
+        """业务板块准入（如房源 house_access）优先于推送中心的模块开关。"""
+        if module == "system" or self.access_checker is None:
+            return True
+        try:
+            return bool(self.access_checker(str(user_token or ""), str(module or "")))
+        except Exception:
+            log.warning("通知板块准入校验异常 user=%s module=%s", mask_key(user_token), module, exc_info=True)
+            return False
 
     # ---- 事件投递 ----
 
@@ -492,13 +758,16 @@ class HubRuntime:
     @staticmethod
     def _group(module: str) -> str:
         return {"system": "公寓管家-通道", "meter": "公寓管家-电表",
-                "house": "公寓管家-房源"}.get(module, f"公寓管家-{module}")
+                "house": "公寓管家-房源", "todo": "公寓管家-待办"}.get(
+                    module, f"公寓管家-{module}")
 
     def broadcast(self, module: str, event_type: str, title: str, body: str,
                   exclude_device_id: str = "", data: dict[str, Any] | None = None,
-                  level: str | None = None, subtitle: str = "") -> dict[str, Any]:
+                  level: str | None = None, subtitle: str = "",
+                  exclude_source_device_id: str = "") -> dict[str, Any]:
         """房源板块广播：投给所有 enabled、模块未禁用、有设备的用户名下设备；
-        exclude_device_id 为发起本次修改的设备，跳过它（本机走本地通知，沿用现有文案）。
+        exclude_device_id 为发起本次修改的设备，exclude_source_device_id 为 App 的本机安装标识；
+        两者任一命中都跳过该设备（本机走本地通知，其他设备走 Bark）。
         改一条推一条，不做合并。"""
         module = str(module or "house")[:32]
         event_type = str(event_type or "change")[:32]
@@ -512,16 +781,21 @@ class HubRuntime:
             for user_token, user in doc["users"].items():
                 if not isinstance(user, dict):
                     continue
+                # 板块准入优先：如房源板块 house_access=False，即使推送中心开着也不发。
+                if not self._module_access_allowed(user_token, module):
+                    continue
                 prefs = user.get("prefs") if isinstance(user.get("prefs"), dict) else {}
                 if prefs.get("enabled") is False:
                     continue
                 modules = prefs.get("modules") if isinstance(prefs.get("modules"), dict) else {}
                 if modules.get(module, True) is False:
                     continue
+                ex_dev = str(exclude_device_id or "").strip()
+                ex_src = str(exclude_source_device_id or "").strip()
                 devices = [d for d in user.get("devices", [])
-                           if isinstance(d, dict) and d.get("bark_key")
-                           and d.get("enabled") is not False
-                           and str(d.get("device_id")) != str(exclude_device_id)]
+                           if self.device_allows(d, module)
+                           and (not ex_dev or str(d.get("device_id") or "") != ex_dev)
+                           and (not ex_src or str(d.get("source_device_id") or "") != ex_src)]
                 if not devices:
                     continue
                 event = {
@@ -596,8 +870,11 @@ class HubRuntime:
 
     def dispatch(self, user_token: str, module: str, event_type: str, title: str, body: str,
                  data: dict[str, Any] | None = None, idem_key: str | None = None,
-                 level: str | None = None, subtitle: str = "") -> dict[str, Any]:
-        """业务模块统一入口：只按 user_token 投该用户名下设备，绝不跨用户群发。"""
+                 level: str | None = None, subtitle: str = "",
+                 exclude_device_id: str = "",
+                 exclude_source_device_id: str = "") -> dict[str, Any]:
+        """业务模块统一入口：只按 user_token 投该用户名下设备，绝不跨用户群发。
+        exclude_* 用于“只通知本账号其他设备”，例如本机刚改完房源时跳过本机 Bark。"""
         module = str(module or "generic")[:32]
         event_type = str(event_type or "alert")[:32]
         title = str(title or "通知")[:120]
@@ -611,6 +888,11 @@ class HubRuntime:
             if not isinstance(user, dict):
                 return {"ok": False, "reason": "unknown_user", "sent": 0, "total": 0}
 
+            # 板块准入优先于推送中心的模块开关（如房源 house_access=False）
+            if not self._module_access_allowed(user_token, module):
+                return self._suppressed_locked(doc, user, module, event_type, title, body, data,
+                                               "module_access_denied")
+
             prefs = user.get("prefs") if isinstance(user.get("prefs"), dict) else {}
             if prefs.get("enabled") is False:
                 return self._suppressed_locked(doc, user, module, event_type, title, body, data,
@@ -620,8 +902,12 @@ class HubRuntime:
                 return self._suppressed_locked(doc, user, module, event_type, title, body, data,
                                                "module_disabled")
 
+            ex_dev = str(exclude_device_id or "").strip()
+            ex_src = str(exclude_source_device_id or "").strip()
             devices = [d for d in user.get("devices", [])
-                       if isinstance(d, dict) and d.get("bark_key") and d.get("enabled") is not False]
+                       if self.device_allows(d, module)
+                       and (not ex_dev or str(d.get("device_id") or "") != ex_dev)
+                       and (not ex_src or str(d.get("source_device_id") or "") != ex_src)]
             if not devices:
                 return self._suppressed_locked(doc, user, module, event_type, title, body, data, "no_device")
 
@@ -846,6 +1132,7 @@ def route_request(handler: Any, method: str, path: str, hub: HubRuntime) -> bool
                 device_name=str(body.get("deviceName") or body.get("device_name") or ""),
                 platform=str(body.get("platform") or ""),
                 server_base=str(body.get("serverBase") or body.get("server_base") or ""),
+                source_device_id=str(body.get("sourceDeviceId") or body.get("source_device_id") or ""),
             )
             if err:
                 if auth_user is None and err == "invalid_code":
@@ -898,6 +1185,20 @@ def route_request(handler: Any, method: str, path: str, hub: HubRuntime) -> bool
                 return send(200, view)
             return send(400, {"ok": False, "error": "unsupported_action"})
 
+        if sub == "reminders" and method == "POST":
+            body = handler._read_json()
+            if body is None:
+                return send(400, {"ok": False, "error": "bad_json"})
+            view, err = hub.replace_reminders(
+                token,
+                str(body.get("source") or ""),
+                body.get("reminders") if isinstance(body.get("reminders"), list) else None,
+            )
+            if err:
+                status = 401 if err == "unauthorized" else 400
+                return send(status, {"ok": False, "error": err})
+            return send(200, view or {"ok": True})
+
         # 通知文案模板：读取 / 保存 / 预览（预览会按当前模板真实推送到该用户设备）
         if sub == "templates/meter" and method == "GET":
             tpls = hub.get_templates(token, "meter")
@@ -920,7 +1221,7 @@ def route_request(handler: Any, method: str, path: str, hub: HubRuntime) -> bool
             event_key = str((body or {}).get("eventKey") or "low")
             return send(200, hub.preview_template(token, "meter", event_key))
 
-        if sub.startswith("register") or sub in ("me", "events", "test", "prefs", "devices", "health"):
+        if sub.startswith("register") or sub in ("me", "events", "test", "prefs", "devices", "reminders", "health"):
             return send(405, {"ok": False, "error": "method_not_allowed"})
         return send(404, {"ok": False, "error": "not_found"})
 

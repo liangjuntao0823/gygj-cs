@@ -176,9 +176,6 @@ enum CrashLogCollector {
             .sorted { a, b in (try? a.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast > (try? b.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast }
     }
 
-    /// 崩溃日志是否存在
-    static func hasLogs() -> Bool { !logFiles().isEmpty }
-
     /// v2.18：崩溃日志总占用（设置页入口右侧显示，不用进去才知道占多大）
     static func totalBytes() -> Int {
         logFiles().reduce(0) { sum, url in

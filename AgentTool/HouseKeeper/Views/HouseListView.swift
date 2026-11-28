@@ -13,46 +13,19 @@ enum HouseSortMode: String, CaseIterable {
 /// v2.9（P1-1）：轻量变更感知三态结果
 enum CloudChangeState: Equatable {
     case noChange        // 两端一致，无变化
-    case hasUpdate       // 云端有更新，提示用户下拉同步
+    case hasUpdate       // 云端有更新，提示用户点左上角刷新确认后同步
     case detectFailed    // 检测失败（断网/超时/未配置云），不再静默
 }
 
-/// v2.63（b121 回归）：自动云端变更检测的全局指示状态。
-/// 冷启动 / 回前台 / 进板块 30 分钟兜底三条路径最终都走 detectCloudLedgerChange，
-/// 在这里统一「点亮 → 至少展示 0.6 秒 → 熄灭」，让用户能看到「正在检测云端变更…」，
-/// 不再出现「无变化时一点反馈都没有」的静默感知。
+/// 手动云端同步的全局指示状态。
 /// 约定：本类所有方法只从主线程调用（异步入口用 MainActor.run 包一层）。
 final class CloudDetectActivity: ObservableObject {
     static let shared = CloudDetectActivity()
 
-    /// 自动检测进行中（房源页顶部胶囊进度条据此显示）
-    @Published private(set) var isDetecting = false
-    /// 手动云端同步进行中——自动检测直接跳过，避免两边同时拉清单、结论互相打架
+    /// 手动云端同步进行中——并发拉清单时跳过重复动作，避免两边结论互相打架
     @Published private(set) var isManualSyncing = false
 
-    private var detectDepth = 0
     private var manualDepth = 0
-    private var startedAt: Date?
-
-    func beginDetecting() {
-        detectDepth += 1
-        if startedAt == nil { startedAt = Date() }
-        isDetecting = true
-    }
-
-    /// 至少展示 minimumVisible 秒（沿用 b121 的 0.6 秒口径），避免检测太快、一闪而过感知不到。
-    /// 计数归零后才真正收尾；期间又来了新检测则继续显示。
-    func endDetecting(minimumVisible: TimeInterval = 0.6) {
-        detectDepth = max(0, detectDepth - 1)
-        guard detectDepth == 0 else { return }
-        let elapsed = Date().timeIntervalSince(startedAt ?? Date())
-        let delay = max(0, minimumVisible - elapsed)
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self, self.detectDepth == 0 else { return }
-            self.isDetecting = false
-            self.startedAt = nil
-        }
-    }
 
     func beginManualSync() {
         manualDepth += 1
@@ -74,16 +47,6 @@ struct HouseListView: View {
     static let houseStoreChanged = Notification.Name("houseStoreChanged")
     /// b118（清单12）：打开 App 轻量变更感知——启动/回前台探测云端账本有变化时广播
     static let cloudLedgerChangedLight = Notification.Name("cloudLedgerChangedLight")
-
-    /// v1.67：后台线程安全的媒体对账快照——SwiftData @Model 属性（mediaItems 等）只能在
-    /// 主线程/模型上下文访问，跨线程读会崩溃（v1.66 刷新「点击没反应」根因）。
-    /// 因此先在主线程把需要的数据提取成纯值，后台只做网络请求。
-    private struct PendingMediaHouseSnapshot {
-        let roomKey: String
-        let displayRoomNo: String
-        let files: [ShareMediaFile]
-        let info: ShareHouseInfo
-    }
 
     @State private var searchText = ""
     /// v2.18：房源顶栏「操作日志」入口（批量导入旁边），不用再进设置页才能看日志
@@ -119,6 +82,9 @@ struct HouseListView: View {
     //   - showShareModeAlert + activeDialog：分享方式选择（普通按钮触发，非 swipeActions）
     //   - showInfoAlert + infoMessage：分享错误 / 批量结果提示
     @State private var showDeleteConfirm = false
+    /// 点左上角刷新时的确认弹窗：有本地隐藏房源时先问“恢复还是保持隐藏”，
+    /// 没有隐藏房源时确认“是否从服务器同步”，避免点一下就直接拉取。
+    @State private var refreshPrompt: RefreshPrompt?
     @State private var isBatchDelete = false
     @State private var deleteRunning = false
     @State private var deleteDone = 0
@@ -132,33 +98,15 @@ struct HouseListView: View {
     // v1.73（#1 重做）：原生悬浮结果提示——顶部胶囊横幅，自动消失，替代「占半个屏幕」的居中大弹窗
     @State private var infoToast: String?
     @State private var infoToastIsError = false
-    // v1.40 第11点：同步先弹变化确认（预览 → 确认 → 应用）
-    @State private var showSyncConfirm = false
     // v1.72（#1/#5）：刷新/同步进行中状态——点刷新立即反馈「正在刷新…」，比对完成才收起
     @State private var isSyncing = false
-    /// v2.63：自动检测指示状态（冷启动 / 回前台 / 进板块兜底三条路径共用同一个全局状态）
-    @StateObject private var detectActivity = CloudDetectActivity.shared
     /// v2.65：长按触发的深度核对与普通刷新分开提示（否则长按后只显示「正在刷新…」，看不出走的是哪条路）
     @State private var isDeepSyncing = false
+    /// b31/iOS17：长按刷新触发后抑制同一次触摸的单击动作，避免长按又跑一次普通刷新。
+    @State private var suppressNextRefreshTap = false
     /// v2.50：云端有更新 → 顶栏常驻横幅，只有手动点 ✕ 才收起（此前 toast 不到 1 秒就消失，容易错过）
     @State private var cloudUpdateBannerVisible = false
-    // v1.68：云端媒体对账确认（先干跑列桶 → 弹确认 → 确认后才上传）+ 同步任务进度/最小化
-    @State private var showMediaSyncConfirm = false
-    @State private var pendingMediaSnaps: [PendingMediaHouseSnapshot] = []
     @ObservedObject private var syncCenter = SyncTaskCenter.shared
-    @State private var pendingSyncRecs: [CloudHouseRecord] = []
-    // v2.62（B1）：本次同步的云端权威房号集合（来自目录列举），执行侧判断「云端是否有这套」只用它
-    @State private var pendingSyncCloudKeys: Set<String> = []
-    @State private var pendingSyncAdded: [(roomNo: String, roomKey: String, mediaNames: [String])] = []
-    @State private var pendingSyncUpdated: [(roomNo: String, byUser: String)] = []
-    @State private var pendingSyncDeleted: [(roomKey: String, roomNo: String)] = []   // v1.42：带房号
-    @State private var pendingSyncPushed: [(roomKey: String, roomNo: String)] = []     // v1.42：带房号
-    @State private var pendingSyncMediaDiff: [(roomNo: String, missing: Bool)] = []    // v1.43：媒体差异房号（含「本地缺文件需从云端补回」）
-    // v2.58（#3）：任务中心 cloudPull 重试发起的这次同步——确认框弹出后要等用户决定，
-    // 点「确认同步」执行完 / 点「取消」才结算任务，不能提前报成功
-    @State private var pendingSyncRetryTaskID: UUID?
-    // v2.58（#3）：媒体补齐确认同样可能由 cloudPull 重试触发——确认/取消后结算原任务
-    @State private var pendingMediaSyncRetryTaskID: UUID?
     @State private var activeDialog: HouseListDialog?
 
     // v1.22：首页多选分享——一次选多套，生成【一个合集分享卡片】（好友点开链接即可查看全部 N 套），
@@ -167,8 +115,8 @@ struct HouseListView: View {
     @State private var selectedHouseIDs = Set<UUID>()
     // v2.17：队列元素从「卡片链接」扩展为任意分享素材（卡片 = [URL]，只分享视频 = [AVAsset]）
     @State private var shareQueue: [[Any]] = []
-    /// v2.29：分享面板回到 SwiftUI sheet 呈现（与 2.17 一致，实测 2.17 视频分享可用）
-    @State private var currentShareStep: ShareStep? = nil
+    // b29：分享面板改用 SharePresenter 从最顶层控制器直呈。
+    // 旧版挂在 SwiftUI .sheet 里，微信分享扩展拿不到有效呈现上下文，表现为“跳微信后什么都没发出去”。
     // v2.17：多选逐套分享时，一套发完询问「继续下一套 / 结束」
     @State private var showContinueShare = false
     // v2.17：保存类操作的轻提示（与工作台/成交板块一致的底部小胶囊，不弹遮罩、不占屏）
@@ -183,6 +131,17 @@ struct HouseListView: View {
     /// v1.15 需求2：单一弹窗枚举（iOS 17 同一视图多个 confirmationDialog/alert 会互相覆盖、且 swipeActions
     /// 手势会拦截 confirmationDialog 按钮点击，删除确认因此无反应）——统一改用单一 alert 呈现所有确认/提示
     /// v1.16 需求2：枚举仅保留「分享方式选择」两类（multiShare/singleShare）；删除/批量删除走独立 showDeleteConfirm
+    enum RefreshPrompt: Identifiable {
+        case confirm(deep: Bool, summary: String)
+        case hidden(count: Int, deep: Bool, summary: String?)
+        var id: String {
+            switch self {
+            case .confirm: return "confirm"
+            case .hidden: return "hidden"
+            }
+        }
+    }
+
     enum HouseListDialog: Identifiable {
         case multiShare
         case singleShare
@@ -308,19 +267,6 @@ struct HouseListView: View {
                         .padding(.vertical, 7)
                         .background(.ultraThinMaterial, in: Capsule())
                         .transition(.move(edge: .top).combined(with: .opacity))
-                    } else if detectActivity.isDetecting {
-                        // v2.63（b121 回归）：自动检测期间的细进度条提示；
-                        // 手动刷新/同步优先（isSyncing 为真时上面那条占了位置），两者不会叠在一起。
-                        HStack(spacing: 8) {
-                            ProgressView().controlSize(.small)
-                            Text("正在检测云端变更…")
-                                .font(.footnote.weight(.medium))
-                                .foregroundColor(.secondary)
-                        }
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 7)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .transition(.move(edge: .top).combined(with: .opacity))
                     }
                     if let toast = infoToast {
                         HStack(spacing: 6) {
@@ -343,9 +289,13 @@ struct HouseListView: View {
                 // v1.59：左上角 = 手动同步 + 多选入口（多选从右上角移到刷新旁边）
                 ToolbarItem(placement: .topBarLeading) {
                     HStack(spacing: 14) {
-                        // v1.19：左上角手动同步（与下拉刷新同效果——拉取云端房源）
+                        // v1.19：左上角手动同步（已取消下拉刷新，这里是唯一手动入口）
                         Button {
-                            Task { await syncCloudHouses() }
+                            if suppressNextRefreshTap {
+                                suppressNextRefreshTap = false
+                            } else {
+                                requestManualSync(deep: false)
+                            }
                         } label: {
                             if isSyncing {
                                 ProgressView().controlSize(.small)
@@ -355,9 +305,15 @@ struct HouseListView: View {
                         }
                         // v2.62（B5）：长按 = 深度刷新——忽略清单摘要与 24h 缓存，逐套全量核对。
                         // 日常点按走增量（1~3 秒）；怀疑漏更新时用长按强制全量。
-                        .highPriorityGesture(
+                        // b31：iOS17 上 highPriorityGesture 会吞掉 Button 的单击，
+                        // 改用 simultaneousGesture；长按后抑制同一次触摸的单击。
+                        .simultaneousGesture(
                             LongPressGesture(minimumDuration: 0.6).onEnded { _ in
-                                Task { await syncCloudHouses(deep: true) }
+                                suppressNextRefreshTap = true
+                                requestManualSync(deep: true)
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                                    suppressNextRefreshTap = false
+                                }
                             }
                         )
                         // v2.63：同步进行中禁用按钮（点按与长按都生效），配合入口重入保护，连点不会再开第二份任务
@@ -400,17 +356,8 @@ struct HouseListView: View {
                     }
                 }
             }
-            // v2.29：分享面板走 sheet（与 2.17 可用版本一致）；面板关闭后再问「继续/结束」
-            .sheet(item: $currentShareStep, onDismiss: {
-                if !shareQueue.isEmpty, shareIndex < shareQueue.count - 1 {
-                    remainingShareCount = shareQueue.count - shareIndex - 1
-                    showContinueShare = true
-                } else if !shareQueue.isEmpty {
-                    exitMultiSelect()
-                }
-            }) { step in
-                HouseShareSheet(items: step.items)
-            }
+            // b29：分享由 SharePresenter 直接 present，不再挂 .sheet。
+            // 旧的 .sheet 包裹会让微信扩展拿不到 present 上下文，出现“跳微信后无内容”。
             .sheet(isPresented: $showAdd, onDismiss: {
                 autoImportNext = false
             }) {
@@ -493,44 +440,6 @@ struct HouseListView: View {
                     GlobalAlertCenter.shared.show(msg)
                 }
             }
-            // v1.40 第11点：同步变化确认——先展示变化详情，确认后才应用
-            .alert("发现云端变化", isPresented: $showSyncConfirm) {
-                Button("确认同步", role: .destructive) {
-                    // v2.58（#3）：把重试任务 id 带进执行体，执行完按真实结果显示成功/失败
-                    let retryTaskID = pendingSyncRetryTaskID
-                    pendingSyncRetryTaskID = nil
-                    Task { await applySyncPreview(retryTaskID: retryTaskID) }
-                }
-                Button("取消", role: .cancel) {
-                    // v2.58（#3）：用户主动取消，不写失败记录，直接收掉这次重试任务
-                    if let retryTaskID = pendingSyncRetryTaskID {
-                        syncCenter.discard(id: retryTaskID)
-                        pendingSyncRetryTaskID = nil
-                    }
-                }
-            } message: {
-                Text(syncChangeSummary())
-            }
-            // v1.68：云端媒体对账确认——干跑列桶后发现云端缺媒体，确认后才开始上传（不再静默后台跑）
-            .alert("确认补齐云端媒体", isPresented: $showMediaSyncConfirm) {
-                Button("开始补齐", role: .destructive) {
-                    // v2.58（#3）：补齐完成后按真实结果结算 cloudPull 重试任务
-                    let retryTaskID = pendingMediaSyncRetryTaskID
-                    pendingMediaSyncRetryTaskID = nil
-                    let snaps = pendingMediaSnaps
-                    pendingMediaSnaps = []
-                    Task { await runMediaUpload(snaps: snaps, config: CosConfig.load(), ctx: houseModelContext, cloudPullTaskID: retryTaskID) }
-                }
-                Button("取消", role: .cancel) {
-                    pendingMediaSnaps = []
-                    if let retryTaskID = pendingMediaSyncRetryTaskID {
-                        syncCenter.discard(id: retryTaskID)
-                        pendingMediaSyncRetryTaskID = nil
-                    }
-                }
-            } message: {
-                Text(mediaSyncConfirmSummary())
-            }
             // v2.26：分享面板改为 SharePresenter 直呈，不再挂 sheet（sheet 里第二次弹微信点不动）
             .overlay {
                 if isGenerating {
@@ -557,26 +466,43 @@ struct HouseListView: View {
             // 挂在本链最末（最后挂载优先响应），避免 iOS 17 swipeActions 手势拦截 confirmationDialog / 自定义 Binding 失效的问题
             // v1.36 需求1：删除改为彻底删除（不再进回收站）
             .alert(isBatchDelete ? "删除选中的 \(selectedHouseIDs.count) 套房源" : "删除这套房源", isPresented: $showDeleteConfirm) {
-                Button("仅删除本地（云端保留）") { startDelete(both: false) }
-                Button("删除双端（推荐）", role: .destructive) { startDelete(both: true) }
+                Button("仅删除本地（服务器保留）") { startDelete(both: false) }
+                Button("删除本地与服务器（推荐）", role: .destructive) { startDelete(both: true) }
                 Button("取消", role: .cancel) { deleteTarget = nil }
             } message: {
                 Text(deleteConfirmMessage)
             }
+            // 点左上角总刷新才触发；自动对账（进页/45 秒）不弹，避免打断当前操作。
+            .alert(item: $refreshPrompt) { prompt in
+                switch prompt {
+                case .confirm(let deep, let summary):
+                    return Alert(
+                        title: Text("与服务器同步房源？"),
+                        message: Text(summary),
+                        primaryButton: .default(Text("开始同步")) {
+                            Task { await syncCloudHouses(deep: deep) }
+                        },
+                        secondaryButton: .cancel(Text("取消")))
+                case .hidden(let count, let deep, let summary):
+                    let head = (summary.map { $0 + "\n\n" }) ?? ""
+                    return Alert(
+                        title: Text("有 \(count) 套仅删了本地的房源"),
+                        message: Text(head + "服务器上仍保留这 \(count) 套。保持隐藏只影响本机显示，不会删服务器；恢复显示会清除本机全部“仅删本地”标记，并把房源和媒体重新拉回本机。"),
+                        primaryButton: .default(Text("恢复显示并同步")) {
+                            HouseLocalDeletionStore.clearAll()
+                            Task { await syncCloudHouses(deep: deep) }
+                        },
+                        secondaryButton: .default(Text("保持隐藏并同步")) {
+                            Task { await syncCloudHouses(deep: deep) }
+                        })
+                }
+            }
         }
         .onAppear {
             reloadHouses()
-            // 服务器模式：进页面静默增量拉取权威库（小 JSON，失败不打扰、不打断操作）
-            if HouseServerMode.ready, let ctx = houseModelContext {
-                Task {
-                    // 进页先补传离线未提交的改动，再全量对账权威库（弱网改动不丢）
-                    _ = await HousePendingUploader.shared.flush(context: ctx)
-                    let n = try? await HouseSyncEngine.shared.pull(context: ctx)
-                    if (n ?? 0) > 0 {
-                        reloadHouses()
-                    }
-                }
-            }
+            // b31：进入房源页不再自动补传/自动拉取。所有本机→服务器、服务器→本机的写入
+            // 都必须由用户在任务中心或左上角刷新按钮手动触发，避免“新设备一接入就把本地房
+            // 自动推到服务器、另一台设备未经确认就写回本机”。
             // v2.58（#3）：整次云端同步的重试入口——页面必须回报真实结果（成功/失败/等确认）
             TaskRetryPerformer.shared.cloudPull = { retryTaskID in
                 await syncCloudHouses(retryTaskID: retryTaskID)
@@ -585,7 +511,7 @@ struct HouseListView: View {
             // 只消费「App 启动 / 回前台」写下的 pending 标记；没有标记就不发请求。
             let pending = UserDefaults.standard.bool(forKey: "cloudLedgerPendingHint")
             UserDefaults.standard.set(false, forKey: "cloudLedgerPendingHint")
-            if pending && !HouseServerMode.ready { showCloudChangeHint() }
+            if pending && HouseServerMode.ready { showCloudChangeHint() }
             // v2.62（A5）：静默兜底——距上次检测超过 30 分钟、且当前没有上传任务时，才轻量检测一次；
             // 失败不弹提示（避免刚进页面就打扰），只有真有更新才挂横幅。
             Task {
@@ -595,19 +521,22 @@ struct HouseListView: View {
                 let lastAt = UserDefaults.standard.double(forKey: "cloudDetectLastAt")
                 guard now - lastAt >= 1800 else { return }
                 let changeState = await Self.detectCloudLedgerChange(houseContext: houseModelContext)
+                UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "cloudDetectLastAt")
                 if changeState == .hasUpdate { showCloudChangeHint() }
             }
         }
+        // b31：去掉 45 秒自动 pull。自动检测只查服务器是否有变化并挂横幅，
+        // 绝不把服务器数据写回本机；用户点左上角刷新、确认后才同步。
         .onReceive(NotificationCenter.default.publisher(for: Self.houseStoreChanged)) { _ in
             reloadHouses()
         }
         // b118（清单12：打开 App 轻量变更感知）：App 启动/回前台探测到云端账本有变化 →
-        // 顶部横幅轻提示「云端有更新」，用户下拉刷新即同步（不自动拉取，省流量、不打断当前操作）
+        // 顶部横幅轻提示「云端有更新」，用户点左上角刷新确认后同步（不自动拉取，省流量、不打断当前操作）
         // b119（清单1 重做）：文案改为「检测到云端有更新，请同步」；本页收到通知直接提示
         // b120：通知到达也走统一提示入口（showCloudChangeHint 防抖），并消费 pendingHint
         .onReceive(NotificationCenter.default.publisher(for: Self.cloudLedgerChangedLight)) { _ in
             UserDefaults.standard.set(false, forKey: "cloudLedgerPendingHint")
-            if !HouseServerMode.ready { showCloudChangeHint() }
+            if HouseServerMode.ready { showCloudChangeHint() }
         }
     }
 
@@ -620,299 +549,39 @@ struct HouseListView: View {
         }
     }
 
-    /// v2.9（P1-1）：检测失败提示（断网/超时/未配置云），与「无变化」区分，不再静默吞错。
-    private func showCloudDetectFailedHint() {
-        let now = Date().timeIntervalSince1970
-        let last = UserDefaults.standard.double(forKey: "cloudLedgerHintShownAt")
-        if now - last < 5 { return }
-        UserDefaults.standard.set(now, forKey: "cloudLedgerHintShownAt")
-        showToast("云端检测失败：请检查网络或云配置后重试")
-    }
-
-    /// v2.37（#15/#34）：变更感知改为「只拉 1 个总清单」做增量比对，请求数从约 128 降到 1。
-    /// - 本地还没有任何修订号基线（首次安装/刚升级），或云端总清单缺失：退回一次全量精确比对（fetchAll），
-    ///   顺手重建总清单、建立基线；之后就只拉总清单。
-    /// - 有基线：拉总清单，按「修订号是否变化 + 房号/座号/媒体数摘要」判断；本地有、清单没有或反之也算差异。
-    /// - 加 45 秒节流：短时间内反复进入页面直接复用上次结果，不重复发请求。
-    /// 探测失败（断网/超时/未配置云）→ .detectFailed，与「无变化」严格区分。
-    static func detectCloudLedgerChange(houseContext: ModelContext?) async -> CloudChangeState {
-        // 服务器模式：清单/账本权威在 8082，旧 COS 清单变更感知整体跳过，避免读旧桶、弹旧「云端有更新」横幅
-        if HouseServerMode.ready { return .noChange }
-        guard let config = CosConfig.load(), config.isValid else { return .detectFailed }
-        guard let ctx = houseContext else { return .detectFailed }
-
-        // v2.62（A2）：有房源上传任务正在跑时，整次检测直接跳过——不上传途中弹「云端有更新」，
-        // 也不写缓存（避免把这一刻的错误结论留到 45 秒后继续复用）。
-        if await MainActor.run(body: { Self.hasRunningHouseUpload() }) {
-            return .noChange
-        }
-
-        // v2.63：手动云端同步（左上角刷新/长按深度刷新）进行中时直接跳过检测——
-        // 两边都要拉云端清单，并发会重复请求，检测基于同步中途的中间态也不可信。
-        // 下拉刷新是纯本地媒体对账、不联网，不在此列，只靠 UI 让位（手动优先）。
-        if await MainActor.run(body: { CloudDetectActivity.shared.isManualSyncing }) {
-            return .noChange
-        }
-
-        // v2.63（b121 回归）：从这里开始算「正在检测」——房源页顶部显示细进度条 +「正在检测云端变更…」；
-        // 无论正常结束、无变化、失败还是提前返回，都由 defer 统一熄灭，且至少展示 0.6 秒。
-        await MainActor.run { CloudDetectActivity.shared.beginDetecting() }
-        defer { DispatchQueue.main.async { CloudDetectActivity.shared.endDetecting() } }
-
-        // 45 秒节流：只复用「无变化」（v2.62：hasUpdate 不再复用，避免旧结论反复弹横幅）
-        let now = Date().timeIntervalSince1970
-        let lastAt = UserDefaults.standard.double(forKey: "cloudDetectLastAt")
-        if now - lastAt < 45,
-           let cached = UserDefaults.standard.string(forKey: "cloudDetectLastState"),
-           let state = cloudChangeState(fromRaw: cached),
-           state == .noChange {
-            return state
-        }
-
-        // v2.62（A1）：本机正在上传/待重试的房号，不参与「本地 vs 云端」差异判定
-        let activeKeys = await MainActor.run(body: { Self.activeUploadRoomKeys() })
-
-        let state: CloudChangeState
-        // 没有任何基线（首次）→ 全量精确比对并建立基线
-        if CloudRevisionStore.all().isEmpty {
-            state = await compareWithFullFetch(config: config, ctx: ctx, activeKeys: activeKeys)
-        } else {
-            do {
-                if let manifest = try await CloudHouseSync.fetchManifest(config: config) {
-                    // v2.54：compareManifest 改为 async 精确口径（revision 不再一票否决）
-                    state = await compareManifest(manifest, config: config, ctx: ctx, activeKeys: activeKeys)
-                } else {
-                    // 云端总清单缺失：全量重建 + 精确比对
-                    state = await compareWithFullFetch(config: config, ctx: ctx, activeKeys: activeKeys)
-                }
-            } catch {
-                state = .detectFailed
-            }
-        }
-        UserDefaults.standard.set(now, forKey: "cloudDetectLastAt")
-        UserDefaults.standard.set(cloudChangeRawValue(state), forKey: "cloudDetectLastState")
-        return state
-    }
-
-    private static func cloudChangeRawValue(_ s: CloudChangeState) -> String {
-        switch s {
-        case .noChange: return "noChange"
-        case .hasUpdate: return "hasUpdate"
-        case .detectFailed: return "detectFailed"
-        }
-    }
-
-    private static func cloudChangeState(fromRaw raw: String) -> CloudChangeState? {
-        switch raw {
-        case "noChange": return .noChange
-        case "hasUpdate": return .hasUpdate
-        case "detectFailed": return .detectFailed
-        default: return nil
-        }
-    }
-
-    /// 全量精确比对（fetchAll 逐间对比），并把云端修订号记成本地基线、确保总清单存在
-    private static func compareWithFullFetch(config: CosConfig, ctx: ModelContext, activeKeys: Set<String>) async -> CloudChangeState {
-        guard let recs = try? await CloudHouseSync.fetchAll(config: config) else { return .detectFailed }
-        let state = stateFromFullRecords(recs, ctx: ctx, activeKeys: activeKeys)
-        // 建立/刷新修订号基线
-        var rev: [String: Int64] = [:]
-        for r in recs { rev[r.roomKey] = r.revision ?? 0 }
-        CloudRevisionStore.remember(rev)
-        // 确保云端有一份总清单（best-effort，失败不影响检测结论）
-        if (try? await CloudHouseSync.fetchManifest(config: config)) == nil {
-            _ = try? await CloudHouseSync.rebuildManifest(config: config)
-        }
-        return state
-    }
-
-    /// 检测到有更新时，列出具体是哪几套房变了（供任务中心写明白「xx 房更新」）。
-    /// 有基线走总清单（一次请求），无基线走全量账本；失败返回空数组，不影响提示。
-    static func cloudChangedRoomKeys(houseContext: ModelContext?) async -> [String] {
-        guard let config = CosConfig.load(), config.isValid, let ctx = houseContext else { return [] }
-        let local = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
-        var localByKey: [String: House] = [:]
-        for h in local where !h.isTrashed { localByKey[h.mediaRoomKey] = h }
-        // v2.62：本机正在上传/待重试的房号不列为「云端变化」
-        let activeKeys = await MainActor.run(body: { Self.activeUploadRoomKeys() })
-        let seen = CloudRevisionStore.all()
-        if !seen.isEmpty, let manifest = try? await CloudHouseSync.fetchManifest(config: config) {
-            var cloudByKey: [String: CloudManifestEntry] = [:]
-            for e in manifest.rooms { cloudByKey[e.roomKey] = e }
-            var keys: [String] = []
-            for (key, entry) in cloudByKey {
-                if activeKeys.contains(key) { continue }
-                guard let h = localByKey[key] else { keys.append(key); continue }
-                // v2.54：与 compareManifest 同口径，revision 不再一票否决，只看摘要
-                if manifestSummaryDiffers(entry, from: h) { keys.append(key) }
-            }
-            for key in localByKey.keys where cloudByKey[key] == nil && !activeKeys.contains(key) { keys.append(key) }
-            return keys.sorted()
-        }
-        guard let recs = try? await CloudHouseSync.fetchAll(config: config) else { return [] }
-        var keys: [String] = []
-        let cloudKeys = Set(recs.map { $0.roomKey })
-        for rec in recs where !activeKeys.contains(rec.roomKey) {
-            guard let h = localByKey[rec.roomKey] else { keys.append(rec.roomKey); continue }
-            if cloudRecordDiffers(rec, from: h) != nil { keys.append(rec.roomKey) }
-        }
-        for key in localByKey.keys where !cloudKeys.contains(key) && !activeKeys.contains(key) { keys.append(key) }
-        return keys.sorted()
-    }
-
-    private static func stateFromFullRecords(_ recs: [CloudHouseRecord], ctx: ModelContext, activeKeys: Set<String>) -> CloudChangeState {
-        let local = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
-        var localByKey: [String: House] = [:]
-        for h in local where !h.isTrashed { localByKey[h.mediaRoomKey] = h }
-        for rec in recs where !activeKeys.contains(rec.roomKey) {
-            guard let h = localByKey[rec.roomKey] else { return .hasUpdate }
-            if cloudRecordDiffers(rec, from: h) != nil { return .hasUpdate }
-        }
-        let cloudKeys = Set(recs.map { $0.roomKey })
-        // v2.62：本机正在上传/待重试的房号不算「云端没有」
-        for key in localByKey.keys where !cloudKeys.contains(key) && !activeKeys.contains(key) { return .hasUpdate }
-        return .noChange
-    }
-
-    /// v2.54：总清单增量比对。revision 号只作「可能变化」的触发信号，最终结论以实际内容为准，
-    /// 且每次检测后都刷新基线，使 revision 错位能自愈（不再「有更新就不更新基线、卡住反复提示」）。
-    private static func compareManifest(_ manifest: CloudManifest, config: CosConfig, ctx: ModelContext, activeKeys: Set<String>) async -> CloudChangeState {
-        let local = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
-        var localByKey: [String: House] = [:]
-        for h in local where !h.isTrashed { localByKey[h.mediaRoomKey] = h }
-        let seen = CloudRevisionStore.all()
-        var cloudByKey: [String: CloudManifestEntry] = [:]
-        for e in manifest.rooms { cloudByKey[e.roomKey] = e }
-
-        // 本地有、云端清单没有：沿用原口径判差异（具体补传还是删除由 syncCloudHouses 决定）
-        // v2.62：本机正在上传/待重试的房号整体豁免——这是「自己还没传完」，不是云端更新
-        for key in localByKey.keys where cloudByKey[key] == nil && !activeKeys.contains(key) {
-            rememberManifestBaseline(manifest)
-            return .hasUpdate
-        }
-
-        // 收集「可能有变化」的房间：本地缺失 / 摘要不同 / 摘要一致但 revision 变了（字段可能变，摘要看不出）
-        var suspectKeys: [String] = []
-        for (key, entry) in cloudByKey {
-            if activeKeys.contains(key) { continue }
-            guard let h = localByKey[key] else {
-                suspectKeys.append(key)
-                continue
-            }
-            if manifestSummaryDiffers(entry, from: h) {
-                suspectKeys.append(key)
-                continue
-            }
-            if let s = seen[key], s != entry.revision {
-                suspectKeys.append(key)
-            }
-        }
-
-        // 无嫌疑：内容一致，刷新基线，无变化
-        guard !suspectKeys.isEmpty else {
-            rememberManifestBaseline(manifest)
-            return .noChange
-        }
-
-        // 有嫌疑：只拉这些房间的完整账本，按实际内容（8 字段 + 媒体 canonicalKey）精确判定。
-        // v2.64：改成 16 并发窗口 + ETag 复用（fetchRecords）。原来这里是逐套串行 await，
-        // 一旦清单缺指纹（v2.62 前写入的旧清单 mediaHash/fieldsHash 全为 nil → 每条都判嫌疑），
-        // 218 套就是 218 个串行往返 ≈ 20 秒；同一批请求并发后 2~3 秒。
-        let fetchedRecords: [CloudHouseRecord]
+    /// b31：自动检测只读服务器清单并和本地对比，不写本地、不拉媒体、不自动补传。
+    /// 有新增/修改/删除时返回 .hasUpdate，由页面挂“检测到服务器有更新”横幅；
+    /// 本机待补传的房号要排除，否则自己的离线改动会被误报成服务器更新。
+    static func detectCloudLedgerChange(houseContext _: ModelContext?) async -> CloudChangeState {
+        guard HouseServerMode.ready else { return .noChange }
         do {
-            fetchedRecords = try await CloudHouseSync.fetchRecords(keys: suspectKeys, config: config)
+            let preview = try await HouseRepository.shared.preview()
+            let pending = Set(HouseRepository.shared.pendingKeys())
+            let newKeys = preview.newKeys.filter { !pending.contains($0) }
+            let updatedKeys = preview.updatedKeys.filter { !pending.contains($0) }
+            let deletedKeys = preview.deletedKeys.filter { !pending.contains($0) }
+            if !newKeys.isEmpty || !updatedKeys.isEmpty || !deletedKeys.isEmpty || preview.hiddenCount > 0 {
+                return .hasUpdate
+            }
+            return .noChange
         } catch {
-            // 网络/解析失败：既不能当无变化也不能当有更新，按检测失败处理
-            return .detectFailed
+            // 检测失败静默；用户手动刷新时会得到明确错误。
+            return .noChange
         }
-        let fetchedKeys = Set(fetchedRecords.map { $0.roomKey })
-        // 清单有条目但 info.json 404（目录为空/已删）：这是「清单幽灵」脏数据，不是真实更新
-        let ghostKeys = suspectKeys.filter { !fetchedKeys.contains($0) }
-        var recByKey: [String: CloudHouseRecord] = [:]
-        for rec in fetchedRecords { recByKey[rec.roomKey] = rec }
-
-        var hasRealChange = false
-        for key in suspectKeys {
-            guard let rec = recByKey[key] else { continue }
-            guard let h = localByKey[key] else {
-                hasRealChange = true   // 云端账本真实存在、本地确实没有这套房
-                continue
-            }
-            if cloudRecordDiffers(rec, from: h) != nil { hasRealChange = true }
-        }
-
-        // v2.64：顺手回填清单指纹。旧清单（v2.62 之前写入）每条的 mediaHash / fieldsHash 都是 nil，
-        // 判定处 `guard let ... else { return true }` 会把全部房源当成「必须拉明细」，导致每次检测
-        // 都全量拉一遍（20 秒+），而检测路径原来只写 revision 基线、从不修清单，所以永远修不好。
-        // 本次已经拿到这些房的明细，直接按真实记录补写回清单（读-改-写；失败只记日志，下次再补）。
-        let needsFingerprintBackfill = manifest.rooms.contains { $0.mediaHash == nil || $0.fieldsHash == nil }
-        var baselineManifest = manifest
-        if needsFingerprintBackfill || !ghostKeys.isEmpty {
-            var upserts: [String: CloudManifestEntry] = [:]
-            if needsFingerprintBackfill {
-                for rec in fetchedRecords { upserts[rec.roomKey] = CloudManifestEntry(record: rec) }
-            }
-            do {
-                try await CloudHouseSync.applyManifestChanges(
-                    upserts: upserts, removes: Set(ghostKeys), config: config)
-                // 回填成功：按「回填后的清单」记基线。回填条目的 revision 取自明细，
-                // 可能与旧清单条目不同；若仍按旧清单记基线，下一次会因 revision 错位再全量拉一遍。
-                var merged = Dictionary(manifest.rooms.map { ($0.roomKey, $0) }, uniquingKeysWith: { first, _ in first })
-                for (key, entry) in upserts { merged[key] = entry }
-                for key in ghostKeys { merged[key] = nil }
-                baselineManifest = CloudManifest(version: manifest.version, revision: manifest.revision + 1,
-                                                 generatedAt: Date(), rooms: Array(merged.values))
-            } catch {
-                BackupLogStore.log(category: "同步", action: "回填清单摘要", result: "失败",
-                                  detail: "清单 \(upserts.count) 套指纹未回填、幽灵 \(ghostKeys.count) 套未摘除：\(error.localizedDescription)，下次检测再补",
-                                  cloud: true)
-            }
-        }
-
-        // 关键：无论是否真有差异，都把当前 manifest revision 记为基线，让 revision 错位自愈、不再卡住
-        rememberManifestBaseline(baselineManifest)
-        return hasRealChange ? .hasUpdate : .noChange
-    }
-
-    /// 把当前总清单各房 revision 整体记为「本机已见」基线（幂等）
-    private static func rememberManifestBaseline(_ manifest: CloudManifest) {
-        var rev: [String: Int64] = [:]
-        for e in manifest.rooms { rev[e.roomKey] = e.revision }
-        CloudRevisionStore.remember(rev)
-    }
-
-    /// v2.54：摘要口径（不含 revision 号）——座号/房号/媒体数（归一化去重）不同才算嫌疑
-    private static func manifestSummaryDiffers(_ entry: CloudManifestEntry, from house: House) -> Bool {
-        if entry.tower != house.tower { return true }
-        if entry.roomNo != house.roomNo { return true }
-        let exempt = exemptPendingKeys(roomKey: house.mediaRoomKey)
-        let localMedia = Set(house.mediaItems.map { mediaNormKey($0.fileName) }).subtracting(exempt)
-        if entry.mediaCount != localMedia.count { return true }
-        // v2.62：清单指纹比对。旧清单条目没有指纹（nil）→ 必须拉明细，
-        // 绝不能只凭「数量一样」判同——删 6 个又新增 6 个时数量不变但内容全变了。
-        guard let mediaHash = entry.mediaHash, let fieldsHash = entry.fieldsHash else { return true }
-        if mediaHash != CloudManifestFingerprint.mediaHash(Array(localMedia)) { return true }
-        if fieldsHash != CloudManifestFingerprint.fieldsHash(
-            roomNo: house.roomNo, tower: house.tower, landlord: house.landlord,
-            layout: house.layout, price: house.price, password: house.password,
-            remark: house.remark, status: house.statusRaw) { return true }
-        return false
     }
 
     /// 从独立 HouseStore 配置拉取房源（按创建时间倒序，与原来 @Query 一致；v1.7：排除已进回收站的软删除房源）
     /// v1.9：isDeleted 为可选属性，SwiftData #Predicate 对「可选 Bool」在 iOS 17 会触发翻译崩溃（点进房源板块闪退的根因），
     /// 改为全量拉取 + 内存过滤（房源数量级小，性能无影响）
     private func reloadHouses() {
-        guard let ctx = houseModelContext else { return }
-        let descriptor = FetchDescriptor<House>(sortBy: [SortDescriptor(\House.createdAt, order: .reverse)])
-        let all = (try? ctx.fetch(descriptor)) ?? []
+        let all = HouseRepository.shared.fetchAllSorted()
         // v1.70：强制从持久层重载每个房源对象（含 mediaItems 关系）——修复「批量恢复媒体后
         // 卡片仍显示无实拍图/不显示缩略图，必须重启才正常」：SwiftData 同一上下文里插入媒体后，
         // 已缓存对象的 to-many 关系不会自动刷新，列表重新 fetch 拿到的仍是同一实例、关系为旧缓存。
         // v1.70：提交挂起变更（含媒体关系插入），确保批量恢复/编辑后重新 fetch 拿到最新关系——
         // 此前列表重新 fetch 返回同一对象实例、mediaItems 关系为旧缓存，缩略图不显示需重启。
         // 注：ModelContext 无 CoreData 式 refresh API，用 processPendingChanges 强制同步变更。
-        ctx.processPendingChanges()
+        HouseRepository.shared.processPendingChanges()
         houses = all.filter { !$0.isTrashed }
         // v1.71：存量无前缀媒体目录自动归一迁移（media/2059/ → media/1-2059/），幂等；修复
         // v1.69 前编辑页新图落盘无前缀目录导致的上传失败、云端断媒体、刷新缺媒体死循环。
@@ -1262,12 +931,6 @@ struct HouseListView: View {
                 .scrollContentBackground(.hidden)
                 .background(AppTheme.background)
                 // v2.3（需求②）：折叠已改为按钮式手动收起/展开，不再随滚动自动切换（原 b106 自动方案无效）
-                // v1.19：下拉刷新 = 从云端拉取房源（与左上角手动同步同效果）
-                // v1.63：下拉刷新改本地刷新——媒体补全检测（磁盘与记录对账），不再触发云端同步；
-                //        左上角刷新按钮保持云端同步不变
-                .refreshable {
-                    await localRefreshWithMediaCheck()
-                }
             }
         }
         // v1.21：多选模式底部操作栏（v1.12：增加批量已租 / 批量删除，分享逻辑保留不动）
@@ -1377,7 +1040,21 @@ struct HouseListView: View {
 
     /// v2.26：分享面板从顶层直呈，面板关闭后按队列决定「继续下一套 / 结束」
     private func presentShareStep(_ items: [Any]) {
-        currentShareStep = ShareStep(items: items)
+        // b29：从最顶层控制器直呈系统分享面板（微信扩展需要这个上下文；
+        // 旧 .sheet 方案会让微信“跳过去但收不到内容”）。
+        SharePresenter.present(items: items) {
+            handleSharePanelClosed()
+        }
+    }
+
+    /// 系统分享面板关闭后：多选队列还有下一套就询问继续，最后一套结束多选。
+    private func handleSharePanelClosed() {
+        if !shareQueue.isEmpty, shareIndex < shareQueue.count - 1 {
+            remainingShareCount = shareQueue.count - shareIndex - 1
+            showContinueShare = true
+        } else if !shareQueue.isEmpty {
+            exitMultiSelect()
+        }
     }
 
     private func exitMultiSelect() {
@@ -1393,12 +1070,12 @@ struct HouseListView: View {
         let count = isBatchDelete ? selectedHouseIDs.count : 1
         let scope: String
         switch deleteTarget?.cloudStatus {
-        case .some(.local): scope = "这套房源本机有、云端没有"
-        case .some(.cloud): scope = "这套房源本机无媒体、云端有"
-        default: scope = "这套房源本地和云端都有"
+        case .some(.local): scope = "这套房源仅在本机，服务器上没有"
+        case .some(.cloud): scope = "这套房源本机无媒体、服务器上有"
+        default: scope = "这套房源本机和服务器上都有"
         }
         let head = isBatchDelete ? "共 \(count) 套，\(scope)。" : "\(scope)。"
-        return head + "\n\n仅删除本地：云端不动，下次同步会把它们重新带回列表。\n删除双端（推荐）：本地照片视频、数据库记录、云端 h/<房号>/ 与账本一并清除，不可恢复（备份镜像 backups/media 保留）。"
+        return head + "\n\n仅删除本地：只清本机缓存和照片视频，服务器继续保留，其他设备不受影响。之后点左上角刷新会先问是否恢复，不会自动带回。\n删除本地与服务器（推荐）：本机照片视频、数据库记录，以及服务器上的房源、账本和实拍图片/视频一并永久删除，不可恢复。"
     }
 
     /// v2.57（P1-2）：统一下手改为「先删云端、成功再删本地」——
@@ -1406,10 +1083,6 @@ struct HouseListView: View {
     /// 现在：先云后本，云端删成功的房立即清本地（界面马上见效）；云端删失败的房本地保留，
     /// 挂任务中心标注「云端环节失败」，retryCloudDelete 重试成功后自动清掉本地残留。
     private func startDelete(both: Bool) {
-        guard let ctx = houseModelContext else {
-            showToast(RemoteConfig.tip("containerUnavailable", "数据容器不可用，无法删除"), isError: true)
-            return
-        }
         // 先把房号目录取成值，删完对象就失效了
         var keys: [String] = []
         var rooms: [String] = []
@@ -1423,16 +1096,21 @@ struct HouseListView: View {
         guard !keys.isEmpty else { deleteTarget = nil; isBatchDelete = false; return }
         _ = rooms
 
-        // 仅删本地：走老路（不动云端），云端本来就不打算删
+        // 仅删本地：服务器不动，但必须留下“本地隐藏”墓碑——否则下一次总刷新
+        // 看到服务器还有这套房，就会不声不响地按云端数据重新 insert（用户看到的“自动带回”）。
         if !both {
-            for h in houses where keys.contains(h.mediaRoomKey) {
+            let targets = houses.filter { keys.contains($0.mediaRoomKey) }
+            for h in targets {
+                if h.cloudStatus != .local {
+                    HouseLocalDeletionStore.mark(h.mediaRoomKey)
+                }
                 MediaStore.deleteHouseDirectory(roomKey: h.mediaRoomKey)
                 SyncFailStore.clear(h.mediaRoomKey)
                 UnreadCloudHouseStore.clear(h.mediaRoomKey)
-                ctx.delete(h)
+                HouseRepository.shared.delete(h)
             }
             do {
-                try ctx.save()
+                try HouseRepository.shared.save()
             } catch {
                 showToast(RemoteConfig.tip("deleteFail", "删除失败：{error}").replacingOccurrences(of: "{error}", with: error.localizedDescription), isError: true)
                 return
@@ -1443,49 +1121,47 @@ struct HouseListView: View {
             // v2.57（P1-5）：本地已删，队列里这套房的待传项全部清掉，不再复活成幽灵任务
             for key in keys { HouseMediaUploadQueue.removeRoom(key) }
             NotificationCenter.default.post(name: Self.houseStoreChanged, object: nil)
-            showToast(RemoteConfig.tip("deletedLocalOnly", "已删除本地房源；云端仍保留，下次同步会重新出现").replacingOccurrences(of: "本地房源", with: "\(keys.count) 套本地房源"))
+            for key in keys where HouseLocalDeletionStore.contains(key) {
+                BackupLogStore.log(category: "房源", action: "仅删本地房源", result: "成功",
+                                   detail: "本机删除，服务器保留；刷新时需手动确认恢复",
+                                   room: key, cloud: true)
+            }
+            showToast("已从本机删除 \(keys.count) 套；服务器仍保留。之后点左上角刷新会先问是否恢复，不会自动带回。")
             return
         }
 
-        // 服务器模式：双端删除走服务器软删除（进回收站，可恢复），逐套同步
+        // 服务器模式：双端删除走服务器硬删（永久，不进回收站），逐套同步
         if HouseServerMode.ready {
-            runServerDelete(keys: keys, ctx: ctx)
+            runServerDelete(keys: keys)
             return
         }
 
-        // 双端删除：无云端配置 → 云端本来就没有，只删本地
-        guard let config = CosConfig.load(), config.isValid else {
-            for h in houses where keys.contains(h.mediaRoomKey) {
-                MediaStore.deleteHouseDirectory(roomKey: h.mediaRoomKey)
-                SyncFailStore.clear(h.mediaRoomKey)
-                UnreadCloudHouseStore.clear(h.mediaRoomKey)
-                ctx.delete(h)
-            }
-            do {
-                try ctx.save()
-            } catch {
-                showToast(RemoteConfig.tip("deleteFail", "删除失败：{error}").replacingOccurrences(of: "{error}", with: error.localizedDescription), isError: true)
-                return
-            }
-            deleteTarget = nil
-            if isBatchDelete { exitMultiSelect() }
-            isBatchDelete = false
-            for key in keys { HouseMediaUploadQueue.removeRoom(key) }
-            NotificationCenter.default.post(name: Self.houseStoreChanged, object: nil)
-            showToast("已删除本地 \(keys.count) 套（未配置云端，无需再删云端）")
+        // 未接入服务器：旧桶删除编排已下线，双端删除仅删本地（目录/状态标记/待传队列/记录）
+        for h in houses where keys.contains(h.mediaRoomKey) {
+            MediaStore.deleteHouseDirectory(roomKey: h.mediaRoomKey)
+            SyncFailStore.clear(h.mediaRoomKey)
+            UnreadCloudHouseStore.clear(h.mediaRoomKey)
+            HouseRepository.shared.delete(h)
+        }
+        do {
+            try HouseRepository.shared.save()
+        } catch {
+            showToast(RemoteConfig.tip("deleteFail", "删除失败：{error}").replacingOccurrences(of: "{error}", with: error.localizedDescription), isError: true)
             return
         }
-
-        // 双端删除（先云后本）：云端先删。删完云端的房才动本地；
-        // 云端失败的房本地先不删（防“复活”），挂任务中心标明失败环节，云端重试成功后再清本地。
-        runCloudThenLocalDelete(keys: keys, config: config, ctx: ctx)
+        deleteTarget = nil
+        if isBatchDelete { exitMultiSelect() }
+        isBatchDelete = false
+        for key in keys { HouseMediaUploadQueue.removeRoom(key) }
+        NotificationCenter.default.post(name: Self.houseStoreChanged, object: nil)
+        showToast("已删除本地 \(keys.count) 套")
     }
 
     /// v2.57（P1-2）：双端删除执行体——先逐套删云端，成功一套删一套本地；全部云端成功的房本地立即清、
     /// 界面马上见效；云端失败的房本地保留（同步不会把它拉回来，因为云端已删/在删），挂任务中心
     /// 「删云端」任务标注失败环节，retryCloudDelete 成功后自动清掉本地残留。
     /// 服务器模式双端硬删：逐套删服务器权威库，成功一套删一套本地；不进回收站；失败的房本地保留可重试
-    private func runServerDelete(keys: [String], ctx: ModelContext) {
+    private func runServerDelete(keys: [String]) {
         deleteTotal = keys.count
         deleteDone = 0
         deleteRunning = true
@@ -1493,14 +1169,25 @@ struct HouseListView: View {
         Task {
             var ok = 0
             var localDeleted: [House] = []
+            var failedKeys: [String] = []
+            var failureReasons: [String] = []
             for key in keys {
                 await MainActor.run { deleteCurrentRoom = key }
                 if let h = houses.first(where: { $0.mediaRoomKey == key }) {
                     do {
-                        try await HouseSyncEngine.shared.pushDelete(h)
+                        try await HouseRepository.shared.pushDelete(h)
+                        HouseLocalDeletionStore.remove(key)
+                        BackupLogStore.log(category: "房源", action: "删除双端房源", result: "成功",
+                                           detail: "服务器与本地永久删除，不可恢复",
+                                           room: key, cloud: true)
                         ok += 1
                         localDeleted.append(h)
                     } catch {
+                        BackupLogStore.log(category: "房源", action: "删除双端房源", result: "失败",
+                                           detail: "服务器删除失败：\(error.localizedDescription)，本机记录保留",
+                                           room: key, cloud: true)
+                        failedKeys.append(key)
+                        failureReasons.append("\(key)：\(error.localizedDescription)")
                         showToast("删除失败 \(key)：\(error.localizedDescription)", isError: true)
                     }
                 }
@@ -1512,121 +1199,41 @@ struct HouseListView: View {
                     SyncFailStore.clear(h.mediaRoomKey)
                     UnreadCloudHouseStore.clear(h.mediaRoomKey)
                     HouseMediaUploadQueue.removeRoom(h.mediaRoomKey)
-                    ctx.delete(h)
+                    HouseRepository.shared.delete(h)
                 }
-                try? ctx.save()
+                try? HouseRepository.shared.save()
                 deleteRunning = false
                 deleteCurrentRoom = ""
                 deleteTarget = nil
                 if isBatchDelete { exitMultiSelect() }
                 isBatchDelete = false
                 for key in keys { HouseMediaUploadQueue.removeRoom(key) }
+                if !failedKeys.isEmpty {
+                    // 云端删除失败统一进任务中心，可点“删云端”重试；本地记录保留
+                    SyncTaskCenter.shared.reportFailure(
+                        kind: .cloudDelete,
+                        title: "删除服务器房源",
+                        roomKeys: failedKeys,
+                        failure: failureReasons.joined(separator: "\n"),
+                        note: "服务器没删掉，本机记录保留"
+                    )
+                }
                 NotificationCenter.default.post(name: Self.houseStoreChanged, object: nil)
                 if ok > 0 { showToast("已删除 \(ok) 套（服务器与本地）") }
             }
         }
     }
 
-    private func runCloudThenLocalDelete(keys: [String], config: CosConfig, ctx: ModelContext) {
-        deleteTotal = keys.count
-        deleteDone = 0
-        deleteCurrentRoom = ""
-        deleteRunning = true
-        let taskID = syncCenter.begin(kind: .cloudDelete, title: "删云端",
-                                      roomKeys: keys, total: keys.count)
-        Task {
-            var cloudFailed: [String] = []      // 云端没删掉 → 本地保留、任务中心重试
-            var localDeleted: [String] = []      // 云端删成功、本地已标记删除（循环结束统一 save）
-            var queueRemovalKeys: [String] = []  // 待清队列的房号（循环结束统一清）
-            // v2.58（#8）：本地房源只在开头查一次表，循环内不再每套都 fetch 全表
-            var byKey: [String: House] = [:]
-            await MainActor.run {
-                let all = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
-                for h in all { byKey[h.mediaRoomKey] = h }
-            }
-            for (idx, key) in keys.enumerated() {
-                await MainActor.run { deleteCurrentRoom = key }
-                var objCount = 0
-                do {
-                    try await CloudBackupService.deleteHouseRemoteFolder(roomKey: key, config: config, writeLog: false, reportCount: { objCount = $0 })
-                    try await CloudHouseSync.delete(roomKey: key, config: config)
-                    BackupLogStore.log(category: "删除", action: "彻底删除（本地+云端）", result: "成功", detail: "删除房源（云端桶文件夹\(objCount)个对象 + 云端账本已移除）", room: key, cloud: true)
-                } catch {
-                    cloudFailed.append(key)
-                    BackupLogStore.log(category: "删除", action: "删除（云端环节）", result: "失败", detail: "云端删除失败：\(error.localizedDescription)；本地暂不删除，待云端删除成功后自动清理", room: key, cloud: true)
-                }
-                // 云端删成功的房：本地跟着删（只标记删除、累计房号；save 与通知统一放到循环结束）
-                if !cloudFailed.contains(key) {
-                    await MainActor.run {
-                        if let h = byKey.removeValue(forKey: key) {
-                            MediaStore.deleteHouseDirectory(roomKey: key)
-                            SyncFailStore.clear(key)
-                            UnreadCloudHouseStore.clear(key)
-                            ctx.delete(h)
-                            localDeleted.append(key)
-                        }
-                        // v2.57（P1-5）：队列残留一并清，防幽灵任务（v2.58 起循环结束统一清）
-                        queueRemovalKeys.append(key)
-                    }
-                }
-                await MainActor.run {
-                    deleteDone = idx + 1
-                    syncCenter.advance(id: taskID, done: idx + 1, note: "正在删 \(key)")
-                }
-            }
-            await MainActor.run {
-                // v2.58（#8）：批量删除收口——一次 save、一次列表通知（进度条仍逐套推进）
-                for key in queueRemovalKeys { HouseMediaUploadQueue.removeRoom(key) }
-                if !localDeleted.isEmpty {
-                    try? ctx.save()
-                }
-                if !queueRemovalKeys.isEmpty {
-                    NotificationCenter.default.post(name: Self.houseStoreChanged, object: nil)
-                }
-                deleteRunning = false
-                deleteCurrentRoom = ""
-                deleteTarget = nil
-                if isBatchDelete { exitMultiSelect() }
-                isBatchDelete = false
-                let okCount = keys.count - cloudFailed.count
-                if cloudFailed.isEmpty {
-                    showToast(RemoteConfig.tip("deleteBothOk", "已删除（本地 + 云端）").replacingOccurrences(of: "已删除", with: "已删除 \(keys.count) 套"))
-                    syncCenter.finish(id: taskID, success: true, note: "云端已删除 \(keys.count) 套")
-                    HouseActionNotifier.shared.send(
-                        key: "delete.\(keys.joined(separator: ","))",
-                        title: "房源已删除",
-                        body: "\(keys.joined(separator: "、")) 本地与云端均已删除"
-                    )
-                } else {
-                    // 失败标注环节：这些房云端没删掉、本地保留
-                    syncCenter.finish(id: taskID, success: false,
-                                     failure: "这几套云端没删掉（本地保留未删）：\(cloudFailed.joined(separator: "、"))，点重试；云端删除成功后会自动清掉本地")
-                    HouseActionNotifier.shared.send(
-                        key: "deletefail.\(cloudFailed.joined(separator: ","))",
-                        title: "云端没删掉",
-                        body: "\(cloudFailed.count) 套云端删除失败（本地保留）：\(cloudFailed.joined(separator: "、"))，可到任务中心重试",
-                        silent: true
-                    )
-                    if okCount > 0 {
-                        showToast("已删除 \(okCount) 套（本地 + 云端）；\(cloudFailed.count) 套云端没删掉、本地保留，可到任务中心重试")
-                    } else {
-                        showToast("云端删除失败（\(cloudFailed.joined(separator: "、"))），本地已保留，可到任务中心重试", isError: true)
-                    }
-                }
-            }
-        }
-    }
-
-    /// 云端删除进度浮层（只负责进行中展示；失败进任务中心，不再在浮层里放重试）
+    /// 服务器删除进度浮层（只负责进行中展示；失败进任务中心，不再在浮层里放重试）
     @ViewBuilder private var deleteOverlayCard: some View {
         if deleteRunning {
             VStack(spacing: 12) {
-                Text("正在同步删除云端")
+                Text("正在同步删除服务器副本")
                     .font(.headline)
                 ProgressView(value: deleteTotal == 0 ? 0 : Double(deleteDone) / Double(deleteTotal))
                     .progressViewStyle(.linear)
                     .frame(width: 210)
-                Text("\(deleteDone)/\(deleteTotal)" + (deleteCurrentRoom.isEmpty ? "" : " · h/\(deleteCurrentRoom)/"))
+                Text("\(deleteDone)/\(deleteTotal)" + (deleteCurrentRoom.isEmpty ? "" : " · 房号 \(deleteCurrentRoom)"))
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -1641,33 +1248,39 @@ struct HouseListView: View {
     /// 默认列表筛选口径为「待租」，切换为已租后该房源从当前列表消失；已租筛选下左滑可一键改回待租。
     /// v1.19：切换时刷新最后更新时间，并把新状态同步到云端账本（共享房源）。
     private func toggleHouseStatus(_ house: House) {
-        guard let ctx = houseModelContext else { return }
         let oldStatus = house.status
         let roomKey = house.mediaRoomKey
         house.status = (house.status == .rented) ? .available : .rented
         house.lastUpdatedAt = Date()
-        try? ctx.save()
+        try? HouseRepository.shared.save()
         // v2.45：账本事件
         HouseLedgerStore.append(
             roomKey: roomKey,
             action: "切换状态",
-            fieldChanges: [HouseLedgerFieldChange(field: "状态", oldValue: oldStatus.label, newValue: house.status.label)])
+            fieldChanges: [HouseLedgerFieldChange(field: "状态", oldValue: oldStatus.label, newValue: house.status.label)],
+            writeOpLog: false)
         pushHouseToCloud(house, action: "切换状态", changeText: "状态：\(oldStatus.label) → \(house.status.label)")
         NotificationCenter.default.post(name: Self.houseStoreChanged, object: nil)
     }
 
     // MARK: - v1.19 云端房源同步（共享房源）
 
-    /// 把单套房源推送到云端账本（读改写，同房号覆盖）。无云存储配置则跳过（仅本地）。
-    /// v1.72（#7）：动作按场景命名（切换状态同步…）；（#8）账本上传也驱动卡片进度条；（#6）写本地账本镜像。
+    /// 状态切换上行：服务器模式推服务器权威库（失败入待补传队列）；旧对象存储账本/媒体上行已下线，非服务器模式仅本机落库。
     private func pushHouseToCloud(_ house: House, action: String = "同步房源（本地→云端）", changeText: String = "") {
-        // 服务器模式：状态切换直接推服务器权威库，不走旧 COS 账本链路；失败入待补传队列
+        // 服务器模式：状态切换直接推服务器权威库，不走旧对象存储账本链路；失败入待补传队列
         if HouseServerMode.ready {
             let roomKey = house.mediaRoomKey
             let roomNo = house.displayRoomNo
             Task {
                 do {
-                    _ = try await HouseSyncEngine.shared.pushHouse(house)
+                    _ = try await HouseRepository.shared.push(house, changedFields: ["status"])
+                    if HousePendingRegistry.change(for: roomKey) != nil {
+                        // 之前失败过：把那条“待同步”收口成成功，不再叠加第二条成功日志
+                        HouseRepository.shared.completePending(roomKey, remoteKey: roomKey)
+                    } else {
+                        BackupLogStore.log(category: "房源", action: action, result: "成功",
+                                           detail: changeText, room: roomKey, cloud: true)
+                    }
                     await MainActor.run {
                         HouseActionNotifier.shared.send(
                             key: "status.\(roomKey)",
@@ -1675,8 +1288,13 @@ struct HouseListView: View {
                             body: "\(roomNo) 已改为\(house.status.label)，服务器已更新")
                     }
                 } catch {
+                    BackupLogStore.log(category: "房源", action: action, result: "待同步",
+                                       detail: "\(changeText)；服务器更新失败，已存本机待补传（\(error.localizedDescription)）",
+                                       room: roomKey, cloud: false)
                     await MainActor.run {
-                        HousePendingUploader.shared.markPending(roomKey)
+                        HouseRepository.shared.markPending(roomKey, action: action,
+                                                            detail: changeText,
+                                                            changedFields: ["status"])
                         HouseActionNotifier.shared.send(
                             key: "statusfail.\(roomKey)",
                             title: "状态同步失败",
@@ -1687,44 +1305,7 @@ struct HouseListView: View {
             }
             return
         }
-        guard let config = CosConfig.load() else { return }
-        let record = CloudHouseSync.record(from: house, username: CloudUser.username)
-        let roomKey = house.mediaRoomKey
-        let roomNo = house.displayRoomNo
-        LocalHouseLedger.save(house)
-        HouseSyncProgress.shared.begin(roomKey: roomKey, direction: .upload, progress: 0.2, label: "同步账本")
-        Task {
-            do {
-                // v2.36（#6）：状态切换改走 uploadGuarded 合并写——先读云端再合并媒体名单、revision+1，
-                // 不再裸 upload 覆盖他人刚写入的数据/媒体
-                _ = try await CloudHouseSync.uploadGuarded(record: record, config: config)
-                HouseSyncProgress.shared.end()
-                await MainActor.run {
-                    house.cloudStatus = .both
-                    SyncFailStore.clear(roomKey)
-                    try? houseModelContext?.save()
-                    // v2.44：状态切换同步结果
-                    HouseActionNotifier.shared.send(
-                        key: "status.\(roomKey)",
-                        title: "状态已同步",
-                        body: "\(roomNo) 已改为\(house.status.label)，桶内已更新"
-                    )
-                }
-                BackupLogStore.log(category: "房源", action: action, result: "成功", detail: changeText, room: roomNo, cloud: true)
-            } catch {
-                HouseSyncProgress.shared.end()
-                await MainActor.run {
-                    SyncFailStore.mark(roomKey)
-                    HouseActionNotifier.shared.send(
-                        key: "statusfail.\(roomKey)",
-                        title: "状态同步失败",
-                        body: "\(roomNo) 已改本机，桶内没同步上：\(error.localizedDescription)",
-                        silent: true
-                    )
-                }
-                BackupLogStore.log(category: "房源", action: action, result: "失败", detail: "同步失败：\(error.localizedDescription)", room: roomNo, cloud: true)
-            }
-        }
+        // 旧桶账本上行已下线：非服务器模式仅本机落库，不再上传旧对象存储账本/媒体
     }
 
     /// v2.50：云端有更新横幅——常驻顶栏，只有点右侧 ✕ 才收起；同步成功后自动收起。
@@ -1735,9 +1316,9 @@ struct HouseListView: View {
                 HStack(spacing: 8) {
                     Image(systemName: "icloud.and.arrow.down").font(.footnote)
                     VStack(alignment: .leading, spacing: 1) {
-                        Text("检测到云端有更新")
+                        Text("检测到服务器有更新")
                             .font(.footnote.weight(.semibold))
-                        Text("点右上角刷新或下拉列表同步")
+                        Text("点左上角刷新按钮同步")
                             .font(.caption2).opacity(0.85)
                     }
                     Spacer(minLength: 0)
@@ -1750,7 +1331,7 @@ struct HouseListView: View {
                             .padding(.leading, 8)
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("关闭云端更新提示")
+                    .accessibilityLabel("关闭服务器更新提示")
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 8)
@@ -1809,203 +1390,98 @@ struct HouseListView: View {
         }
     }
 
-    /// v1.41：云端账本与本地房源的字段级对比——任一字段（含媒体清单）不同即视为有变化。
-    /// v1.43：媒体名归一化 key——去扩展名 + 小写。
-    /// 视频 .mov/.mp4 同源（上传云端统一转 mp4、本地按原样或账本名保存），按此视为同一文件；
-    /// 图片保留完整后缀（foo.jpg ≠ foo.png），不同 base 名也区分。v2.37（#11）：统一走 MediaNaming.canonicalKey。
-    private static func mediaNormKey(_ name: String) -> String {
-        MediaNaming.canonicalKey(name)
-    }
-
-    /// 仍在待上传登记簿里的媒体属于“本地还没传完”，对账时不能把它算成本地与云端的真实差异。
-    /// 否则失败任务被取消后，这条本地媒体仍被豁免删除，但每轮刷新又被判成“云端有更新”，形成死循环。
-    private static func exemptPendingKeys(roomKey: String) -> Set<String> {
-        Set(HouseMediaUploadQueue.pendingItems()
-            .filter { $0.roomKey == roomKey }
-            .map { mediaNormKey($0.fileName) })
-    }
-
-    /// v2.62：本机「正在上传 / 待重试」的房号集合。
-    /// 这些房是「本地先建好、云端还没写完」，检测时必须整体豁免——否则新增房源上传途中
-    /// 任何一次检测都会命中「本地有、云端没有」，弹出假「云端有更新」。
-    @MainActor
-    private static func activeUploadRoomKeys() -> Set<String> {
-        var keys = Set(HouseMediaUploadQueue.pendingItems().map { $0.roomKey })
-        for task in SyncTaskCenter.shared.running where task.isHouseUpload == true {
-            keys.formUnion(task.roomKeys)
-        }
-        return keys
-    }
-
     /// v2.62：当前是否有房源上传任务正在跑（决定要不要跳过整次检测）
     @MainActor
     private static func hasRunningHouseUpload() -> Bool {
         SyncTaskCenter.shared.running.contains { $0.isHouseUpload == true }
     }
 
-    /// 替代旧的时间戳比较：时间戳只有秒级精度且恢复备份后 lastUpdatedAt 为空，
-    /// 会导致「明明没变化每次同步都判更新」。字段级对比满足「一个标点符号变了都要同步」。
-    /// v1.43：媒体清单改用归一化等价比较（去扩展名小写）——视频 .mov/.mp4 视为同一文件，
-    ///        不再因两套扩展名互斥而每次同步都误判「更新」。
-    /// b116：返回差异描述（nil=一致，非nil=具体哪个字段不同），字符串先 trim 防首尾空格死循环。
-    /// b120：改为 static——轻量变更感知（detectCloudLedgerChange）与同步按钮共用同一判定口径。
-    private static func cloudRecordDiffers(_ rec: CloudHouseRecord, from house: House) -> String? {
-        let ls = { (s: String) in s.trimmingCharacters(in: .whitespacesAndNewlines) }
-        if rec.roomNo != house.roomNo { return "roomNo「\(rec.roomNo)」vs「\(house.roomNo)」" }
-        if rec.tower != house.tower { return "tower \(rec.tower) vs \(house.tower)" }
-        if ls(rec.landlord) != ls(house.landlord) { return "landlord「\(rec.landlord)」vs「\(house.landlord)」" }
-        if ls(rec.layout) != ls(house.layout) { return "layout「\(rec.layout)」vs「\(house.layout)」" }
-        if rec.price != house.price { return "price \(rec.price) vs \(house.price)" }
-        if ls(rec.password) != ls(house.password) { return "password 不同" }
-        if ls(rec.remark) != ls(house.remark) { return "remark「\(rec.remark)」vs「\(house.remark)」" }
-        if ls(rec.status) != ls(house.statusRaw) { return "status「\(rec.status)」vs「\(house.statusRaw)」" }
-        let exempt = exemptPendingKeys(roomKey: house.mediaRoomKey)
-        let localMedia = Set(house.mediaItems.map { Self.mediaNormKey($0.fileName) }).subtracting(exempt)
-        let cloudMedia = Set(rec.mediaNames.map { Self.mediaNormKey($0) })
-        if localMedia != cloudMedia {
-            let onlyLocal = localMedia.subtracting(cloudMedia)
-            let onlyCloud = cloudMedia.subtracting(localMedia)
-            return "media 本地独有[\(onlyLocal.joined(separator: ","))] 云端独有[\(onlyCloud.joined(separator: ","))]"
-        }
-        return nil
-    }
-
-    /// 从云端拉取房源账本并同步到本地（下拉刷新 / 左上角手动同步同效果）。
-    /// v1.19 补全「增减逻辑」：
-    ///  - 增：云端新增 → 完整下载到本地（文字 + 媒体），标双端、可编辑
-    ///  - 改：云端比本地新 → 覆盖文字字段；本地媒体缺失但云端有 → 自动下载媒体
-    ///  - 减：本地房源在云端账本已不存在 → 若它来自云端（双端/云端）则跟随删除；纯本地未上传的保留并补传云端
-    ///  - 无任何变化 → 提示「已刷新，无变化」，不写入操作日志
-    /// v1.41：
-    ///  - 「更新」判定改为字段级对比（cloudRecordDiffers），不再依赖时间戳（时间戳精度/恢复备份导致误判）
-    ///  - 媒体差异双向识别：云端有本地缺（要下载）与 本地有云端缺（要跟随删除）都算变化并弹确认
-    /// v1.63：下拉刷新 = 本地刷新（媒体补全检测）：
-    /// 磁盘有而记录没有 → 自动补建媒体记录；记录有而磁盘没有 → 提示待云端回补；
-    /// 无对应房源的目录 → 提示可扫描补录。有变化列明细，无变化提示「已刷新，无变化」。
-    private func localRefreshWithMediaCheck() async {
-        // v2.63：重入保护——连续下拉两次时不并发跑两份本地对账，避免同一文件被重复插入媒体记录
-        guard !isSyncing else { return }
-        isSyncing = true   // v1.72（#5）：本地刷新同样给出「正在刷新」反馈
-        defer { isSyncing = false }
-        guard let ctx = houseModelContext else { return }
-        let all = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
-        let active = all.filter { !$0.isTrashed }
-        var addedLines: [String] = []
-        var missingLines: [String] = []
-        var addedCount = 0
-        var addedFiles = 0
-        await MainActor.run {
-            var inserted: [MediaItem] = []
-            for house in active {
-                // v1.69：目录名强制带前缀（mediaRoomKey），不再做无前缀迁移
-                let dir = MediaStore.houseDirectory(roomKey: house.mediaRoomKey)
-                let disk = Set(MediaStore.mediaFileNames(in: dir))
-                let recorded = Set(house.mediaItems.map { $0.fileName })
-                let toAdd = disk.subtracting(recorded)
-                let missing = recorded.subtracting(disk)
-                if !toAdd.isEmpty {
-                    for f in toAdd.sorted() {
-                        let lower = f.lowercased()
-                        let media = MediaItem(fileName: f, kind: (lower.hasSuffix(".mp4") || lower.hasSuffix(".mov")) ? "video" : "image")
-                        media.house = house
-                        ctx.insert(media)
-                        inserted.append(media)
-                        addedFiles += 1
-                    }
-                    addedCount += 1
-                    addedLines.append("\(house.displayRoomNo)：补全 \(toAdd.count) 个媒体")
-                }
-                if !missing.isEmpty {
-                    missingLines.append("\(house.displayRoomNo)：本地缺 \(missing.count) 个文件（云端回补）")
-                }
-            }
-            if !inserted.isEmpty { try? ctx.save() }
-            // 未收录目录：media 下有目录但无对应房源
-            let keys = MediaStore.scanMediaDirectoryKeys()
-            let orphanKeys = keys.filter { key in
-                let (roomNo, tower) = BatchImporter.parseRoom(key, explicitTower: key.hasPrefix("2-") ? 2 : 0)
-                guard !roomNo.isEmpty else { return true }
-                return !active.contains { $0.tower == tower && $0.roomNo == roomNo }
-            }
-            var lines: [String] = []
-            if addedCount > 0 {
-                lines.append("媒体补全 \(addedCount) 间（\(addedFiles) 个文件）：")
-                lines.append(contentsOf: addedLines)
-            }
-            if !missingLines.isEmpty {
-                lines.append("待云端回补：" + missingLines.joined(separator: "；"))
-            }
-            if !orphanKeys.isEmpty {
-                lines.append("未收录目录 \(orphanKeys.count) 个：\(orphanKeys.prefix(5).joined(separator: "、"))（可去批量录入-扫描补录导入）")
-            }
-            if lines.isEmpty {
-                showToast(RemoteConfig.tip("refreshNoChange", "已刷新，无变化"))
-            } else {
-                showToast(lines.joined(separator: "\n"))
-            }
-            // v1.77：下拉刷新（本地刷新）不再重建本地账本镜像——重建只在左上角云端同步后执行
-            NotificationCenter.default.post(name: Self.houseStoreChanged, object: nil)
-        }
-    }
-
-    /// v1.76：重建/刷新本地账本镜像（media/<房号>/info.json），保证与本地房源记录一致。
-    /// v1.77：仅由「左上角云端同步」触发（下拉刷新不再调用）。
-    /// v1.78：改为增量——每套与现有账本对比，有差异才写盘，无差异跳过。
-    /// v1.79：增量对比改为「语义字段」判断（v1.78 的字节全等对比太脆弱：媒体清单顺序/元数据微变都会
-    /// 判为有差异，导致每次同步仍全量重写）。现只对比业务字段 + 排序后的媒体清单，
-    /// updatedAt/updatedBy 不参与判断；真正无变化的套数零写入。返回(实际写入套数, 已校验套数)。
-    /// 判断「账本是否已是当前状态」：业务字段一致且媒体清单（排序后）一致 → 视为无变化
-    private func ledgerIsCurrent(_ h: House, existing: CloudHouseRecord?) -> Bool {
-        guard let existing else { return false }
-        return existing.roomKey == h.mediaRoomKey
-            && existing.roomNo == h.roomNo
-            && existing.tower == h.tower
-            && existing.landlord == h.landlord
-            && existing.layout == h.layout
-            && existing.price == h.price
-            && existing.password == h.password
-            && existing.remark == h.remark
-            && existing.status == h.statusRaw
-            && existing.mediaNames.sorted() == h.mediaItems.map { $0.fileName }.sorted()
-    }
-
-    @discardableResult
-    private func rebuildLocalLedgers() -> (written: Int, checked: Int) {
-        guard let ctx = houseModelContext else { return (0, 0) }
-        let all = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
-        var written = 0
-        var checked = 0
-        for h in all where !h.isTrashed {
-            checked += 1
-            let url = MediaStore.houseDirectory(roomKey: h.mediaRoomKey).appendingPathComponent("info.json")
-            let existing = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(CloudHouseRecord.self, from: $0) }
-            if ledgerIsCurrent(h, existing: existing) {
-                continue   // 账本已是最新，跳过写入
-            }
-            LocalHouseLedger.save(h)
-            written += 1
-        }
-        return (written, checked)
-    }
-
     /// v1.83：同步失败自动重试一次——网络瞬断/弱网（如电梯信号切换）时第一次失败会在 1 秒后自动重跑，
     /// 第二次仍失败才提示。retriedOnce 防止重试套娃无限递归。
     @discardableResult
-    /// 服务器模式同步：增量拉取权威库并直接应用到本地（服务器已做合并，无需本地 diff 预览）
-    private func runServerSync(context ctx: ModelContext) async -> CloudPullRunOutcome {
-        let progressID = syncCenter.beginTransient(kind: .cloudPull, title: "同步房源", total: 1)
+    /// 服务器模式同步：先补传本机改动，再把服务器清单应用到本地；
+    /// 整次动作挂任务中心持久任务，媒体回补另挂“下载服务器媒体”任务并驱动卡片进度。
+    private func runServerSync(retryTaskID: UUID? = nil, deep: Bool = false) async -> CloudPullRunOutcome {
+        let taskID: UUID
+        if let retryTaskID {
+            taskID = retryTaskID
+            syncCenter.advance(id: taskID, done: 0, note: "正在补传本机改动")
+        } else {
+            taskID = syncCenter.begin(kind: .cloudPull,
+                                      title: "同步服务器房源",
+                                      total: 1,
+                                      note: "正在补传本机改动")
+        }
         do {
-            // 先补传本地离线写，再拉取服务器全量清单对账，保证两端最终一致
-            _ = await HousePendingUploader.shared.flush(context: ctx)
-            let changed = try await HouseSyncEngine.shared.pull(context: ctx)
-            showToast(changed > 0 ? "已从服务器同步 \(changed) 套房源" : "服务器上房源已是最新")
-            syncCenter.endTransient(id: progressID)
+            // b31：刷新只做“服务器 → 本机”，不再自动补传本机改动。
+            // 本机改动由任务中心逐套确认上传，避免刷新动作顺带把本地房源推到服务器。
+            syncCenter.advance(id: taskID, done: 0, note: "正在拉取服务器房源")
+            let preview = try? await HouseRepository.shared.preview()
+            let result = try await HouseRepository.shared.pull(reportMediaTask: true, deep: deep)
+            let hidden = HouseRepository.shared.hiddenCloudCount()
+            let pending = HouseRepository.shared.pendingKeys().count
+            var tail = (hidden > 0 ? "；\(hidden) 套仅删本地，仍保持隐藏" : "")
+                + (pending > 0 ? "；\(pending) 套本机改动未同步，已保留本地，请点重试" : "")
+            if let mediaNote = result.mediaNote {
+                tail += "；\(mediaNote)"
+            }
+            let changeText = preview?.resultText ?? (result.changed > 0
+                ? "已同步 \(result.changed) 套房源" : "已刷新，无变化")
+            let toast = changeText + tail
+            showToast(toast)
+            // b31：手动同步也写本机操作日志（此前只写云端/任务中心，用户在本机日志里查不到）。
+            BackupLogStore.log(category: "房源", action: "刷新服务器房源",
+                               result: "成功", detail: toast, cloud: false)
+            let note = changeText + (result.mediaTotal > 0 ? "，媒体在任务中心继续" : "")
+            syncCenter.finish(id: taskID, success: true, note: note)
+            cloudUpdateBannerVisible = false
             return .finished
         } catch {
             let msg = "服务器同步失败：\(error.localizedDescription)"
             showToast(msg, isError: true)
-            syncCenter.endTransient(id: progressID)
+            BackupLogStore.log(category: "房源", action: "刷新服务器房源",
+                               result: "失败", detail: msg, cloud: false)
+            syncCenter.finish(id: taskID, success: false, failure: msg)
             return .failed(msg)
+        }
+    }
+
+    /// 唯一手动刷新入口：先向服务器查变化并列给用户确认，再同步；有“仅删本地”隐藏房源时也先列变化。
+    private func requestManualSync(deep: Bool) {
+        guard !isSyncing else {
+            showToast("正在同步中，请稍候")
+            return
+        }
+        let hidden = HouseLocalDeletionStore.count()
+        isSyncing = true
+        Task {
+            do {
+                let preview = try await HouseRepository.shared.preview()
+                await MainActor.run {
+                    isSyncing = false
+                    // b31：无变化不再弹“与服务器同步房源？”确认框（旧版这里直接提示“已刷新，无变化”）。
+                    if preview.isEmpty {
+                        showToast("已刷新，无变化")
+                        BackupLogStore.log(category: "房源", action: "刷新服务器房源",
+                                           result: "成功", detail: "已刷新，无变化", cloud: false)
+                    } else if hidden > 0 {
+                        refreshPrompt = .hidden(count: hidden, deep: deep, summary: preview.summary)
+                    } else {
+                        refreshPrompt = .confirm(deep: deep, summary: preview.summary)
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    isSyncing = false
+                    if hidden > 0 {
+                        refreshPrompt = .hidden(count: hidden, deep: deep, summary: nil)
+                    } else {
+                        refreshPrompt = .confirm(
+                            deep: deep,
+                            summary: "无法预览服务器变化（\(error.localizedDescription)）。\n仍可继续同步，同步时会重新核对服务器数据。")
+                    }
+                }
+            }
         }
     }
 
@@ -2021,900 +1497,20 @@ struct HouseListView: View {
         // v2.63：标记「手动云端同步进行中」——自动检测看到这个标记直接跳过，两边不会同时拉清单
         await MainActor.run { CloudDetectActivity.shared.beginManualSync() }
         defer { DispatchQueue.main.async { CloudDetectActivity.shared.endManualSync() } }
-        // 服务器模式：房源读写走 8082 house-keeper 权威接口，短路旧 COS 直连链路
-        if HouseServerMode.ready, let ctx = houseModelContext {
-            return await runServerSync(context: ctx)
+        // 服务器模式：房源读写走 8082 house-keeper 权威接口，短路旧对象存储直连链路
+        if HouseServerMode.ready {
+            return await runServerSync(retryTaskID: retryTaskID, deep: deep)
         }
-        let config = CosConfig.load()
-        guard let config else {
-            let message = RemoteConfig.tip("noCloudConfig", "未配置云存储，无法同步云端房源")
-            showToast(message, isError: true)
-            return .failed(message)
-        }
-        guard let ctx = houseModelContext else {
-            return .failed("房源数据未就绪，请重新进入房源页再试")
-        }
-        // 总刷新只显示顶部临时进度条，**不写任务中心**（用户明确：点一次一条太占地方）
-        let progressID = syncCenter.beginTransient(kind: .cloudPull, title: "同步云端房源", total: 1)
-        do {
-            // v2.62（B3）：先把积压的清单改动补写，保证后面「按清单跳过」可信
-            await CloudManifestUpdater.shared.flush()
-            // v2.62（B1）：主线程读 SwiftData 生成纯值摘要，后台只做网络与比对
-            let locals: [String: LocalHouseSummary] = await MainActor.run {
-                let local = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
-                var out: [String: LocalHouseSummary] = [:]
-                for h in local where !h.isTrashed {
-                    // 待上传队列里的媒体还没传完，不算「本地已有」——与检测侧同一口径，避免每刷都判 suspect
-                    let pending = Self.exemptPendingKeys(roomKey: h.mediaRoomKey)
-                    out[h.mediaRoomKey] = LocalHouseSummary(
-                        roomKey: h.mediaRoomKey, roomNo: h.roomNo, tower: h.tower,
-                        landlord: h.landlord, layout: h.layout, price: h.price,
-                        password: h.password, remark: h.remark, statusRaw: h.statusRaw,
-                        mediaKeys: Set(h.mediaItems.map { Self.mediaNormKey($0.fileName) }).subtracting(pending)
-                    )
-                }
-                return out
-            }
-            // v2.62（B1~B8）：增量拉取——只有清单判「有变化」和本地没有的房才拉 info.json
-            let fetched = try await CloudHouseSync.fetchIncremental(
-                config: config, locals: locals, seen: CloudRevisionStore.all(), deep: deep)
-            let recs = fetched.records
-            // v1.80：云端同步成功 → 顺带拉取远程配置（公告/文案/开关/参数），失败不影响同步
-            Task { await RemoteConfig.refresh() }
-            // v1.40 第11点：先算 diff 弹确认，确认后才应用（此前直接执行后才弹结果，用户无法拦截误覆盖）
-            // v1.42：新增/更新/删除/补传/媒体差异全部带具体房号（用户要求：只要对比有差别就列出房号）
-            var added: [(roomNo: String, roomKey: String, mediaNames: [String])] = []
-            var updated: [(roomNo: String, byUser: String)] = []
-            var deleted: [(roomKey: String, roomNo: String)] = []
-            var pushed: [(roomKey: String, roomNo: String)] = []
-            // v2.58（#5）：媒体差异候选先收集，之后对 24h 宽限期内、确实要下载的记录做一次
-            // 「桶里是否真存在」校验：账本有、桶里没有的引用从差异里静音（不弹框、不下载，只记日志）。
-            var mediaCandidates: [(roomKey: String, roomNo: String, rec: CloudHouseRecord,
-                                   localNorm: Set<String>, diskNorm: Set<String>,
-                                   needDownload: Bool, needRemove: Bool)] = []
-            var mediaRoomKeys: [(roomKey: String, roomNo: String)] = []
-            await MainActor.run {
-                pendingSyncMediaDiff = []   // v1.43：每次同步前重置媒体差异收集
-                let local = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
-                var localByKey: [String: House] = [:]
-                for h in local where !h.isTrashed { localByKey[h.mediaRoomKey] = h }
-                // v2.62（B1）：云端权威房号集合来自目录列举（不是本次拉明细的集合）
-                let cloudKeys = fetched.cloudKeys
-                for rec in recs {
-                    if let h = localByKey[rec.roomKey] {
-                        if Self.cloudRecordDiffers(rec, from: h) != nil {
-                            // v1.40 B1：多人冲突提示——云端由他人更新时展示修改者
-                            // v1.69：房号一律真实引用带前缀（rec.roomKey），不做去前缀简化
-                            updated.append((rec.roomKey, rec.updatedBy))
-                        }
-                        // v1.43：媒体差异三名单对账（账本 / 本地记录 / 磁盘真实文件），归一化等价比较：
-                        //   - 账本有、本地记录或磁盘缺 → 需要下载（含用户手删 media 文件后刷新刷回）
-                        //   - 本地记录或磁盘有、账本没有 → 需要跟随删除（多余/旧残留收敛）
-                        //   - 视频 .mov/.mp4 视为同一文件（去扩展名比较），消除两套名字互斥导致的循环
-                        let exempt = Self.exemptPendingKeys(roomKey: h.mediaRoomKey)
-                        let localNorm = Set(h.mediaItems.map { Self.mediaNormKey($0.fileName) }).subtracting(exempt)
-                        let cloudNorm = Set(rec.mediaNames.map { Self.mediaNormKey($0) })
-                        let diskNorm = Set(MediaStore.existingFileNames(roomKey: h.mediaRoomKey).map { Self.mediaNormKey($0) }).subtracting(exempt)
-                        let needDownload = !cloudNorm.isSubset(of: localNorm) || !cloudNorm.isSubset(of: diskNorm)
-                        let needRemove = !localNorm.isSubset(of: cloudNorm) || !diskNorm.isSubset(of: cloudNorm)
-                        if needDownload || needRemove {
-                            mediaCandidates.append((h.mediaRoomKey, h.displayRoomNo, rec,
-                                                    localNorm, diskNorm, needDownload, needRemove))
-                        }
-                    } else {
-                        // v1.69：新增列表与媒体差异的房号一律带前缀真实引用
-                        added.append((rec.roomKey, rec.roomKey, rec.mediaNames))
-                        if !rec.mediaNames.isEmpty {
-                            // 新房：本地无记录/无磁盘文件，媒体全从云端下载
-                            mediaCandidates.append((rec.roomKey, rec.roomKey, rec, [], [], true, false))
-                        }
-                    }
-                }
-                for (key, h) in localByKey where !cloudKeys.contains(key) {
-                    // v1.71（方案 A）：云端账本为空（首次同步/云端被清空）时一律走「本地→云端」补传，
-                    // 不判定「云端已删」——否则本地双端房会被误判为云端已删而提示删本地（v1.42 事故模式）。
-                    // v2.62：判空必须用权威云端房号集合（cloudKeys），不能用 recs（recs 只含需明细的房，
-                    // 无变化时为空，会把真实删除误判成补传）。
-                    if !cloudKeys.isEmpty && (h.cloudStatus == .both || h.cloudStatus == .cloud) {
-                        deleted.append((key, h.displayRoomNo))
-                    } else {
-                        pushed.append((key, h.displayRoomNo))
-                    }
-                }
-            }
-            // v2.58（#5）：宽限期内静音「账本引用但桶里不存在」的媒体
-            var finalMediaDiffs: [(roomNo: String, missing: Bool)] = []
-            for c in mediaCandidates {
-                var needDownload = c.needDownload
-                if needDownload, Date().timeIntervalSince(c.rec.updatedAt) < 24 * 3600 {
-                    do {
-                        let missing = try await CloudHouseSync.missingLedgerMedia(
-                            roomKey: c.roomKey, expectedNames: c.rec.mediaNames, config: config)
-                        if !missing.isEmpty {
-                            let cloudNorm = Set(c.rec.mediaNames.map { Self.mediaNormKey($0) })
-                            let missingNorm = Set(missing.map { Self.mediaNormKey($0) })
-                            let effectiveCloud = cloudNorm.subtracting(missingNorm)
-                            needDownload = !effectiveCloud.isSubset(of: c.localNorm)
-                                || !effectiveCloud.isSubset(of: c.diskNorm)
-                            BackupLogStore.log(category: "同步", action: "宽限期静音桶内缺失媒体", result: "跳过",
-                                               detail: "\(c.roomKey)：账本引用但桶里不存在的 \(missing.count) 个文件（\(missing.prefix(3).joined(separator: "、"))），24 小时内不提示、不下载；等另一台设备补传成功后自动恢复",
-                                               room: c.roomKey, cloud: false)
-                        }
-                    } catch {
-                        // 列桶失败（网络/权限）：保持原差异，绝不把网络失败当成「桶里不存在」
-                    }
-                }
-                if needDownload || c.needRemove {
-                    mediaRoomKeys.append((c.roomKey, c.roomNo))
-                    finalMediaDiffs.append((c.roomNo, needDownload))
-                }
-            }
-            await MainActor.run {
-                pendingSyncMediaDiff = finalMediaDiffs
-            }
-            let hasChange = !added.isEmpty || !updated.isEmpty || !deleted.isEmpty || !pushed.isEmpty || !mediaRoomKeys.isEmpty
-            guard hasChange else {
-                // v1.65：账本无变化时做「云端媒体对账」——本地有媒体但云端 h/<房号>/ 缺对象 → 补齐媒体。
-                // v1.68：改为先「干跑」列桶比对（只查不传），得出待补列表 → 弹确认框，确认后才开始上传。
-                // 不再静默后台跑（用户看不到过程以为没反应）；上传过程走全局同步任务中心：
-                // 房源页顶部进度条 + 可最小化收起到「设置 → 待补传媒体」随时查看进度。
-                // v2.62（B5）：媒体对账也要列整桶（最慢的一段），日常刷新不再每次都跑——
-                // 只在「本次走全量」或「距上次对账 ≥ 24 小时」时做一次；其余情况靠上传失败进任务中心兜底。
-                let lastMediaAudit = UserDefaults.standard.double(forKey: "cloudMediaAuditLastAt")
-                let auditDue = fetched.usedFullScan
-                    || lastMediaAudit <= 0
-                    || Date().timeIntervalSince1970 - lastMediaAudit >= 24 * 3600
-                let pending: [PendingMediaHouseSnapshot]
-                if auditDue {
-                    pending = await preflightMediaSnapshots(config: config, ctx: ctx)
-                    UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "cloudMediaAuditLastAt")
-                } else {
-                    pending = []
-                }
-                if pending.isEmpty {
-                    // v1.77：无变化也同步本地账本镜像；v1.78：增量写，只报实际写入套数
-                    let ledger = rebuildLocalLedgers()
-                    if ledger.written > 0 {
-                        showToast(RemoteConfig.tip("refreshNoChangeLedger", "已刷新，无变化\n本地账本已同步 {n} 套").replacingOccurrences(of: "{n}", with: String(ledger.written)))
-                        BackupLogStore.log(category: "同步", action: "云端同步完成", result: "成功", detail: "无变化；本地数据刷新 \(ledger.written) 套", cloud: false)
-                    } else {
-                        showToast(RemoteConfig.tip("refreshNoChange", "已刷新，无变化"))
-                    }
-                    // 已同步成功：云端更新提示自动收起（不用用户再手动关）
-                    cloudUpdateBannerVisible = false
-                    // v2.55（恢复 v2.47 口径，修复进板块反复误报）：无变化也要回写修订号基线，
-                    // 让下次进板块的增量检测基线与云端对齐，不再因基线错位而每次误报「检测到云端有更新」
-                    // v2.62：基线来自本次清单（增量时不必再拉一遍所有明细）
-                    CloudRevisionStore.remember(fetched.revisions)
-                    syncCenter.endTransient(id: progressID)
-                    return .finished
-                }
-                pendingMediaSnaps = pending
-                pendingMediaSyncRetryTaskID = retryTaskID
-                showMediaSyncConfirm = true
-                // 等用户确认，真正上传在确认后另建任务：这里先收掉临时进度
-                syncCenter.endTransient(id: progressID)
-                return retryTaskID == nil ? .finished : .needsConfirmation
-            }
-            pendingSyncRecs = recs
-            // v2.62（B1）：执行侧必须用「云端权威房号集合」判断云端是否存在，
-            // 不能用 recs（recs 只含本次需要明细的房）——否则未变化的房会被当成「云端已删」。
-            pendingSyncCloudKeys = fetched.cloudKeys
-            pendingSyncAdded = added
-            pendingSyncUpdated = updated
-            pendingSyncDeleted = deleted
-            pendingSyncPushed = pushed
-            // v2.58（#3）：这次同步若来自任务中心重试，记下任务 id——确认框点「确认同步」
-            // 执行完才结算成功，点「取消」直接丢弃任务；不能在这里提前报成功
-            pendingSyncRetryTaskID = retryTaskID
-            showSyncConfirm = true
-            // 等用户确认后由 applySyncPreview 执行：这里先收掉临时进度
-            syncCenter.endTransient(id: progressID)
-            return .needsConfirmation
-        } catch {
-            syncCenter.endTransient(id: progressID)
-            // 回到 b174 规则：失败自动重试 1 次（弱网瞬断常见），第二次仍失败才提示
-            if !retriedOnce {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                return await syncCloudHouses(retriedOnce: true, retryTaskID: retryTaskID, deep: deep)
-            }
-            let message = "云端同步没完成：\(error.localizedDescription)，点重试重跑整次同步"
-            showToast("网络断开，待网络恢复后重试", isError: true)
-            BackupLogStore.log(category: "同步", action: "云端同步", result: "失败", detail: error.localizedDescription, cloud: false)
-            // v2.58（#3）：预览阶段失败也挂任务，不再只弹一条 toast 就结束；
-            // 任务中心重试进来的这次由 retry(id:) 按返回值结算原任务，不重复建任务
-            if retryTaskID == nil {
-                syncCenter.reportFailure(kind: .cloudPull, title: "从云端拉下来",
-                                         roomKeys: [], failure: message)
-            }
-            return .failed(message)
-        }
+        // 旧对象存储直连兜底链路已下线：未连接服务器时仅返回失败，本地数据可离线查看
+        return .failed("服务器未连接，请检查网络后重试")
     }
 
-    /// v1.67：在主线程把 House 的可跨线程数据提取成值快照（后台线程安全）
-    private func makePendingSnapshot(from h: House) -> PendingMediaHouseSnapshot {
-        let files = h.mediaItems.map { ShareMediaFile(name: $0.fileName, kind: $0.kind) }
-        let profile = CosUploader.loadShareProfile()
-        let info = ShareHouseInfo(
-            displayRoomNo: h.displayRoomNo, towerLabel: h.towerLabel,
-            layout: h.layout, statusLabel: h.status.label, priceText: h.priceText,
-            landlord: h.landlord, password: h.password, remark: h.remark,
-            name: profile.name, phone: profile.phone
-        )
-        return PendingMediaHouseSnapshot(roomKey: h.mediaRoomKey, displayRoomNo: h.displayRoomNo, files: files, info: info)
-    }
-
-    /// v1.68：云端媒体对账「干跑」——只列桶比对，不传任何东西，返回「云端缺媒体」的房源快照列表。
-    /// 供同步无变化时弹确认框前预检；列桶失败视为待补（确认后可重试，不丢数据）。
-    /// v1.83：一次递归列桶替代逐房号串行列桶——房源多时不再每次刷新发起 N 次 COS 请求。
-    /// 整桶 h/ 平铺拉回（自动分页），按房号前缀分组比对；仅命中差异的房号进入待补列表。
-    private func preflightMediaSnapshots(config: CosConfig, ctx: ModelContext) async -> [PendingMediaHouseSnapshot] {
-        var snapshots: [PendingMediaHouseSnapshot] = []
-        await MainActor.run {
-            let local = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
-            snapshots = local.filter { !$0.isTrashed && $0.cloudStatus != .cloud && !$0.mediaItems.isEmpty }.map { makePendingSnapshot(from: $0) }
-        }
-        guard !snapshots.isEmpty else { return [] }
-        // 一次列桶拉回 h/ 全部对象（自动分页），按「h/<房号>/」前缀归组
-        var cloudByRoom: [String: Set<String>] = [:]
-        do {
-            let objs = try await CosUploader.listObjects(prefix: "h/", config: config)
-            let prefixLen = "h/".count
-            for obj in objs {
-                var name = obj.name
-                guard name.hasPrefix("h/") else { continue }
-                name.removeFirst(prefixLen)
-                // 只处理 h/<房号>/ 下的对象（目录子项/根散文件跳过）
-                guard let slash = name.firstIndex(of: "/") else { continue }
-                let roomKey = String(name[..<slash])
-                guard !roomKey.isEmpty, !roomKey.hasPrefix("_") else { continue }
-                let file = String(name[name.index(after: slash)...])
-                guard !file.isEmpty else { continue }
-                cloudByRoom[roomKey, default: []].insert(Self.mediaNormKey(file))
-            }
-        } catch {
-            // 整桶列桶失败（网络/限流）：退回逐房号列桶（原逻辑），仍失败则视为待补（不丢数据）
-            var pending: [PendingMediaHouseSnapshot] = []
-            for snap in snapshots {
-                do {
-                    let objs = try await CosUploader.listObjects(prefix: "h/\(snap.roomKey)/", config: config)
-                    let cloudNames = Set(objs.map { Self.mediaNormKey(($0.name as NSString).lastPathComponent) })
-                    let localNames = Set(snap.files.map { Self.mediaNormKey($0.name) })
-                    if !localNames.isSubset(of: cloudNames) { pending.append(snap) }
-                } catch {
-                    pending.append(snap)
-                }
-            }
-            return pending
-        }
-        var pending: [PendingMediaHouseSnapshot] = []
-        for snap in snapshots {
-            let cloudNames = cloudByRoom[snap.roomKey] ?? []
-            let localNames = Set(snap.files.map { Self.mediaNormKey($0.name) })
-            if !localNames.isSubset(of: cloudNames) { pending.append(snap) }
-        }
-        return pending
-    }
-
-    /// v1.68：按确认后的快照列表执行媒体补传，走全局同步任务中心（进度条 / 最小化 / 待补传页可见）。
-    /// 幂等覆盖+刷新分享页（与批量导入同机制）；失败保留在补传队列，下次刷新对账再补。
-    private func runMediaUpload(snaps: [PendingMediaHouseSnapshot], config: CosConfig?, ctx: ModelContext?, cloudPullTaskID: UUID? = nil) async {
-        guard !snaps.isEmpty, let config else {
-            if let cloudPullTaskID {
-                syncCenter.finish(id: cloudPullTaskID, success: false, failure: "云存储配置未就绪，请重新同步")
-            }
-            return
-        }
-        await MediaActivityGate.shared.beginUpload()
-        defer { Task { await MediaActivityGate.shared.endUpload() } }
-        let total = snaps.reduce(0) { $0 + $1.files.count }
-        let taskID = syncCenter.begin(kind: .media, title: "补齐云端媒体",
-                                     roomKeys: snaps.map { $0.displayRoomNo }, total: total)
-        var uploaded: [String] = []
-        var failed: [String] = []
-        var done = 0
-        for snap in snaps {
-            syncCenter.advance(id: taskID, done: done, note: "正在处理 \(snap.displayRoomNo)")
-            let fileCount = snap.files.count
-            do {
-                _ = try await CosUploader.autoRegenerateMaskedShare(mediaFiles: snap.files, roomKey: snap.roomKey, info: snap.info, config: config)
-                uploaded.append(snap.displayRoomNo)
-                // v2.45：补齐云端媒体写账本；v2.62：只记数量，不拼文件名
-                let fillSplit = HouseLedgerFormat.split(snap.files.map { (name: $0.name, kind: $0.kind) })
-                HouseLedgerStore.append(
-                    roomKey: snap.roomKey,
-                    action: "补齐云端媒体",
-                    detail: HouseLedgerFormat.mediaParts(images: fillSplit.images, videos: fillSplit.videos, includeNames: false).joined(separator: "；"))
-            } catch {
-                failed.append(snap.displayRoomNo)
-            }
-            done += fileCount
-            syncCenter.advance(id: taskID, done: done)
-        }
-        if failed.isEmpty {
-            syncCenter.finish(id: taskID, success: true, note: "已补齐 \(uploaded.count) 套")
-        } else {
-            // 失败挂任务中心，手动点重试；不自动跑
-            syncCenter.finish(id: taskID, success: false,
-                             failure: "这几套媒体没传上：\(failed.joined(separator: "、"))，点重试")
-        }
-        var lines: [String] = []
-        if !uploaded.isEmpty { lines.append("已补齐云端媒体 \(uploaded.count) 套：" + uploaded.joined(separator: "，")) }
-        if !failed.isEmpty { lines.append("补传失败（可稍后再刷新重试）：" + failed.joined(separator: "，")) }
-        showToast(lines.isEmpty ? "没有需要补传的媒体" : lines.joined(separator: "\n"))
-        // v2.44：媒体补传结果系统通知
-        if !failed.isEmpty {
-            let failedFiles = snaps.filter { failed.contains($0.displayRoomNo) }.reduce(0) { $0 + $1.files.count }
-            HouseActionNotifier.shared.send(
-                key: "media.fill",
-                title: "媒体补传未完成",
-                body: "还剩 \(failedFiles) 个没传上，已挂任务中心，可手动重试",
-                silent: true
-            )
-        } else if total > 0 {
-            HouseActionNotifier.shared.send(
-                key: "media.fill",
-                title: "媒体补传完成",
-                body: "\(snaps.count) 套房、\(total) 个媒体已全部传完"
-            )
-        }
-        if !uploaded.isEmpty {
-            // v2.16：补齐云端媒体属于云端侧动作，只写云端日志区，本机区不再出现
-            CloudOps.log(category: "同步", action: "补齐云端媒体（本地→云端）", result: "成功", detail: "已补齐 \(uploaded.count) 套：" + uploaded.joined(separator: "，"))
-        }
-        if !failed.isEmpty {
-            CloudOps.log(category: "同步", action: "补齐云端媒体（本地→云端）", result: "失败", detail: "补齐失败：" + failed.joined(separator: "，"))
-        }
-        // v2.58（#3）：由 cloudPull 重试进入的媒体补齐，按真实结果结算原任务（不提前报成功）
-        if let cloudPullTaskID {
-            if failed.isEmpty {
-                syncCenter.finish(id: cloudPullTaskID, success: true, note: "媒体已补齐，同步完成")
-            } else {
-                syncCenter.finish(id: cloudPullTaskID, success: false,
-                                  failure: "云端同步没完成：\(failed.count) 套媒体没补齐，点重试")
-            }
-        }
-    }
-
-    /// v1.68：媒体对账确认框详情——列出每套缺几个媒体
-    private func mediaSyncConfirmSummary() -> String {
-        guard !pendingMediaSnaps.isEmpty else { return "" }
-        var lines = ["云端缺失媒体 \(pendingMediaSnaps.count) 套，确认后开始补齐："]
-        lines += pendingMediaSnaps.map { "\($0.displayRoomNo)（缺 \($0.files.count) 个媒体）" }
-        return lines.joined(separator: "\n")
-    }
-
-    /// v1.40 第11点：确认弹窗里的变化详情
-    /// v1.42：所有差异（新增/更新/云端已删/本地补传/媒体差异）一律列出具体房号
-    private func syncChangeSummary() -> String {
-        var parts: [String] = []
-        if !pendingSyncAdded.isEmpty { parts.append("新增\(pendingSyncAdded.count)套：\(pendingSyncAdded.map { $0.roomNo }.prefix(8).joined(separator: "，"))") }
-        if !pendingSyncUpdated.isEmpty {
-            let upd = pendingSyncUpdated.prefix(8).map { "\($0.roomNo)（\($0.byUser.isEmpty ? "他人" : $0.byUser)改）" }.joined(separator: "，")
-            parts.append("更新\(pendingSyncUpdated.count)套：\(upd)")
-        }
-        if !pendingSyncDeleted.isEmpty { parts.append("云端已删\(pendingSyncDeleted.count)套：\(pendingSyncDeleted.map { $0.roomNo }.prefix(8).joined(separator: "，"))，本地跟随删除") }
-        if !pendingSyncPushed.isEmpty { parts.append("本地新增\(pendingSyncPushed.count)套将补传云端：\(pendingSyncPushed.map { $0.roomNo }.prefix(8).joined(separator: "，"))") }
-        // v1.43：媒体差异独立列出房号，并标注「缺（将从云端补齐）」与「多（将跟随删除）」，不重复计入更新数
-        if !pendingSyncMediaDiff.isEmpty {
-            let missing = Set(pendingSyncMediaDiff.filter { $0.missing }.map { $0.roomNo })
-            let extra = Set(pendingSyncMediaDiff.filter { !$0.missing }.map { $0.roomNo })
-            var mediaParts: [String] = []
-            if !missing.isEmpty { mediaParts.append("本地缺媒体将从云端补齐：\(Array(missing).prefix(8).joined(separator: "，"))") }
-            if !extra.isEmpty { mediaParts.append("本地多余媒体将跟随删除：\(Array(extra).prefix(8).joined(separator: "，"))") }
-            parts.append(contentsOf: mediaParts)
-        }
-        return parts.joined(separator: "\n") + "\n\n确认后才会同步；取消则本次不动任何数据。"
-    }
-
-    /// v1.40 第11点：确认后应用同步（原执行逻辑）
-    /// v1.41：更新判定改字段级对比；新增媒体 reconcile——跟随云端删除本地多余媒体（账本已删、本地残留）
-    private func applySyncPreview(retryTaskID: UUID? = nil) async {
-        guard let config = CosConfig.load(), let ctx = houseModelContext else {
-            if let retryTaskID {
-                syncCenter.finish(id: retryTaskID, success: false,
-                                  failure: "云存储配置或房源数据未就绪，请到房源页重新同步")
-            }
-            return
-        }
-        let recs = pendingSyncRecs
-        // v2.62（B1）：recs 只含需要明细的房，不能再用它判「云端是否为空」。
-        // 空集保护改用权威云端房号集合——云端真的没有房源时仍然阻止同步，保护本地数据。
-        guard !pendingSyncCloudKeys.isEmpty else {
-            showToast("云端账本为空，已停止本次同步以保护本地数据", isError: true)
-            BackupLogStore.log(category: "同步", action: "云端同步", result: "失败",
-                              detail: "云端账本返回空集，已阻止空集同步", cloud: false)
-            if let retryTaskID {
-                syncCenter.finish(id: retryTaskID, success: false,
-                                  failure: "云端账本为空，已停止同步以保护本地数据")
-            }
-            return
-        }
-        // 总同步只显示顶部临时进度条，不写任务中心（成功/失败都不记录）
-        let applyID = syncCenter.beginTransient(kind: .cloudPull, title: "同步云端房源",
-                                               total: max(1, recs.count))
-        do {
-            var addedCount = 0, updatedCount = 0, deletedCount = 0, pushedCount = 0
-            var removedMediaCount = 0
-            var unreadRoomKeys: [String] = []   // v2.20：本次同步新增/被云端覆盖的房源，标红待看
-            var addedRoomNo: [String] = []
-            var updatedRoomNo: [String] = []
-            var deletedRoomNo: [String] = []
-            var pushedRoomNo: [String] = []
-            var pushedRecords: [CloudHouseRecord] = []   // v1.64：补传聚合
-            var pushedMediaHouses: [PendingMediaHouseSnapshot] = []   // v1.67：补传后需上传媒体的快照（主线程提取，后台只传值）
-            var mediaDiffRoomNo: [String] = []
-            var mediaRoomKeys: [(roomKey: String, roomNo: String)] = []   // v1.42：带房号
-            var conflictRoomNo: [String] = []   // v2.36（#7）：本地有未同步改动、跳过云端覆盖的房号
-            await MainActor.run {
-                let local = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
-                var localByKey: [String: House] = [:]
-                for h in local where !h.isTrashed { localByKey[h.mediaRoomKey] = h }
-                // v2.62（B1）：云端权威房号集合（目录列举结果），不是本次拉明细的集合
-                let cloudKeys = pendingSyncCloudKeys
-                // v2.37（#2/#35）：还在待上传队列里（等待/正在补传）的文件一律豁免——
-                // 按房间收集其规范键，下面动手删时名单内的不删、也不清排队任务，等它传完离开队列，下次同步再处理。
-                var exemptByRoom: [String: Set<String>] = [:]
-                for q in HouseMediaUploadQueue.pendingItems() {
-                    exemptByRoom[q.roomKey, default: []].insert(Self.mediaNormKey(q.fileName))
-                }
-                for rec in recs {
-                    if let h = localByKey[rec.roomKey] {
-                        // v2.36（#7）：本地有未同步成功的改动（SyncFail 标记），说明本地与云端已分叉。
-                        // 跳过云端覆盖整段（含媒体对账），保留本地改动，避免把用户本地修改冲掉。
-                        if SyncFailStore.isFailed(rec.roomKey) {
-                            conflictRoomNo.append(h.displayRoomNo)
-                            continue
-                        }
-                        // v2.36（#33）：执行侧与预览侧用同一份计划——只覆盖预览判定为「更新」的房源
-                        if let diff = Self.cloudRecordDiffers(rec, from: h),
-                           pendingSyncUpdated.contains(where: { $0.roomNo == rec.roomKey }) {
-                            // b116：记录具体差异，定位 1-711 这类死循环根因
-                            BackupLogStore.log(category: "同步", action: "云端更新本机", result: "成功",
-                                               detail: "\(rec.roomKey) 按云端更新：\(diff)", cloud: false)
-                            h.roomNo = rec.roomNo; h.tower = rec.tower; h.landlord = rec.landlord
-                            h.layout = rec.layout; h.price = rec.price; h.password = rec.password
-                            h.remark = rec.remark; h.statusRaw = rec.status
-                            h.lastUpdatedAt = rec.updatedAt
-                            updatedCount += 1
-                            updatedRoomNo.append(rec.roomKey)   // v1.69：带前缀真实引用
-                            unreadRoomKeys.append(h.mediaRoomKey)   // v2.20：被云端覆盖 → 标红
-                            LocalHouseLedger.save(h)   // v1.72（#6）：本地一房一账本镜像随更新同步
-                        }
-                        // v1.43：媒体差异双向 reconcile（归一化等价，.mov/.mp4 视为同一文件）——
-                        //  ① 账本有、本地记录或磁盘缺 → 下载（mediaRoomKeys；含用户手删文件后刷回）
-                        //  ② 本地记录有、账本已无 → 跟随删除（文件 + 记录）
-                        //  ③ 磁盘上有、账本已无的孤儿残留（旧首帧图/分享页等）→ 只删文件
-                        let exempt = exemptByRoom[h.mediaRoomKey] ?? []
-                        let cloudNorm = Set(rec.mediaNames.map { Self.mediaNormKey($0) })
-                        let localNorm = Set(h.mediaItems.map { Self.mediaNormKey($0.fileName) }).subtracting(exempt)
-                        let diskNorm = Set(MediaStore.existingFileNames(roomKey: h.mediaRoomKey).map { Self.mediaNormKey($0) }).subtracting(exempt)
-                        let needDownload = !cloudNorm.isSubset(of: localNorm) || !cloudNorm.isSubset(of: diskNorm)
-                        let needRemove = !localNorm.isSubset(of: cloudNorm) || !diskNorm.isSubset(of: cloudNorm)
-                        if needDownload {
-                            mediaRoomKeys.append((h.mediaRoomKey, h.displayRoomNo))
-                            mediaDiffRoomNo.append(h.displayRoomNo)
-                        }
-                        // v2.23：媒体有增删（云端换图/删视频）也算「有变化」，一并标红待看
-                        if needDownload || needRemove {
-                            unreadRoomKeys.append(h.mediaRoomKey)
-                        }
-                        if needRemove {
-                            let exempt = exemptByRoom[h.mediaRoomKey] ?? []
-                            for item in Array(h.mediaItems) where !cloudNorm.contains(Self.mediaNormKey(item.fileName)) {
-                                // v2.37（#2/#35）：待上传豁免——名单内不删、不清队列，传完下次再处理
-                                if exempt.contains(Self.mediaNormKey(item.fileName)) { continue }
-                                MediaStore.delete(fileName: item.fileName, roomKey: h.mediaRoomKey)
-                                ctx.delete(item)
-                                HouseMediaUploadQueue.remove(roomKey: h.mediaRoomKey, fileName: item.fileName)
-                                removedMediaCount += 1
-                            }
-                            for dname in MediaStore.existingFileNames(roomKey: h.mediaRoomKey) where !cloudNorm.contains(Self.mediaNormKey(dname)) {
-                                // 待上传豁免：磁盘上的排队文件同样保留
-                                if exempt.contains(Self.mediaNormKey(dname)) { continue }
-                                MediaStore.delete(fileName: dname, roomKey: h.mediaRoomKey)
-                                removedMediaCount += 1
-                            }
-                        }
-                        h.cloudStatus = .both
-                    } else if pendingSyncAdded.contains(where: { $0.roomKey == rec.roomKey }) {
-                        // v2.36（#33）：只新增预览判定为「新增」的房源
-                        let h = House(
-                            roomNo: rec.roomNo, tower: rec.tower, landlord: rec.landlord,
-                            layout: rec.layout, price: rec.price, password: rec.password,
-                            remark: rec.remark, status: HouseStatus(rawValue: rec.status) ?? .available
-                        )
-                        h.lastUpdatedAt = rec.updatedAt
-                        h.cloudStatus = .cloud
-                        ctx.insert(h)
-                        LocalHouseLedger.save(h)   // v1.72（#6）：本地一房一账本镜像
-                        addedCount += 1
-                        addedRoomNo.append(rec.roomKey)   // v1.69：带前缀真实引用
-                        unreadRoomKeys.append(h.mediaRoomKey)   // v2.20：新增 → 标红
-                        if !rec.mediaNames.isEmpty {
-                            mediaRoomKeys.append((h.mediaRoomKey, rec.roomKey))
-                            mediaDiffRoomNo.append(rec.roomKey)
-                        }
-                    }
-                }
-                for (key, h) in localByKey where !cloudKeys.contains(key) {
-                    // v2.36（#33）：执行侧只处理预览计划里的「删除/补传」，计划外的一律跳过，不再凭 cloudStatus 临时推导
-                    let inDeleted = pendingSyncDeleted.contains(where: { $0.roomKey == key })
-                    let inPushed = pendingSyncPushed.contains(where: { $0.roomKey == key })
-                    if inDeleted, h.cloudStatus == .both || h.cloudStatus == .cloud {
-                        MediaStore.deleteHouseDirectory(roomKey: key)
-                        SyncFailStore.clear(key)
-                        UnreadCloudHouseStore.clear(key)
-                        // v2.57（P1-5）：队列残留一并清，防待传任务把已删的房又传回云端（幽灵任务）
-                        HouseMediaUploadQueue.removeRoom(key)
-                        ctx.delete(h)
-                        deletedCount += 1
-                        deletedRoomNo.append(h.displayRoomNo)
-                    } else if inPushed {
-                        // v1.64：不再逐个并发 pushHouseToCloud（并发读改写同一账本文件会互相覆盖、
-                        // 云端丢失房源）——先收集，同步完成后一次性聚合写回云端账本
-                        pushedRecords.append(CloudHouseSync.record(from: h, username: CloudUser.username))
-                        pushedCount += 1
-                        pushedRoomNo.append(h.displayRoomNo)
-                    }
-                }
-                try? ctx.save()
-                reloadHouses()
-                UnreadCloudHouseStore.mark(unreadRoomKeys)   // v2.20：同步新增/修改的房源标红，点开详情后消失
-            }
-            // v2.36（#7）：被跳过的冲突房源提示给用户，明确这些房没有被云端覆盖
-            if !conflictRoomNo.isEmpty {
-                await MainActor.run {
-                    showToast("本机有未同步的修改，已保留：\(conflictRoomNo.joined(separator: "，"))", isError: true)
-                }
-                BackupLogStore.log(category: "同步", action: "保留本机修改", result: "成功",
-                                  detail: "本机未同步的修改已保留：\(conflictRoomNo.joined(separator: "，"))", cloud: false)
-            }
-            // v1.64：本地补传聚合为一次全量账本写入（串行）——此前 7 个异步 Task 并发对 h/_houses.json
-            // 做「读改写」，最后一次写回会覆盖其他并发任务的结果，导致云端只剩最后一条（实测只剩 2309）。
-            // 聚合写 + 成功后统一把补传房源标「双端」，失败保持「仅本地」并提示，可下次重试。
-            if !pushedRecords.isEmpty {
-                do {
-                    // v1.72（#8）：补传账本也显示卡片进度条（本地→云端同步动作）；v2.4：begin/end 计数
-                    if let first = pushedRecords.first {
-                        HouseSyncProgress.shared.begin(roomKey: first.roomKey, direction: .upload, progress: 0.1, label: "补传账本")
-                    }
-                    // v2.7（P1⑪ 补传合并写）：逐套 uploadGuarded 合并写——
-                    // 此前 uploadRecords 全量覆盖写，若另一用户刚在云端加了同号房（带媒体），
-                    // 本地空媒体名单会覆盖云端媒体名单，把云端媒体删掉。
-                    // uploadGuarded 写前先读云端 info.json，合并 mediaNames = 云端∪本地−本次删除，
-                    // revision+1，避免覆盖他人数据。
-                    for rec in pushedRecords {
-                        _ = try await CloudHouseSync.uploadGuarded(record: rec, config: config)
-                    }
-                    HouseSyncProgress.shared.end()
-                    await MainActor.run {
-                        let local = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
-                        var snapshots: [PendingMediaHouseSnapshot] = []
-                        for h in local where !h.isTrashed && pushedRecords.contains(where: { $0.roomKey == h.mediaRoomKey }) {
-                            h.cloudStatus = .both
-                            LocalHouseLedger.save(h)   // v1.72（#6）：本地一房一账本镜像
-                            if !h.mediaItems.isEmpty {
-                                snapshots.append(makePendingSnapshot(from: h))
-                            }
-                        }
-                        pushedMediaHouses = snapshots
-                        try? ctx.save()
-                        reloadHouses()
-                    }
-                    // v1.65：补传账本后同步上传本地媒体（幂等覆盖+刷新分享页，与批量导入同机制）。
-                    // 此前同步只写账本不传媒体，恢复/导入后媒体永远上不了云，「双端」名不副实；
-                    // 上传失败的媒体下次「已刷新无变化」会走云端媒体对账再补。
-                    // v1.67：只用主线程提取的值快照，后台不再访问 SwiftData 模型。
-                    // v1.68：上传纳入全局同步任务中心（房源页进度条 + 可最小化到待补传媒体页查看）。
-                    if !pushedMediaHouses.isEmpty {
-                        Task { await runMediaUpload(snaps: pushedMediaHouses, config: config, ctx: ctx) }
-                    }
-                    BackupLogStore.log(category: "同步", action: "补传房源（本地→云端）", result: "成功", detail: pushedRoomNo.joined(separator: "，"), cloud: false)
-                } catch {
-                    HouseSyncProgress.shared.end()   // v2.4：失败也归还计数，避免进度条残留
-                    await MainActor.run {
-                        showToast(RemoteConfig.tip("backfillFail", "补传云端失败：{error}。本地房源保持「仅本地」，可稍后重新同步补传").replacingOccurrences(of: "{error}", with: error.localizedDescription), isError: true)
-                    }
-                    BackupLogStore.log(category: "同步", action: "补传房源（本地→云端）", result: "失败", detail: error.localizedDescription, cloud: false)
-                }
-            }
-            var mediaSaved = 0
-            if !mediaRoomKeys.isEmpty {
-                for (idx, roomKeyInfo) in mediaRoomKeys.enumerated() {
-                    let (roomKey, _) = roomKeyInfo
-                    // 总进度条推进到当前房号（临时进度，不进任务中心）
-                    syncCenter.advanceTransient(id: applyID, done: idx, total: max(1, mediaRoomKeys.count),
-                                                note: "正在处理 \(roomKey)")
-                    // v1.42：同步下载进度 → 卡片底部进度条（云端 → 本机）
-                    HouseSyncProgress.shared.update(roomKey: roomKey, direction: .download, progress: 0)
-                    // v1.43：只下载云端账本名单（expectedNames）内的媒体，落盘名与账本一致 →
-                    // 同步完成后本地记录/磁盘 = 账本名单，下次同步零差异（根治「下载N删N」循环）
-                    guard let rec = recs.first(where: { $0.roomKey == roomKey }) else {
-                        HouseSyncProgress.shared.update(roomKey: roomKey, direction: .download, progress: 1)
-                        continue
-                    }
-                    let recordAge = Date().timeIntervalSince(rec.updatedAt)
-                    // v2.58（#5）：24h 宽限期内先剔除「账本引用但桶里不存在」的名字——
-                    // 只按真实存在的对象下载，不再对必然失败的名字发请求；只记日志，不弹框、不剔除账本。
-                    var expectedNames = rec.mediaNames
-                    if recordAge < 24 * 3600 {
-                        do {
-                            let missing = try await CloudHouseSync.missingLedgerMedia(
-                                roomKey: roomKey, expectedNames: rec.mediaNames, config: config)
-                            if !missing.isEmpty {
-                                let dropNorm = Set(missing.map { MediaNaming.canonicalKey($0) })
-                                expectedNames = rec.mediaNames.filter { !dropNorm.contains(MediaNaming.canonicalKey($0)) }
-                                BackupLogStore.log(category: "同步", action: "宽限期静音桶内缺失媒体", result: "跳过",
-                                                   detail: "\(roomKey)：账本引用但桶里不存在的 \(missing.count) 个文件（\(missing.prefix(3).joined(separator: "、"))），24 小时内不下载、不剔除；等另一台设备补传成功后自动恢复",
-                                                   room: roomKey, cloud: false)
-                            }
-                        } catch {
-                            // 列桶失败（网络/权限）：照旧按账本名单下载（下载器会跳过桶里没有的对象），不做静音
-                        }
-                    }
-                    let files = (try? await CosUploader.downloadHouseMedia(roomKey: roomKey, expectedNames: expectedNames, config: config, progress: { p in
-                        HouseSyncProgress.shared.update(roomKey: roomKey, direction: .download, progress: p)
-                    })) ?? []
-                    HouseSyncProgress.shared.update(roomKey: roomKey, direction: .download, progress: 1)
-                    // b118（1-711 死循环收敛）：账本名单里有、桶里没有等价对象的失效媒体引用
-                    // （下载永远失败 → 本地永远缺 → 每次同步都判「云端独有」→ 无限循环，实测 1-711-mov-2b237b6b-1）。
-                    // 超过 24 小时仍缺才从云端账本剔除写回；24h 内已在下载前静音，这里不再重复列桶/剔除，
-                    // 避免把「另一台设备还没补传上来」的引用误删。
-                    let missingLedger: [String]
-                    if recordAge < 24 * 3600 {
-                        missingLedger = []
-                    } else {
-                        do {
-                            missingLedger = try await CloudHouseSync.missingLedgerMedia(roomKey: roomKey, expectedNames: rec.mediaNames, config: config)
-                        } catch {
-                            missingLedger = []
-                        }
-                    }
-                    if !missingLedger.isEmpty {
-                        var pruned = rec
-                        let dropNorm = Set(missingLedger.map { MediaNaming.canonicalKey($0) })
-                        pruned.mediaNames = rec.mediaNames.filter { !dropNorm.contains(MediaNaming.canonicalKey($0)) }
-                        if pruned.mediaNames.count != rec.mediaNames.count {
-                            _ = try? await CloudHouseSync.uploadGuarded(record: pruned, removedMedia: Set(missingLedger), config: config)
-                            BackupLogStore.log(category: "同步", action: "清理失效媒体记录", result: "成功",
-                                               detail: "\(roomKey)：云端已不存在的 \(missingLedger.joined(separator: "，")) 已从名单剔除", cloud: false)
-                        }
-                    }
-                    mediaSaved += files.count
-                    await MainActor.run {
-                        let all = (try? ctx.fetch(FetchDescriptor<House>())) ?? []
-                        if let h = all.first(where: { $0.mediaRoomKey == roomKey && !$0.isTrashed }) {
-                            // 下载返回的文件名 = 账本名 → 插入记录后本地记录与账本零差异
-                            for f in files where !h.mediaItems.contains(where: { $0.fileName == f.fileName }) {
-                                let item = MediaItem(fileName: f.fileName, kind: f.kind)
-                                item.house = h
-                                ctx.insert(item)
-                            }
-                            // v1.41：按账本补记录——磁盘已有但记录缺失（如恢复快速备份后，
-                            // 备份只有记录引用没有媒体本体），补建 MediaItem 记录，详情页才能打开视频
-                            if let rec = recs.first(where: { $0.roomKey == roomKey }) {
-                                let recorded = Set(h.mediaItems.map { $0.fileName })
-                                let disk = MediaStore.existingFileNames(roomKey: roomKey)
-                                for name in rec.mediaNames where !recorded.contains(name) && disk.contains(name) {
-                                    let lower = name.lowercased()
-                                    let isVideo = lower.hasSuffix(".mp4") || lower.hasSuffix(".mov")
-                                    let item = MediaItem(fileName: name, kind: isVideo ? "video" : "image")
-                                    item.house = h
-                                    ctx.insert(item)
-                                }
-                            }
-                            h.cloudStatus = .both
-                            try? ctx.save()
-                        }
-                    }
-                }
-            }
-            // v1.42：完成提示一律列出具体房号（用户要求：只要对比有差别就列出房号）
-            // v1.43：媒体方向标注（云端→本地 / 本地→云端）
-            var parts: [String] = []
-            if addedCount > 0 { parts.append("新增\(addedCount)套：\(addedRoomNo.joined(separator: "，"))") }
-            if updatedCount > 0 { parts.append("更新\(updatedCount)套：\(updatedRoomNo.joined(separator: "，"))") }
-            if deletedCount > 0 { parts.append("云端已删\(deletedCount)套：\(deletedRoomNo.joined(separator: "，"))") }
-            if pushedCount > 0 { parts.append("补传\(pushedCount)套：\(pushedRoomNo.joined(separator: "，"))") }
-            if mediaSaved > 0 { parts.append("下载媒体\(mediaSaved)个（云端→本地）") }
-            if removedMediaCount > 0 { parts.append("删除媒体\(removedMediaCount)个（本地多余跟随删）") }
-            if !mediaDiffRoomNo.isEmpty { parts.append("媒体同步：\(Array(Set(mediaDiffRoomNo)).joined(separator: "，"))") }
-            let msg = "已同步：\(parts.joined(separator: "，"))"
-            // v1.77：同步完成后重建本地账本镜像；v1.78：增量写，只报实际写入套数
-            let ledger = rebuildLocalLedgers()
-            if ledger.written > 0 {
-                showToast(msg + "\n本地账本已同步 \(ledger.written) 套")
-            } else {
-                showToast(msg)
-            }
-            // v2.44：总同步完成系统通知，正文即上面带房号明细的 msg
-            HouseActionNotifier.shared.send(
-                key: "sync.done",
-                title: "房源同步完成",
-                body: ledger.written > 0 ? msg + "；本地账本 \(ledger.written) 套" : msg
-            )
-            // v2.46：合并成一条——本地数据刷新套数并进明细，不再单独写「重建本地账本镜像」
-            let syncDetail = msg + (ledger.written > 0 ? "；本地数据刷新 \(ledger.written) 套" : "")
-            BackupLogStore.log(category: "同步", action: "云端同步完成", result: "成功", detail: syncDetail, cloud: false)
-            HouseSyncProgress.shared.end()
-            // 已同步成功：云端更新横幅自动收起
-            cloudUpdateBannerVisible = false
-            // 总进度条完成（只关临时进度，不写「最近完成」）
-            syncCenter.endTransient(id: applyID)
-            // v2.58（#3）：任务中心重试进来的这次同步，执行成功才结算为成功
-            if let retryTaskID {
-                syncCenter.finish(id: retryTaskID, success: true, note: "同步完成")
-            }
-            // v2.37（#34）：同步成功后刷新本地修订号基线，并强制把总清单积压改动落盘，
-            // 保证下次进页面的增量检测基线准确，不再误报「有更新」
-            var seenRev: [String: Int64] = [:]
-            for r in recs { seenRev[r.roomKey] = r.revision ?? 0 }
-            CloudRevisionStore.remember(seenRev)
-            Task { await CloudManifestUpdater.shared.flush() }
-            // v2.45：同步收尾——把各房云端账本（别人的操作）拉到本地，再合并上传所有待同步账本
-            Task {
-                for rec in recs {
-                    try? await HouseLedgerStore.pull(roomKey: rec.roomKey, config: config)
-                }
-                await HouseLedgerStore.syncAll(roomKeys: HouseLedgerStore.dirtyRoomKeys(), config: config)
-            }
-            // v2.28：按用户要求移除「同步成功后自动清理孤儿」——自动删云端对象风险高（账本读取失败会整目录误删），
-            // 只保留设置页「清理桶孤儿媒体」手动按钮（先扫描列清单、确认后才删）
-        } catch {
-            // v2.57（P3-14）：总同步失败不再只 toast——挂任务中心 cloudPull 任务，点重试即重跑整次同步
-            // （云端配置无效等永久错误除外：重试也没意义，仍只提示）。
-            var permanent = false
-            if case CosUploader.CosError.invalidConfig = error { permanent = true }
-            showToast("云端同步失败：\(error.localizedDescription)。已挂任务中心，可点重试", isError: true)
-            HouseActionNotifier.shared.send(
-                key: "sync.fail",
-                title: "同步失败",
-                body: "\(error.localizedDescription)，已挂任务中心可重试",
-                silent: true
-            )
-            if let retryTaskID {
-                // v2.58（#3）：原任务直接按真实失败结算，不再另建一条重复任务
-                syncCenter.finish(id: retryTaskID, success: false,
-                                  failure: "云端同步没完成：\(error.localizedDescription)，点重试重跑整次同步")
-            } else if !permanent {
-                syncCenter.finish(id: syncCenter.begin(kind: .cloudPull, title: "从云端拉下来", roomKeys: [], total: 1),
-                                  success: false,
-                                  failure: "云端同步没完成：\(error.localizedDescription)，点重试重跑整次同步")
-            }
-            BackupLogStore.log(category: "同步", action: "云端同步", result: "失败", detail: String(describing: error), cloud: false)
-            HouseSyncProgress.shared.end()
-            syncCenter.endTransient(id: applyID)
-        }
-    }
-
-    /// v2.7（P2⑯ 桶孤儿清理）：同步完成后后台清理桶里的孤儿媒体对象。
-    /// 规则：
-    /// 1) 列 h/ 整桶对象，按「h/<房号>/」前缀分组；
-    /// 2) 对每个房号目录，读 info.json 账本拿到 mediaNames；
-    /// 3) 删除目录下不在 mediaNames 里的媒体对象（图片/视频）——这些是改名/删媒体后残留的孤儿；
-    /// 4) 没有 info.json（或账本读取失败）的房号目录 → v2.28 起保守跳过、一个不删
-    ///    （旧注释写“整目录全删”与实现不符：账本读取失败可能是网络抖动，删了无法恢复；孤儿留给设置页手动清）；
-    /// 5) 只删媒体对象（.jpg/.jpeg/.png/.heic/.webp/.gif/.mp4/.mov），不动 info.json 与其他系统对象。
-    /// 失败静默（不打断用户），下次同步再清。
-    /// b117：孤儿媒体清单项
-    struct OrphanMedia {
-        let roomKey: String   // 房号（如 1-711上 / 2-1418下）
-        let fileName: String  // 孤儿文件名
-        var path: String { "h/\(roomKey)/\(fileName)" }
-    }
-
-    /// b117：干跑扫描——列出桶里所有孤儿媒体对象，不删。
-    /// v2.47：onProgress 逐房回报扫描进度（done/total/当前房号）
-    /// 取消令牌：设置页「取消本次」置位后，扫描循环立即停止，一个文件都不删
-    actor OrphanScanControl {
-        private(set) var isCancelled = false
-        func cancel() { isCancelled = true }
-    }
-
-    static func scanOrphanMedia(config: CosConfig,
-                                control: OrphanScanControl? = nil,
-                                onProgress: ((_ done: Int, _ total: Int, _ roomKey: String) -> Void)? = nil) async throws -> [OrphanMedia] {
-        let objs = try await CosUploader.listObjects(prefix: "h/", config: config)
-        var byRoom: [String: [String]] = [:]
-        for obj in objs {
-            let name = obj.name
-            guard name.hasPrefix("h/") else { continue }
-            let rest = String(name.dropFirst(2))
-            guard let slash = rest.firstIndex(of: "/") else { continue }
-            let roomKey = String(rest[..<slash])
-            guard !roomKey.isEmpty, !roomKey.hasPrefix("_") else { continue }
-            let file = String(rest[rest.index(after: slash)...])
-            guard !file.isEmpty else { continue }
-            byRoom[roomKey, default: []].append(file)
-        }
-        let roomKeys = byRoom.keys.sorted()
-        let total = roomKeys.count
-        onProgress?(0, max(total, 1), "")
-        var orphans: [OrphanMedia] = []
-        var done = 0
-        for roomKey in roomKeys {
-            if await control?.isCancelled == true { break }
-            let files = byRoom[roomKey] ?? []
-            // 安全规则：读取该房云端账本失败（网络错误/超时）时，绝不按空名单处理——
-            // 否则整间房的媒体都会被误判成孤儿而删除。直接跳过该房间，本次不清理。
-            // 无账本（无 info.json）同样整间跳过。
-            let rec: CloudHouseRecord?
-            do {
-                rec = try await CloudHouseSync.fetchOne(roomKey: roomKey, config: config)
-            } catch {
-                rec = nil
-            }
-            if let rec {
-                let ledgerKeys = Set(rec.mediaNames.map { MediaNaming.canonicalKey($0) })
-                for file in files {
-                    guard file != "info.json" else { continue }
-                    let lower = file.lowercased()
-                    let isMedia = [".jpg", ".jpeg", ".png", ".heic", ".webp", ".gif", ".mp4", ".mov"].contains { lower.hasSuffix($0) }
-                    guard isMedia else { continue }
-                    // v2.37（#11）：按规范键判断账本是否引用——视频 mov/mp4 等价、图片保留后缀
-                    let fileKey = MediaNaming.canonicalKey(file)
-                    if !ledgerKeys.contains(fileKey) {
-                        orphans.append(OrphanMedia(roomKey: roomKey, fileName: file))
-                    }
-                }
-            }
-            done += 1
-            onProgress?(done, max(total, 1), roomKey)
-        }
-        return orphans
-    }
-
-    /// b117：实际删除指定孤儿清单，返回删除成功数。
-    /// v2.37（#19）：点「确认删除」那一刻对每个文件重新实时核对——重拉该房账本确认它现在仍无主、
-    /// 再确认对象还在；凡是现在有主/有变化/账本或列桶失败的一律剔除，只删核对后确实还是孤儿的，
-    /// 哪怕确认弹窗放了很久，也不会误删别人刚传的同名文件。
-    static func deleteOrphanMedia(_ orphans: [OrphanMedia], config: CosConfig) async -> Int {
-        var byRoom: [String: [OrphanMedia]] = [:]
-        for o in orphans { byRoom[o.roomKey, default: []].append(o) }
-        var deleted = 0
-        for (roomKey, items) in byRoom {
-            // ① 重拉账本：失败/无账本（整间可能已被改动）→ 保守起见本间全部跳过，不删
-            let rec: CloudHouseRecord
-            do {
-                guard let fetched = try await CloudHouseSync.fetchOne(roomKey: roomKey, config: config) else { continue }
-                rec = fetched
-            } catch {
-                continue
-            }
-            let ledgerKeys = Set(rec.mediaNames.map { MediaNaming.canonicalKey($0) })
-            // ② 列当前桶内对象确认还在；列桶失败（网络）绝不当成空，本间跳过
-            let currentObjs: Set<String>
-            do {
-                let objs = try await CosUploader.listObjects(prefix: "h/\(roomKey)/", config: config)
-                currentObjs = Set(objs.map { $0.name })
-            } catch {
-                continue
-            }
-            for o in items {
-                // 现在已被账本引用 → 剔除，不删
-                if ledgerKeys.contains(MediaNaming.canonicalKey(o.fileName)) { continue }
-                // 对象已不存在 → 无需删
-                guard currentObjs.contains(o.path) else { continue }
-                do {
-                    try await CloudBackupService.deleteRemoteObject(name: o.path, config: config)
-                    deleted += 1
-                } catch {
-                    // 单个失败跳过
-                }
-            }
-        }
-        return deleted
-    }
-
-    // v2.33：自动孤儿清理的残留函数 cleanupOrphanMedia 已删除——自动触发点 v2.28 已移除，
-    // 云端媒体只允许设置页「清理桶孤儿媒体」手动扫描+确认后删除（scanOrphanMedia/deleteOrphanMedia）。
 
     // MARK: - v1.12 多选批量操作（批量已租 / 批量删除）
 
     /// 批量已租：选中的待租房源全部标为已租（已租的保持不变），完成后自动退出多选
     private func batchSetRented() {
-        guard !selectedHouseIDs.isEmpty, let ctx = houseModelContext else { return }
+        guard !selectedHouseIDs.isEmpty else { return }
         var changed = 0
         var rentedHouses: [House] = []
         for house in houses where selectedHouseIDs.contains(house.id) && house.status == .available {
@@ -2925,13 +1521,14 @@ struct HouseListView: View {
                 roomKey: house.mediaRoomKey,
                 action: "批量标记已租",
                 detail: "状态：\(HouseStatus.available.label) → \(HouseStatus.rented.label)",
-                fieldChanges: [HouseLedgerFieldChange(field: "状态", oldValue: HouseStatus.available.label, newValue: HouseStatus.rented.label)])
+                fieldChanges: [HouseLedgerFieldChange(field: "状态", oldValue: HouseStatus.available.label, newValue: HouseStatus.rented.label)],
+                writeOpLog: false)
             rentedHouses.append(house)
             changed += 1
         }
-        try? ctx.save()
+        try? HouseRepository.shared.save()
         // v2.24：批量已租也要推云端（此前只改本地，下次同步被云端旧状态回滚回去）
-        // 服务器模式：逐套推服务器权威库，失败入待补传；旧 COS 链路仅在非服务器模式走
+        // 服务器模式：逐套推服务器权威库，失败入待补传；旧对象存储链路仅在非服务器模式走
         if HouseServerMode.ready, !rentedHouses.isEmpty {
             let toPush = rentedHouses
             Task {
@@ -2941,10 +1538,19 @@ struct HouseListView: View {
                     let roomKey = house.mediaRoomKey
                     let roomNo = house.displayRoomNo
                     do {
-                        _ = try await HouseSyncEngine.shared.pushHouse(house)
+                        _ = try await HouseRepository.shared.push(house)
+                        BackupLogStore.log(category: "房源", action: "批量标记已租", result: "成功",
+                                           detail: "状态：\(HouseStatus.available.label) → \(HouseStatus.rented.label)",
+                                           room: roomKey, cloud: true)
                         okRooms.append(roomNo)
                     } catch {
-                        await MainActor.run { HousePendingUploader.shared.markPending(roomKey) }
+                        BackupLogStore.log(category: "房源", action: "批量标记已租", result: "失败",
+                                           detail: "服务器更新失败：\(error.localizedDescription)",
+                                           room: roomKey, cloud: true)
+                        await MainActor.run {
+                            HouseRepository.shared.markPending(roomKey, action: "批量标记已租",
+                                                              detail: "状态：\(HouseStatus.available.label) → \(HouseStatus.rented.label)")
+                        }
                         failRooms.append(roomNo)
                     }
                 }
@@ -2963,52 +1569,6 @@ struct HouseListView: View {
                     }
                 }
             }
-        } else if let config = CosConfig.load(), config.isValid, !rentedHouses.isEmpty {
-            let toPush = rentedHouses
-            Task {
-                var okRooms: [String] = []
-                var failRooms: [String] = []
-                for house in toPush {
-                    let record = CloudHouseSync.record(from: house, username: CloudUser.username)
-                    LocalHouseLedger.save(house)
-                    let roomKey = house.mediaRoomKey
-                    let roomNo = house.displayRoomNo
-                    HouseSyncProgress.shared.begin(roomKey: roomKey, direction: .upload, progress: 0.2, label: "同步账本")
-                    do {
-                        // v2.36（#6）：批量已租改走 uploadGuarded 合并写，避免裸覆盖
-                        _ = try await CloudHouseSync.uploadGuarded(record: record, config: config)
-                        HouseSyncProgress.shared.end()
-                        await MainActor.run {
-                            house.cloudStatus = .both
-                            SyncFailStore.clear(roomKey)
-                            try? houseModelContext?.save()
-                        }
-                        okRooms.append(roomNo)
-                        BackupLogStore.log(category: "房源", action: "批量标记已租", result: "成功", detail: "状态：待租 → 已租", room: roomNo, cloud: true)
-                    } catch {
-                        HouseSyncProgress.shared.end()
-                        await MainActor.run { SyncFailStore.mark(roomKey) }
-                        failRooms.append(roomNo)
-                        BackupLogStore.log(category: "房源", action: "批量标记已租", result: "失败", detail: "云端更新失败：\(error.localizedDescription)", room: roomNo, cloud: true)
-                    }
-                }
-                await MainActor.run {
-                    if failRooms.isEmpty {
-                        HouseActionNotifier.shared.send(
-                            key: "batch.rented",
-                            title: "批量改已租完成",
-                            body: "\(okRooms.count) 套已改为已租，云端同步 \(okRooms.count)/\(okRooms.count)"
-                        )
-                    } else {
-                        HouseActionNotifier.shared.send(
-                            key: "batch.rented",
-                            title: "部分房源没传上",
-                            body: "\(okRooms.count) 套同步成功，\(failRooms.count) 套失败（\(failRooms.joined(separator: "、"))），联网后自动重试",
-                            silent: true
-                        )
-                    }
-                }
-            }
         }
         NotificationCenter.default.post(name: Self.houseStoreChanged, object: nil)
         let total = selectedHouseIDs.count
@@ -3018,14 +1578,14 @@ struct HouseListView: View {
 
     /// v1.7：卡片左滑「分享」→ 单套分享卡片（脱敏 / 完整），生成链接后弹系统分享面板
     /// 注意：Task 内只传值类型，绝不直接访问 SwiftData @Model（跨线程读取模型会闪退）
-    /// v2.17：列表页单套 → 只分享视频（不走云端卡片，不需要 COS 配置）
+    /// v2.17：列表页单套 → 只分享视频（不走云端卡片，不需要对象存储配置）
     private func generateSingleVideoShare() {
         guard let house = singleShareHouse else { return }
         let urls = house.videos
             .map { MediaStore.url(for: $0.fileName, roomKey: house.mediaRoomKey) }
             .filter { FileManager.default.fileExists(atPath: $0.path) }
         guard !urls.isEmpty else {
-            infoMessage = "这套房源没有可分享的视频；视频若还在云端，先下载到本地再分享"
+            infoMessage = "这套房源没有可分享的视频；视频若还在服务器，先下载到本地再分享"
             showInfoAlert = true
             singleShareHouse = nil
             return
@@ -3066,17 +1626,13 @@ struct HouseListView: View {
 
     private func generateSingleShare(mode: ShareMode) {
         guard let house = singleShareHouse else { return }
-        guard let config = CosConfig.load(), config.isValid else {
-            infoMessage = "请先到「设置 → 房源分享 → 远程配置」填写云存储配置（腾讯云 COS）并保存验证，再分享卡片链接"; showInfoAlert = true
-            return
-        }
         guard !house.mediaItems.isEmpty else {
             infoMessage = "这套房源还没有照片或视频，先编辑添加素材再分享"; showInfoAlert = true
             return
         }
         let files = house.mediaItems.map { ShareMediaFile(name: $0.fileName, kind: $0.kind) }
         let roomKey = house.mediaRoomKey
-        let profile = CosUploader.loadShareProfile()
+        let profile = ShareProfileStore.load()
         let info = ShareHouseInfo(
             displayRoomNo: house.displayRoomNo,
             towerLabel: house.towerLabel,
@@ -3089,37 +1645,51 @@ struct HouseListView: View {
             name: profile.name,
             phone: profile.phone
         )
-        isGenerating = true
-        generateTip = "正在上传照片和视频…"
-        generateProgress = 0
-        Task {
-            do {
-                let url = try await CosUploader.shareCard(mediaFiles: files, roomKey: roomKey, info: info, mode: mode, config: config) { p in
-                    Task { @MainActor in self.generateProgress = p }
-                }
-                await MainActor.run {
-                    isGenerating = false
-                    shareQueue = [[url]]
-                    shareIndex = 0
-                    presentShareStep([url])
-                    singleShareHouse = nil
-                }
-            } catch {
-                await MainActor.run {
-                    isGenerating = false
-                    infoMessage = error.localizedDescription; showInfoAlert = true
-                    singleShareHouse = nil
+        // 服务器模式：只发一个带签名的 H5 链接
+        if HouseServerMode.ready {
+            isGenerating = true
+            generateTip = "正在生成分享链接…"
+            generateProgress = 0.35
+            Task {
+                await ShareAssetUploader.prepare(roomKeys: [roomKey], mediaByRoom: [files])
+                _ = await ShareAssetUploader.ensureQRCode()
+                do {
+                    let url = try await HouseRemoteClient.shared.createShare(
+                        kind: "single", roomKeys: [roomKey], mode: mode.rawValue,
+                        expiryDays: 3650, watermark: ShareAssetUploader.watermarkDict(),
+                        summary: info.shareText(mode: mode))
+                    await MainActor.run {
+                        isGenerating = false
+                        shareQueue = [[url]]
+                        shareIndex = 0
+                        presentShareStep([url])
+                        singleShareHouse = nil
+                    }
+                } catch {
+                    await MainActor.run {
+                        isGenerating = false
+                        infoMessage = error.localizedDescription
+                        showInfoAlert = true
+                        singleShareHouse = nil
+                    }
                 }
             }
+            return
         }
+        // 旧桶卡片链接已下线：未接入服务器回退本地媒体 + 纯文字系统分享
+        let localUrls = files.compactMap { f in
+            let u = MediaStore.url(for: f.name, roomKey: roomKey)
+            return FileManager.default.fileExists(atPath: u.path) ? u : nil
+        }
+        let items: [Any] = localUrls + [info.shareText]
+        shareQueue = [items]
+        shareIndex = 0
+        presentShareStep(items)
+        singleShareHouse = nil
     }
 
     private func startMultiShare() {
         guard !selectedHouseIDs.isEmpty else { return }
-        guard let config = CosConfig.load(), config.isValid else {
-            infoMessage = "请先到「设置 → 房源分享 → 远程配置」填写云存储配置（腾讯云 COS）并保存验证，再分享卡片链接"; showInfoAlert = true
-            return
-        }
         // 过滤出有素材的房源（无照片视频的无法生成卡片）
         let shareable = houses.filter { selectedHouseIDs.contains($0.id) && !$0.mediaItems.isEmpty }
         guard !shareable.isEmpty else {
@@ -3132,10 +1702,6 @@ struct HouseListView: View {
     /// v1.22：生成【合集分享卡片】（一次选 N 套 → 一个链接 → 好友点开看全部），生成后弹一次系统分享面板
     /// 注意：值类型（ShareCollectionItem）在主线程构建完成，Task 内只传递值，绝不直接访问 SwiftData @Model（跨线程读取模型会闪退）
     private func generateShareQueue(mode: ShareMode) {
-        guard let config = CosConfig.load(), config.isValid else {
-            infoMessage = "请先到「设置 → 房源分享 → 远程配置」填写云存储配置（腾讯云 COS）并保存验证，再分享卡片链接"; showInfoAlert = true
-            return
-        }
         let shareable = houses.filter { selectedHouseIDs.contains($0.id) && !$0.mediaItems.isEmpty }
         guard !shareable.isEmpty else {
             infoMessage = "选中的房源都没有照片或视频，先编辑添加素材再分享"; showInfoAlert = true
@@ -3148,10 +1714,55 @@ struct HouseListView: View {
             return a.roomNo < b.roomNo
         }
 
-        // 主线程先构建值类型数组（Task 闭包内不触碰 @Model）
-        let rooms = sortedShareable.map { house -> ShareCollectionItem in
-            ShareCollectionItem(
-                roomKey: house.mediaRoomKey,
+        // 服务器模式：合集=一个带签名的 H5 链接（一次发给好友，点开看 N 套）
+        if HouseServerMode.ready {
+            isGenerating = true
+            generateTip = "正在生成合集链接…"
+            generateProgress = 0.35
+            let roomKeys = sortedShareable.map { $0.mediaRoomKey }
+            let mediaByRoom = sortedShareable.map { h in
+                h.mediaItems.map { ShareMediaFile(name: $0.fileName, kind: $0.kind) }
+            }
+            let summaries = sortedShareable.map { h in
+                ShareHouseInfo(
+                    displayRoomNo: h.displayRoomNo, towerLabel: h.towerLabel,
+                    layout: h.layout, statusLabel: h.status.label,
+                    priceText: h.priceText, landlord: h.landlord,
+                    password: h.password, remark: h.remark,
+                    name: ShareProfileStore.load().name, phone: ShareProfileStore.load().phone
+                ).shareText(mode: mode)
+            }
+            Task {
+                await ShareAssetUploader.prepare(roomKeys: roomKeys, mediaByRoom: mediaByRoom)
+                _ = await ShareAssetUploader.ensureQRCode()
+                do {
+                    let url = try await HouseRemoteClient.shared.createShare(
+                        kind: "collection", roomKeys: roomKeys, mode: mode.rawValue,
+                        expiryDays: 3650, watermark: ShareAssetUploader.watermarkDict(),
+                        summary: "合集分享 · \(roomKeys.count)套\n" + summaries.joined(separator: "\n"))
+                    await MainActor.run {
+                        isGenerating = false
+                        shareQueue = [[url]]
+                        shareIndex = 0
+                        presentShareStep([url])
+                    }
+                } catch {
+                    await MainActor.run {
+                        isGenerating = false
+                        infoMessage = error.localizedDescription
+                        showInfoAlert = true
+                    }
+                }
+            }
+            return
+        }
+
+        // 旧桶合集卡片已下线：未接入服务器按套分批本地媒体 + 纯文字依次系统分享
+        var localBatches: [[Any]] = []
+        for house in sortedShareable {
+            let roomKey = house.mediaRoomKey
+            let profile = ShareProfileStore.load()
+            let info = ShareHouseInfo(
                 displayRoomNo: house.displayRoomNo,
                 towerLabel: house.towerLabel,
                 layout: house.layout,
@@ -3160,33 +1771,18 @@ struct HouseListView: View {
                 landlord: house.landlord,
                 password: house.password,
                 remark: house.remark,
-                mediaFiles: house.mediaItems.map { ShareMediaFile(name: $0.fileName, kind: $0.kind) }
+                name: profile.name,
+                phone: profile.phone
             )
-        }
-
-        isGenerating = true
-        generateTip = "正在生成合集分享卡片（共 \(sortedShareable.count) 套）…"
-        generateProgress = 0
-
-        Task {
-            do {
-                let url = try await CosUploader.shareCollection(rooms: rooms, mode: mode, config: config) { p in
-                    Task { @MainActor in self.generateProgress = p }
-                }
-                await MainActor.run {
-                    isGenerating = false
-                    shareQueue = [[url]]
-                    shareIndex = 0
-                    presentShareStep([url])
-                }
-            } catch {
-                await MainActor.run {
-                    isGenerating = false
-                    infoMessage = error.localizedDescription; showInfoAlert = true
-                    exitMultiSelect()
-                }
+            let urls = house.mediaItems.compactMap { item -> URL? in
+                let u = MediaStore.url(for: item.fileName, roomKey: roomKey)
+                return FileManager.default.fileExists(atPath: u.path) ? u : nil
             }
+            localBatches.append(urls + [info.shareText])
         }
+        shareQueue = localBatches
+        shareIndex = 0
+        presentShareStep(localBatches[0])
     }
 
     private func showSaveToast(_ msg: String) {
@@ -3241,7 +1837,7 @@ struct HouseListView: View {
         }.filter { !$0.isEmpty }
         let flat = videoURLs.flatMap { $0 }
         guard !flat.isEmpty else {
-            infoMessage = "选中的房源没有可分享的视频；视频若还在云端，先下载到本地再分享"
+            infoMessage = "选中的房源没有可分享的视频；视频若还在服务器，先下载到本地再分享"
             showInfoAlert = true
             return
         }

@@ -11,7 +11,7 @@
 口径说明：
 - 字段修改走 upsert_house，自动写账本事件与 outbox；后台 operator 固定 "admin"。
 - 历史账本事件为审计记录，不提供改写；如需追加管理员备注，后续在存储层补 append_ledger。
-- 媒体对象存 COS；候选调阅链接按自定义域名拼接，若桶为私有读，需另取临时凭证（本轮返回 objectKey）。
+- 媒体对象存服务器本地磁盘（media_v2）；后台返回媒体清单与 objectKey，调阅走公开媒体接口。
 """
 
 from __future__ import annotations
@@ -40,11 +40,25 @@ def _matches(house: dict[str, Any], q: str, tower: str, status: str) -> bool:
 
 
 class HouseConsole:
-    def __init__(self, store: Any) -> None:
+    def __init__(self, store: Any, hub: Any = None) -> None:
         self.store = store
+        self.hub = hub
+
+    def deliver_pending(self) -> None:
+        """后台写完房源后立即尝试投递 outbox；真正的发送只走 house_api 一条路。"""
+        if self.hub is None:
+            return
+        try:
+            import house_api as ha
+        except ImportError:
+            import sys
+            from pathlib import Path as _P
+            sys.path.insert(0, str(_P(__file__).resolve().parent.parent / "house-keeper"))
+            import house_api as ha
+        ha.deliver_pending(self.store, self.hub)
 
     def list(self, q: str = "", tower: str = "", status: str = "",
-             include_deleted: bool = True) -> dict[str, Any]:
+             include_deleted: bool = False) -> dict[str, Any]:
         doc = self.store.list_houses(include_deleted=include_deleted)
         houses = [h for h in doc.get("houses", []) if _matches(h, q, tower, status)]
         stats = self.store.stats()
@@ -57,7 +71,8 @@ class HouseConsole:
         house["ledger"] = self.store.ledger(room_key)
         return house
 
-    def update(self, room_key: str, fields: dict[str, Any]) -> dict[str, Any]:
+    def update(self, room_key: str, fields: dict[str, Any], notify_scope: str = "all",
+               notify_user_token: str = "") -> dict[str, Any]:
         existing = self.store.get_house(room_key, with_media=False)
         if existing is None:
             return {"ok": False, "error": "not_found"}
@@ -74,14 +89,44 @@ class HouseConsole:
             "media": existing.get("media", []),
         }
         try:
-            doc = self.store.upsert_house(payload, operator="admin", origin_device_id="admin-web")
+            doc = self.store.upsert_house(
+                payload, operator="admin", origin_device_id="admin-web",
+                notify_scope=notify_scope, notify_user_token=notify_user_token)
+            changed = [k for k in ("roomNo", "tower", "landlord", "layout",
+                                  "price", "password", "remark", "status")
+                       if str(fields.get(k, existing.get(k))) != str(existing.get(k))]
+            self.store.append_op(
+                "房源", "后台修改房源", "成功",
+                "修改字段：" + ("、".join(changed) if changed else "无字段变化"),
+                room_key, "admin")
             return {"ok": True, "house": doc}
         except Exception as e:
             return {"ok": False, "error": type(e).__name__, "detail": str(e)[:200]}
 
-    def set_deleted(self, room_key: str, deleted: bool) -> dict[str, Any]:
+    def delete(self, room_key: str, notify_scope: str = "all",
+               notify_user_token: str = "") -> dict[str, Any]:
+        """后台删除 = 永久删除：房源/账本/媒体引用一起清掉，不进回收站。"""
         try:
-            doc = self.store.set_deleted(room_key, deleted, "admin", "admin-web")
+            doc = self.store.hard_delete(
+                room_key, "admin", "admin-web",
+                notify_scope=notify_scope, notify_user_token=notify_user_token)
+            self.store.append_op(
+                "房源", "后台彻底删除房源", "成功",
+                "后台永久删除房源、账本与媒体", room_key, "admin")
+            return {"ok": True, **doc}
+        except Exception as e:
+            return {"ok": False, "error": type(e).__name__, "detail": str(e)[:200]}
+
+    def set_deleted(self, room_key: str, deleted: bool, notify_scope: str = "all",
+                    notify_user_token: str = "") -> dict[str, Any]:
+        try:
+            doc = self.store.set_deleted(
+                room_key, deleted, "admin", "admin-web",
+                notify_scope=notify_scope, notify_user_token=notify_user_token)
+            self.store.append_op(
+                "房源", "后台恢复房源" if not deleted else "后台删除房源", "成功",
+                "后台" + ("恢复" if not deleted else "移入回收站"),
+                room_key, "admin")
             return {"ok": True, **doc}
         except Exception as e:
             return {"ok": False, "error": type(e).__name__, "detail": str(e)[:200]}
@@ -89,15 +134,38 @@ class HouseConsole:
     def ledger(self, room_key: str) -> list[dict[str, Any]]:
         return self.store.ledger(room_key)
 
-    # ---- 导出 ----
+    def media_bytes(self, room_key: str, file_name: str):
+        """后台详情/编辑弹窗读真实媒体二进制（Cookie 会话鉴权，不暴露公开目录）。"""
+        rel = self.store.media.rel_house(room_key, file_name)
+        data = self.store.media.read_house_media(room_key, file_name)
+        if data is None:
+            return None, None
+        return data, self.store.media.guess_content_type(rel_path=rel)
+
+    def config_get(self) -> dict[str, Any]:
+        return {"ok": True, "config": self.store.config_get("app")}
+
+    def config_set(self, value: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {"ok": False, "error": "bad_json"}
+        self.store.config_set("app", value)
+        return {"ok": True, "config": self.store.config_get("app")}
+
+    def share_stats(self, days: int = 30) -> dict[str, Any]:
+        return {"ok": True, **self.store.share_stats(days)}
+
+    def share_records(self, limit: int = 200) -> dict[str, Any]:
+        return {"ok": True, "records": self.store.share_records_list(limit)}
+
+
     def export_json(self) -> tuple[bytes, str]:
-        doc = self.store.list_houses(include_deleted=True)
+        doc = self.store.list_houses(include_deleted=False)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         return (json.dumps(doc, ensure_ascii=False, indent=2).encode("utf-8"),
                 f"houses-{stamp}.json")
 
     def export_csv(self) -> tuple[bytes, str]:
-        doc = self.store.list_houses(include_deleted=True)
+        doc = self.store.list_houses(include_deleted=False)
         cols = ["roomKey", "roomNo", "tower", "landlord", "layout", "price",
                 "status", "remark", "password", "revision", "isDeleted",
                 "createdAt", "updatedAt", "updatedBy", "mediaCount"]

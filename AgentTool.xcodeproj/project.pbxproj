@@ -26,8 +26,6 @@
 		A10000010000000000000015 /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000015 /* Theme.swift */; };
 		A10000010000000000000012 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000012 /* Assets.xcassets */; };
 		LSB0000000000000000000001 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = LSR0000000000000000000001 /* LaunchScreen.storyboard */; };
-		A10000010000000000000116 /* CloudDeployPackage.zip in Resources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000116 /* CloudDeployPackage.zip */; };
-		A20000010000000000000003 /* MigrationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000010000000000000003 /* MigrationView.swift */; };
 		C20000010000000000000001 /* PlanEditors.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000002 /* PlanEditors.swift */; };
 		A10000010000000000000013 /* Preview Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000013 /* Preview Assets.xcassets */; };
 		WA /* WidgetDataSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = WB /* WidgetDataSync.swift */; };
@@ -35,13 +33,13 @@
 		W3 /* AgentToolWidget.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = W4 /* AgentToolWidget.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		A10000010000000000000099 /* TrashView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000099 /* TrashView.swift */; };
 		A10000010000000000000100 /* House.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000100 /* House.swift */; };
-		A10000010000000000000101 /* CosUploader.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000101 /* CosUploader.swift */; };
 		A10000010000000000000102 /* MediaStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000102 /* MediaStore.swift */; };
 		A10000010000000000000199 /* RemoteConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000199 /* RemoteConfig.swift */; };
 		A10000010000000000000201 /* RemoteConfigAdminView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000201 /* RemoteConfigAdminView.swift */; };
 		A10000010000000000000103 /* HouseComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000103 /* HouseComponents.swift */; };
 		A10000010000000000000104 /* HouseDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000104 /* HouseDetailView.swift */; };
 		A10000010000000000000105 /* HouseEditView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000105 /* HouseEditView.swift */; };
+		A10000010000000000000702 /* HouseOrphanMediaView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000702 /* HouseOrphanMediaView.swift */; };
 		A10000010000000000000106 /* HouseListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000106 /* HouseListView.swift */; };
 		A10000010000000000000118 /* HouseBatchImportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000118 /* HouseBatchImportView.swift */; };
 		A10000010000000000000107 /* HouseSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000107 /* HouseSettingsView.swift */; };
@@ -59,14 +57,13 @@
 		A10000010000000000000501 /* HouseRemoteClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000501 /* HouseRemoteClient.swift */; };
 		A10000010000000000000502 /* HouseSyncEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000502 /* HouseSyncEngine.swift */; };
 		A10000010000000000000503 /* HouseServerMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000503 /* HouseServerMode.swift */; };
-		A10000010000000000000601 /* HouseCosCredentialStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000601 /* HouseCosCredentialStore.swift */; };
 		A10000010000000000000602 /* HousePendingUploader.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000602 /* HousePendingUploader.swift */; };
+		A10000010000000000000708 /* HouseRepository.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000708 /* HouseRepository.swift */; };
 		A10000010000000000000305 /* HouseLedger.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000305 /* HouseLedger.swift */; };
 		A10000010000000000000306 /* HouseLedgerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000306 /* HouseLedgerView.swift */; };
 		A10000010000000000000117 /* NetworkMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000117 /* NetworkMonitor.swift */; };
 		A10000010000000000000140 /* MediaPendingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000140 /* MediaPendingView.swift */; };
 		A10000010000000000000141 /* SyncTaskCenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000141 /* SyncTaskCenter.swift */; };
-		A10000010000000000000401 /* HouseUploadRollbacker.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000401 /* HouseUploadRollbacker.swift */; };
 		A10000010000000000000150 /* GlobalAlertCenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000150 /* GlobalAlertCenter.swift */; };
 		A10000010000000000000202 /* MeterModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000202 /* MeterModels.swift */; };
 		A10000010000000000000203 /* MeterStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000203 /* MeterStore.swift */; };
@@ -102,7 +99,6 @@
 		SE24 /* ShareLocalInbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = SF12 /* ShareLocalInbox.swift */; };
 		SE20 /* AppIcon60x60@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = SF09 /* AppIcon60x60@2x.png */; };
 		SE21 /* AppIcon76x76@2x~ipad.png in Resources */ = {isa = PBXBuildFile; fileRef = SF10 /* AppIcon76x76@2x~ipad.png */; };
-		SE01 /* CosUploader.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000101 /* CosUploader.swift */; };
 		SE02 /* MediaStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000102 /* MediaStore.swift */; };
 		SE03 /* House.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000100 /* House.swift */; };
 		SE04 /* HouseLedger.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000305 /* HouseLedger.swift */; };
@@ -117,7 +113,18 @@
 		SE13 /* ShareViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = SF03 /* ShareViewController.swift */; };
 		SE14 /* SharePanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = SF04 /* SharePanelView.swift */; };
 		SE15 /* ShareUploadCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = SF05 /* ShareUploadCoordinator.swift */; };
+		SE25 /* ExtensionHouseClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = SF26 /* ExtensionHouseClient.swift */; };
 		SE16 /* AgentToolShare.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = SF06 /* AgentToolShare.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		A10000010000000000000700 /* DataPathDiagnosticsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000700 /* DataPathDiagnosticsView.swift */; };
+		A10000010000000000000701 /* HouseSyncBaseStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000701 /* HouseSyncBaseStore.swift */; };
+		SE26 /* HouseSyncBaseStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000701 /* HouseSyncBaseStore.swift */; };
+		A10000010000000000000703 /* MediaOptimizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000703 /* MediaOptimizer.swift */; };
+		A10000010000000000000704 /* HouseSharedSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000704 /* HouseSharedSupport.swift */; };
+		A10000010000000000000705 /* ShareProfileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000705 /* ShareProfileStore.swift */; };
+		A10000010000000000000706 /* WatermarkSettingsViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000706 /* WatermarkSettingsViews.swift */; };
+		A10000010000000000000707 /* LocalHouseLedger.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000707 /* LocalHouseLedger.swift */; };
+		SE27 /* MediaOptimizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000703 /* MediaOptimizer.swift */; };
+		SE28 /* HouseSharedSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000704 /* HouseSharedSupport.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -139,10 +146,8 @@
 	B10000010000000000000119 /* RentStatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RentStatView.swift; sourceTree = "<group>"; };
 		B10000010000000000000015 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
 		B10000010000000000000012 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-		B10000010000000000000116 /* CloudDeployPackage.zip */ = {isa = PBXFileReference; lastKnownFileType = archive.zip; path = CloudDeployPackage.zip; sourceTree = "<group>"; };
 		B10000010000000000000013 /* Preview Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = "Preview Assets.xcassets"; sourceTree = "<group>"; };
 		B10000010000000000000014 /* AgentTool.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AgentTool.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		B20000010000000000000003 /* MigrationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MigrationView.swift; sourceTree = "<group>"; };
 		C20000010000000000000002 /* PlanEditors.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlanEditors.swift; sourceTree = "<group>"; };
 		W2 /* AgentToolWidget.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentToolWidget.swift; sourceTree = "<group>"; };
 		WB /* WidgetDataSync.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WidgetDataSync.swift; sourceTree = "<group>"; };
@@ -150,13 +155,13 @@
 		W4 /* AgentToolWidget.appex */ = {isa = PBXFileReference; explicitFileType = wrapper.app-extension; path = AgentToolWidget.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		B10000010000000000000099 /* TrashView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrashView.swift; sourceTree = "<group>"; };
 		B10000010000000000000100 /* House.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = House.swift; sourceTree = "<group>"; };
-		B10000010000000000000101 /* CosUploader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CosUploader.swift; sourceTree = "<group>"; };
 		B10000010000000000000102 /* MediaStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaStore.swift; sourceTree = "<group>"; };
 		B10000010000000000000199 /* RemoteConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteConfig.swift; sourceTree = "<group>"; };
 		B10000010000000000000201 /* RemoteConfigAdminView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteConfigAdminView.swift; sourceTree = "<group>"; };
 		B10000010000000000000103 /* HouseComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseComponents.swift; sourceTree = "<group>"; };
 		B10000010000000000000104 /* HouseDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseDetailView.swift; sourceTree = "<group>"; };
 		B10000010000000000000105 /* HouseEditView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseEditView.swift; sourceTree = "<group>"; };
+		B10000010000000000000702 /* HouseOrphanMediaView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseOrphanMediaView.swift; sourceTree = "<group>"; };
 		B10000010000000000000106 /* HouseListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseListView.swift; sourceTree = "<group>"; };
 		B10000010000000000000118 /* HouseBatchImportView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseBatchImportView.swift; sourceTree = "<group>"; };
 		B10000010000000000000107 /* HouseSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseSettingsView.swift; sourceTree = "<group>"; };
@@ -174,14 +179,13 @@
 		B10000010000000000000501 /* HouseRemoteClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseRemoteClient.swift; sourceTree = "<group>"; };
 		B10000010000000000000502 /* HouseSyncEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseSyncEngine.swift; sourceTree = "<group>"; };
 		B10000010000000000000503 /* HouseServerMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseServerMode.swift; sourceTree = "<group>"; };
-		B10000010000000000000601 /* HouseCosCredentialStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseCosCredentialStore.swift; sourceTree = "<group>"; };
 		B10000010000000000000602 /* HousePendingUploader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HousePendingUploader.swift; sourceTree = "<group>"; };
+		B10000010000000000000708 /* HouseRepository.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseRepository.swift; sourceTree = "<group>"; };
 		B10000010000000000000305 /* HouseLedger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseLedger.swift; sourceTree = "<group>"; };
 		B10000010000000000000306 /* HouseLedgerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseLedgerView.swift; sourceTree = "<group>"; };
 		B10000010000000000000117 /* NetworkMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkMonitor.swift; sourceTree = "<group>"; };
 		B10000010000000000000140 /* MediaPendingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaPendingView.swift; sourceTree = "<group>"; };
 		B10000010000000000000141 /* SyncTaskCenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncTaskCenter.swift; sourceTree = "<group>"; };
-		B10000010000000000000401 /* HouseUploadRollbacker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseUploadRollbacker.swift; sourceTree = "<group>"; };
 		B10000010000000000000150 /* GlobalAlertCenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlobalAlertCenter.swift; sourceTree = "<group>"; };
 		B10000010000000000000202 /* MeterModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeterModels.swift; sourceTree = "<group>"; };
 		B10000010000000000000203 /* MeterStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeterStore.swift; sourceTree = "<group>"; };
@@ -217,11 +221,19 @@
 		SF03 /* ShareViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareViewController.swift; sourceTree = "<group>"; };
 		SF04 /* SharePanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharePanelView.swift; sourceTree = "<group>"; };
 		SF05 /* ShareUploadCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareUploadCoordinator.swift; sourceTree = "<group>"; };
+		SF26 /* ExtensionHouseClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExtensionHouseClient.swift; sourceTree = "<group>"; };
 		SF06 /* AgentToolShare.appex */ = {isa = PBXFileReference; explicitFileType = wrapper.app-extension; path = AgentToolShare.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		SF07 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		SF08 /* AgentToolShare.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = AgentToolShare.entitlements; sourceTree = "<group>"; };
 		SF09 /* AppIcon60x60@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "AppIcon60x60@2x.png"; sourceTree = "<group>"; };
 		SF10 /* AppIcon76x76@2x~ipad.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "AppIcon76x76@2x~ipad.png"; sourceTree = "<group>"; };
+		B10000010000000000000700 /* DataPathDiagnosticsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DataPathDiagnosticsView.swift; sourceTree = "<group>"; };
+		B10000010000000000000701 /* HouseSyncBaseStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseSyncBaseStore.swift; sourceTree = "<group>"; };
+		B10000010000000000000703 /* MediaOptimizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaOptimizer.swift; sourceTree = "<group>"; };
+		B10000010000000000000704 /* HouseSharedSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HouseSharedSupport.swift; sourceTree = "<group>"; };
+		B10000010000000000000705 /* ShareProfileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareProfileStore.swift; sourceTree = "<group>"; };
+		B10000010000000000000706 /* WatermarkSettingsViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatermarkSettingsViews.swift; sourceTree = "<group>"; };
+		B10000010000000000000707 /* LocalHouseLedger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalHouseLedger.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -297,11 +309,9 @@
 				WB /* WidgetDataSync.swift */,
 				D10000010000000000000004 /* Models */,
 				D10000010000000000000005 /* ViewModels */,
-				D20000010000000000000001 /* Sync */,
 				D10000010000000000000006 /* Views */,
 				B10000010000000000000012 /* Assets.xcassets */,
 				LSR0000000000000000000001 /* LaunchScreen.storyboard */,
-				B10000010000000000000116 /* CloudDeployPackage.zip */,
 				B10000010000000000000115 /* Info.plist */,
 				D10000010000000000000007 /* Preview Content */,
 				D10000010000000000000008 /* HouseKeeper */,
@@ -344,14 +354,6 @@
 			path = ViewModels;
 			sourceTree = "<group>";
 		};
-		D20000010000000000000001 /* Sync */ = {
-			isa = PBXGroup;
-			children = (
-				B20000010000000000000003 /* MigrationView.swift */,
-			);
-			path = Sync;
-			sourceTree = "<group>";
-		};
 		D10000010000000000000006 /* Views */ = {
 			isa = PBXGroup;
 			children = (
@@ -362,6 +364,7 @@
 				B10000010000000000000009 /* PayoutView.swift */,
 				B10000010000000000000010 /* ProfitView.swift */,
 				B10000010000000000000095 /* SettingsView.swift */,
+				B10000010000000000000700 /* DataPathDiagnosticsView.swift */,
 				B10000010000000000000140 /* MediaPendingView.swift */,
 				B10000010000000000000113 /* BackupCenterViews.swift */,
 				B10000010000000000000011 /* UtilityView.swift */,
@@ -382,7 +385,7 @@
 			sourceTree = "<group>";
 		};
 		WG /* AgentToolWidget */ = {isa = PBXGroup; children = (W2 /* AgentToolWidget.swift */, W5 /* Info.plist */,); path = AgentToolWidget; sourceTree = "<group>"; };
-		SG /* AgentToolShare */ = {isa = PBXGroup; children = (SF03 /* ShareViewController.swift */, SF04 /* SharePanelView.swift */, SF05 /* ShareUploadCoordinator.swift */, SF07 /* Info.plist */, SF08 /* AgentToolShare.entitlements */, SF09 /* AppIcon60x60@2x.png */, SF10 /* AppIcon76x76@2x~ipad.png */,); path = AgentToolShare; sourceTree = "<group>"; };
+		SG /* AgentToolShare */ = {isa = PBXGroup; children = (SF03 /* ShareViewController.swift */, SF04 /* SharePanelView.swift */, SF05 /* ShareUploadCoordinator.swift */, SF26 /* ExtensionHouseClient.swift */, SF07 /* Info.plist */, SF08 /* AgentToolShare.entitlements */, SF09 /* AppIcon60x60@2x.png */, SF10 /* AppIcon76x76@2x~ipad.png */,); path = AgentToolShare; sourceTree = "<group>"; };
 		D10000010000000000000008 /* HouseKeeper */ = {
 			isa = PBXGroup;
 			children = (
@@ -407,7 +410,6 @@
 		D10000010000000000000010 /* Services */ = {
 			isa = PBXGroup;
 			children = (
-				B10000010000000000000101 /* CosUploader.swift */,
 				B10000010000000000000102 /* MediaStore.swift */,
 				B10000010000000000000199 /* RemoteConfig.swift */,
 				B10000010000000000000201 /* RemoteConfigAdminView.swift */,
@@ -420,15 +422,19 @@
 				B10000010000000000000117 /* NetworkMonitor.swift */,
 				B10000010000000000000141 /* SyncTaskCenter.swift */,
 				B10000010000000000000150 /* GlobalAlertCenter.swift */,
-				B10000010000000000000401 /* HouseUploadRollbacker.swift */,
 				SF01 /* SharedBridge.swift */,
 				SF02 /* ShareModels.swift */,
 				SF12 /* ShareLocalInbox.swift */,
 				B10000010000000000000501 /* HouseRemoteClient.swift */,
 				B10000010000000000000502 /* HouseSyncEngine.swift */,
 				B10000010000000000000503 /* HouseServerMode.swift */,
-				B10000010000000000000601 /* HouseCosCredentialStore.swift */,
 				B10000010000000000000602 /* HousePendingUploader.swift */,
+				B10000010000000000000708 /* HouseRepository.swift */,
+				B10000010000000000000701 /* HouseSyncBaseStore.swift */,
+				B10000010000000000000703 /* MediaOptimizer.swift */,
+				B10000010000000000000704 /* HouseSharedSupport.swift */,
+				B10000010000000000000705 /* ShareProfileStore.swift */,
+				B10000010000000000000707 /* LocalHouseLedger.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -440,6 +446,8 @@
 				B10000010000000000000104 /* HouseDetailView.swift */,
 				B10000010000000000000306 /* HouseLedgerView.swift */,
 				B10000010000000000000105 /* HouseEditView.swift */,
+				B10000010000000000000702 /* HouseOrphanMediaView.swift */,
+				B10000010000000000000706 /* WatermarkSettingsViews.swift */,
 				B10000010000000000000106 /* HouseListView.swift */,
 				B10000010000000000000118 /* HouseBatchImportView.swift */,
 				B10000010000000000000107 /* HouseSettingsView.swift */,
@@ -498,7 +506,7 @@
 
 /* Begin PBXSourcesBuildPhase section */
 		WP = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (W1 /* AgentToolWidget.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
-		SS = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (SE01 /* CosUploader.swift in Sources */, SE02 /* MediaStore.swift in Sources */, SE03 /* House.swift in Sources */, SE04 /* HouseLedger.swift in Sources */, SE05 /* HouseMediaUploadQueue.swift in Sources */, SE06 /* MediaActivityGate.swift in Sources */, SE07 /* NetworkMonitor.swift in Sources */, SE08 /* RemoteConfig.swift in Sources */, SE09 /* BackupLogStore.swift in Sources */, SE10 /* HouseActionNotifier.swift in Sources */, SE11 /* SharedBridge.swift in Sources */, SE12 /* ShareModels.swift in Sources */, SE13 /* ShareViewController.swift in Sources */, SE14 /* SharePanelView.swift in Sources */, SE15 /* ShareUploadCoordinator.swift in Sources */, SE19 /* CloudBackupService.swift in Sources */, SE22 /* HouseClipboardImport.swift in Sources */, SE23 /* ShareLocalInbox.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
+		SS = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (SE27 /* MediaOptimizer.swift in Sources */, SE28 /* HouseSharedSupport.swift in Sources */, SE02 /* MediaStore.swift in Sources */, SE03 /* House.swift in Sources */, SE04 /* HouseLedger.swift in Sources */, SE05 /* HouseMediaUploadQueue.swift in Sources */, SE06 /* MediaActivityGate.swift in Sources */, SE07 /* NetworkMonitor.swift in Sources */, SE08 /* RemoteConfig.swift in Sources */, SE09 /* BackupLogStore.swift in Sources */, SE10 /* HouseActionNotifier.swift in Sources */, SE11 /* SharedBridge.swift in Sources */, SE12 /* ShareModels.swift in Sources */, SE13 /* ShareViewController.swift in Sources */, SE14 /* SharePanelView.swift in Sources */, SE15 /* ShareUploadCoordinator.swift in Sources */, SE25 /* ExtensionHouseClient.swift in Sources */, SE26 /* HouseSyncBaseStore.swift in Sources */, SE19 /* CloudBackupService.swift in Sources */, SE22 /* HouseClipboardImport.swift in Sources */, SE23 /* ShareLocalInbox.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 /* Begin PBXNativeTarget section */
 		E10000010000000000000001 /* AgentTool */ = {
@@ -566,7 +574,6 @@
 				A10000010000000000000013 /* Preview Assets.xcassets in Resources */,
 				A10000010000000000000012 /* Assets.xcassets in Resources */,
 				LSB0000000000000000000001 /* LaunchScreen.storyboard in Resources */,
-				A10000010000000000000116 /* CloudDeployPackage.zip in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -591,22 +598,28 @@
 				A10000010000000000000009 /* PayoutView.swift in Sources */,
 				A10000010000000000000010 /* ProfitView.swift in Sources */,
 				A10000010000000000000095 /* SettingsView.swift in Sources */,
+				A10000010000000000000700 /* DataPathDiagnosticsView.swift in Sources */,
+				A10000010000000000000701 /* HouseSyncBaseStore.swift in Sources */,
+				A10000010000000000000703 /* MediaOptimizer.swift in Sources */,
+				A10000010000000000000704 /* HouseSharedSupport.swift in Sources */,
+				A10000010000000000000705 /* ShareProfileStore.swift in Sources */,
+				A10000010000000000000706 /* WatermarkSettingsViews.swift in Sources */,
+				A10000010000000000000707 /* LocalHouseLedger.swift in Sources */,
 				A10000010000000000000096 /* DataBackupManager.swift in Sources */,
 				A30000010000000000000001 /* LocalNotificationManager.swift in Sources */,
 				A10000010000000000000011 /* UtilityView.swift in Sources */,
 				A10000010000000000000099 /* TrashView.swift in Sources */,
 				A10000010000000000000015 /* Theme.swift in Sources */,
 				A10000010000000000000119 /* RentStatView.swift in Sources */,
-				A20000010000000000000003 /* MigrationView.swift in Sources */,
 				C20000010000000000000001 /* PlanEditors.swift in Sources */,
 				A10000010000000000000100 /* House.swift in Sources */,
-				A10000010000000000000101 /* CosUploader.swift in Sources */,
 				A10000010000000000000102 /* MediaStore.swift in Sources */,
 				A10000010000000000000199 /* RemoteConfig.swift in Sources */,
 				A10000010000000000000201 /* RemoteConfigAdminView.swift in Sources */,
 				A10000010000000000000103 /* HouseComponents.swift in Sources */,
 				A10000010000000000000104 /* HouseDetailView.swift in Sources */,
 				A10000010000000000000105 /* HouseEditView.swift in Sources */,
+				A10000010000000000000702 /* HouseOrphanMediaView.swift in Sources */,
 				A10000010000000000000106 /* HouseListView.swift in Sources */,
 				A10000010000000000000118 /* HouseBatchImportView.swift in Sources */,
 				A10000010000000000000107 /* HouseSettingsView.swift in Sources */,
@@ -626,12 +639,11 @@
 				A10000010000000000000117 /* NetworkMonitor.swift in Sources */,
 				A10000010000000000000141 /* SyncTaskCenter.swift in Sources */,
 				A10000010000000000000150 /* GlobalAlertCenter.swift in Sources */,
-				A10000010000000000000401 /* HouseUploadRollbacker.swift in Sources */,
 				A10000010000000000000501 /* HouseRemoteClient.swift in Sources */,
 				A10000010000000000000502 /* HouseSyncEngine.swift in Sources */,
 				A10000010000000000000503 /* HouseServerMode.swift in Sources */,
-				A10000010000000000000601 /* HouseCosCredentialStore.swift in Sources */,
 				A10000010000000000000602 /* HousePendingUploader.swift in Sources */,
+				A10000010000000000000708 /* HouseRepository.swift in Sources */,
 				A10000010000000000000140 /* MediaPendingView.swift in Sources */,
 				A10000010000000000000202 /* MeterModels.swift in Sources */,
 				A10000010000000000000203 /* MeterStore.swift in Sources */,
@@ -722,7 +734,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = AgentTool/AgentTool.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 214;
+				CURRENT_PROJECT_VERSION = 36;
 				DEVELOPMENT_ASSET_PATHS = "\"AgentTool/Preview Content\"";
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -742,8 +754,8 @@ INFOPLIST_KEY_NSLocalNetworkUsageDescription = "仅在你点击同步时连接�
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 2.72;
-				PRODUCT_BUNDLE_IDENTIFIER = com.gj.tg;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.gj.tg2;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
@@ -757,7 +769,7 @@ INFOPLIST_KEY_NSLocalNetworkUsageDescription = "仅在你点击同步时连接�
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = AgentTool/AgentTool.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 214;
+				CURRENT_PROJECT_VERSION = 36;
 				DEVELOPMENT_ASSET_PATHS = "\"AgentTool/Preview Content\"";
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -777,8 +789,8 @@ INFOPLIST_KEY_NSLocalNetworkUsageDescription = "仅在你点击同步时连接�
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 2.72;
-				PRODUCT_BUNDLE_IDENTIFIER = com.gj.tg;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.gj.tg2;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
@@ -786,10 +798,10 @@ INFOPLIST_KEY_NSLocalNetworkUsageDescription = "仅在你点击同步时连接�
 			};
 			name = Release;
 		};
-		WD = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = AgentToolWidget/AgentToolWidget.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 214; INFOPLIST_FILE = AgentToolWidget/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; MARKETING_VERSION = 2.72; PRODUCT_BUNDLE_IDENTIFIER = com.gj.tg.widget; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SKIP_INSTALL = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
-		WR = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = AgentToolWidget/AgentToolWidget.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 214; INFOPLIST_FILE = AgentToolWidget/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; MARKETING_VERSION = 2.72; PRODUCT_BUNDLE_IDENTIFIER = com.gj.tg.widget; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SKIP_INSTALL = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
-		SD = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = AgentToolShare/AgentToolShare.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 214; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = AgentToolShare/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks"); MARKETING_VERSION = 2.72; PRODUCT_BUNDLE_IDENTIFIER = com.gj.tg.share; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SKIP_INSTALL = YES; APPLICATION_EXTENSION_API_ONLY = YES; SWIFT_ACTIVE_COMPILATION_CONDITIONS = "APP_EXTENSION $(inherited)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
-		SR = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = AgentToolShare/AgentToolShare.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 214; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = AgentToolShare/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks"); MARKETING_VERSION = 2.72; PRODUCT_BUNDLE_IDENTIFIER = com.gj.tg.share; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SKIP_INSTALL = YES; APPLICATION_EXTENSION_API_ONLY = YES; SWIFT_ACTIVE_COMPILATION_CONDITIONS = "APP_EXTENSION $(inherited)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
+		WD = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = AgentToolWidget/AgentToolWidget.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 36; INFOPLIST_FILE = AgentToolWidget/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; MARKETING_VERSION = 1.0; PRODUCT_BUNDLE_IDENTIFIER = com.gj.tg2.widget; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SKIP_INSTALL = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
+		WR = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = AgentToolWidget/AgentToolWidget.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 36; INFOPLIST_FILE = AgentToolWidget/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; MARKETING_VERSION = 1.0; PRODUCT_BUNDLE_IDENTIFIER = com.gj.tg2.widget; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SKIP_INSTALL = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
+		SD = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = AgentToolShare/AgentToolShare.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 36; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = AgentToolShare/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks"); MARKETING_VERSION = 1.0; PRODUCT_BUNDLE_IDENTIFIER = com.gj.tg2.share; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SKIP_INSTALL = YES; APPLICATION_EXTENSION_API_ONLY = YES; SWIFT_ACTIVE_COMPILATION_CONDITIONS = "APP_EXTENSION $(inherited)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
+		SR = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_ENTITLEMENTS = AgentToolShare/AgentToolShare.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 36; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = AgentToolShare/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks"); MARKETING_VERSION = 1.0; PRODUCT_BUNDLE_IDENTIFIER = com.gj.tg2.share; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SKIP_INSTALL = YES; APPLICATION_EXTENSION_API_ONLY = YES; SWIFT_ACTIVE_COMPILATION_CONDITIONS = "APP_EXTENSION $(inherited)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */

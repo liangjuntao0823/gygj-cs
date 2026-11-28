@@ -79,7 +79,6 @@ final class MeterWebViewProvider: NSObject, MeterQuerying, WKNavigationDelegate 
                 failed.append(item.uid)
             }
         }
-        store.sendLowAlertIfNeeded()
         if ok == 0 { throw MeterQueryError.msg("网页抓取未取到数据，请检查链接或稍后重试") }
         return MeterRefreshOutcome(okCount: ok, failedUIDs: failed)
     }

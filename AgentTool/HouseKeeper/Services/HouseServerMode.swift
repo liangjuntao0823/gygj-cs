@@ -1,35 +1,22 @@
 //
 //  HouseServerMode.swift
-//  公寓管家 · 房源服务器模式总开关（灰度路由）
+//  公寓管家 · 房源服务器模式
 //
-//  服务器模式开启且已接入租户令牌时，房源读写走 8082 house-keeper 权威接口；
-//  否则回退旧 COS 直连链路兜底，保证任何情况下功能不丢。
-//  迁移验证稳定后（P4），旧链路与本开关一并移除。
+//  房源读写统一走 8082 house-keeper 权威接口；未绑定账号令牌时只写本机并挂待补传，
+//  绑定后在任务中心手动补传。旧对象存储直连链路已下线，不再提供本地/旧桶回退开关。
 //
 
 import Foundation
 
-// 仅读写 UserDefaults 与令牌状态，无 UI 状态隔离需求；nonisolated 以便账本存储等非 MainActor 路径同步读取
+// 仅读令牌状态，无 UI 状态隔离需求；nonisolated 以便账本存储等非 MainActor 路径同步读取
 enum HouseServerMode {
-    private static let modeKey = "house.serverMode.v1"
-
-    /// 服务器模式开关（默认开启；可在设置页关闭以回退旧链路）
-    static var enabled: Bool {
-        get {
-            if let v = UserDefaults.standard.object(forKey: modeKey) as? Bool { return v }
-            return true
-        }
-        set { UserDefaults.standard.set(newValue, forKey: modeKey) }
-    }
-
-    /// 是否已具备走服务器的条件：开关开 + 已接入租户令牌
+    /// 是否已具备走服务器的条件：已接入账号令牌
     static var ready: Bool {
-        enabled && MeterCloudSync.hasPersistedToken()
+        MeterCloudSync.hasPersistedToken()
     }
 
     /// 未接入时给用户的引导文案
     static var notReadyReason: String {
-        if !enabled { return "服务器模式已关闭" }
-        return "尚未接入服务器，请到「电表监控设置」完成接入"
+        "尚未绑定账号令牌"
     }
 }
