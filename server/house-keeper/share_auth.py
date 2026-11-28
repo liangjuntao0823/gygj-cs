@@ -67,3 +67,18 @@ class ShareSigner:
 
     def expires(self, days: int) -> int:
         return int(time.time()) + max(0, int(days)) * 86400
+    def room_alias(self, room_key: str) -> str:
+        """脱敏分享里的房号别名：不可逆 HMAC，页面源码不出现真实房号。"""
+        raw = hmac.new(self.secret, ("room:" + str(room_key or "")).encode("utf-8"),
+                       hashlib.sha256).hexdigest()[:20]
+        return "~" + raw
+
+    def match_room_alias(self, alias: str, candidates: list[str]) -> str:
+        """把别名还原成候选房号；候选只来自当前分享记录允许的房源。"""
+        a = str(alias or "")
+        if not a.startswith("~"):
+            return ""
+        for room in candidates or []:
+            if hmac.compare_digest(a, self.room_alias(room)):
+                return str(room)
+        return ""

@@ -102,6 +102,10 @@ class NativeStoreTests(unittest.TestCase):
         self.assertNotIn("1100", html)
         self.assertNotIn("1234", html)
         self.assertNotIn("全屋定制", html)
+        # 脱敏页源码/localStorage/媒体 URL 都不能出现房号
+        self.assertNotIn("1-2059", html)
+        self.assertIn("/api/public/media/share/~", html)
+        self.assertNotIn("__GALLERY__", html)
 
     def test_h5_full_shows_details(self):
         html = self._render_single("full")
@@ -113,7 +117,9 @@ class NativeStoreTests(unittest.TestCase):
         html = self._render_single("masked")
         self.assertIn('property="og:title"', html)
         self.assertIn('property="og:image"', html)
-        self.assertIn("/api/public/media/share/1-2059/cover.jpg?t=tok", html)
+        self.assertIn("/api/public/media/share/~", html)
+        full = self._render_single("full")
+        self.assertIn("/api/public/media/share/1-2059/cover.jpg?t=tok", full)
 
     def test_h5_collection_and_list(self):
         import h5_page
@@ -129,6 +135,15 @@ class NativeStoreTests(unittest.TestCase):
         self.assertIn("米兰公馆 · 在租房源", rooms)
         self.assertIn("单间", rooms)
         self.assertNotIn("康", rooms)
+
+    def test_share_asset_alias_hides_room(self):
+        asset = self.store.register_share_asset(7, "houses/1-2059/1-2059-JPG-abc.jpg")
+        self.assertTrue(asset)
+        self.assertNotIn("1-2059", asset)
+        self.assertEqual(
+            self.store.resolve_share_asset(7, asset),
+            "houses/1-2059/1-2059-JPG-abc.jpg")
+        self.assertEqual(self.store.resolve_share_asset(8, asset), "")
 
     def test_share_token_roundtrip(self):
         from share_auth import ShareSigner

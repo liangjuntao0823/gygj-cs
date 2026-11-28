@@ -63,12 +63,14 @@ def card_block(name: str, phone: str, qr_src: str) -> str:
     </section>'''
 
 
-def common_script(phone: str, track_script: str = "") -> str:
+def common_script(phone: str, track_script: str = "",
+                  gallery: list[str] | None = None) -> str:
+    gallery_js = json.dumps([str(u) for u in (gallery or [])], ensure_ascii=False)
     return f'''<div class="mask" id="mask" style="display:none" onclick="hideModal()"><img id="modalImg" src="" alt=""></div>
 <div id="toast"></div>
 <div id="lb"><div id="lbImg"></div><div id="lbPrev" onclick="lbPrev()">‹</div><div id="lbNext" onclick="lbNext()">›</div><div id="lbClose" onclick="lbClose()">✕</div><div id="lbCnt"></div></div>
 <script>
-var GALLERY=__GALLERY__;var gi=0;
+var GALLERY={gallery_js};var gi=0;
 function playVideo(w,src){{var v=w.querySelector('video');if(!v.src){{v.src=src;}}var p=v.play();if(p&&p.catch){{p.catch(function(){{}});}}w.className=w.className+' playing';}}
 function openImg(i){{gi=i;show();}}
 function show(){{var d=document.getElementById('lb');document.getElementById('lbImg').style.backgroundImage="url('"+GALLERY[gi]+"')";document.getElementById('lbCnt').textContent=(gi+1)+' / '+GALLERY.length;d.style.display='block';}}
@@ -174,7 +176,7 @@ def masked_single(title: str, desc: str, name: str, phone: str,
 {card_block(name, phone, qr)}
 <div class="foot">更多优质房源请与我联系-{esc(phone)}</div>
 </div>
-{common_script(phone, track_script)}
+{common_script(phone, track_script, image_urls)}
 </body>
 </html>'''
     return _head(title, desc, cover, share_url, BASE_CSS) + body
@@ -201,7 +203,7 @@ def full_single(title: str, desc: str, info: dict[str, Any], name: str, phone: s
 {card_block(name, phone, qr)}
 <div class="foot">更多优质房源请与我联系-{esc(phone)}</div>
 </div>
-{common_script(phone, track_script)}
+{common_script(phone, track_script, image_urls)}
 </body>
 </html>'''
     return _head(title, desc, cover, share_url, BASE_CSS) + body

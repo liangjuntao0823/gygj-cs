@@ -144,6 +144,13 @@ CREATE TABLE IF NOT EXISTS share_visits (
   ip_hash TEXT NOT NULL DEFAULT '',
   ua TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS share_assets (
+  asset TEXT PRIMARY KEY,
+  share_id INTEGER NOT NULL DEFAULT 0,
+  rel TEXT NOT NULL DEFAULT '',
+  ts TEXT NOT NULL,
+  UNIQUE(share_id, rel)
+);
 CREATE TABLE IF NOT EXISTS ops (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts TEXT NOT NULL,
@@ -268,6 +275,13 @@ class HouseStore:
             "CREATE INDEX IF NOT EXISTS idx_share_token ON share_records(token)")
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_share_visit_ts ON share_visits(ts)")
+        # b30：脱敏分享的媒体资产别名表；老库启动时补建，不改历史记录。
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS share_assets ("
+            "asset TEXT PRIMARY KEY, share_id INTEGER NOT NULL DEFAULT 0,"
+            "rel TEXT NOT NULL DEFAULT '', ts TEXT NOT NULL, UNIQUE(share_id, rel))")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_share_asset_sid ON share_assets(share_id)")
 
     # ------------------------------------------------------------------
     # 读取
@@ -1177,6 +1191,31 @@ class HouseStore:
                 "UPDATE share_records SET revoked=1 WHERE kind=? AND revoked=0", (kind,))
             self._conn.commit()
             return int(cur.rowcount or 0)
+
+    def register_share_asset(self, share_id: int, rel: str) -> str:
+        """给脱敏页的媒体文件分配不透明资产别名，URL 不出现房号/文件名。"""
+        sid, rel = int(share_id or 0), str(rel or "")
+        if not sid or not rel:
+            return ""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT asset FROM share_assets WHERE share_id=? AND rel=?",
+                (sid, rel)).fetchone()
+            if row:
+                return str(row["asset"])
+            asset = secrets.token_urlsafe(16)
+            self._conn.execute(
+                "INSERT INTO share_assets (asset,share_id,rel,ts) VALUES (?,?,?,?)",
+                (asset, sid, rel, iso(now_local())))
+            self._conn.commit()
+            return asset
+
+    def resolve_share_asset(self, share_id: int, asset: str) -> str:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT rel FROM share_assets WHERE share_id=? AND asset=?",
+                (int(share_id or 0), str(asset or ""))).fetchone()
+            return str(row["rel"]) if row else ""
 
     def share_visit_add(self, share_id: int, room_key: str, mode: str,
                         ref: str, visitor: str, ip_hash: str, ua: str) -> None:

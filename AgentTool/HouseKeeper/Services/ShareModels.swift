@@ -65,7 +65,9 @@ extension ShareHouseInfo {
 }
 
 // MARK: - 分享前资源准备（旧 2.72：400px 封面 / 640px 视频首帧 / 400px 方形二维码）
+// 仅主 App 使用；分享扩展不链接 HouseRemoteClient/HouseServerMode，避免扩展编译找不到主工程类型。
 
+#if !APP_EXTENSION
 enum ShareAssetUploader {
     static func watermarkDict() -> [String: Any] {
         let wm = WatermarkSettingsStore.current
@@ -152,3 +154,4 @@ enum ShareAssetUploader {
         }
     }
 }
+#endif

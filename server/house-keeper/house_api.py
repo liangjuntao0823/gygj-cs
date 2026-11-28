@@ -241,12 +241,16 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
             mode = "full" if rec.get("mode") == "full" else "masked"
             if kind == "list":
                 room_key = str(q.get("roomKey") or "").strip()
-                page = (h5_page.render_single(store, handler, token, room_key, "masked", wm)
-                        if room_key else h5_page.render_list(store, handler, token, "masked", wm))
+                page = (h5_page.render_single(store, handler, token, room_key, "masked", wm,
+                                        int(rec.get("id") or 0))
+                        if room_key else h5_page.render_list(store, handler, token, "masked", wm,
+                                                             int(rec.get("id") or 0)))
             elif kind == "collection":
-                page = h5_page.render_collection(store, handler, token, rec.get("roomKeys") or [], mode, wm)
+                page = h5_page.render_collection(store, handler, token, rec.get("roomKeys") or [], mode, wm,
+                                               int(rec.get("id") or 0))
             else:
-                page = h5_page.render_single(store, handler, token, rec.get("roomKey") or "", mode, wm)
+                page = h5_page.render_single(store, handler, token, rec.get("roomKey") or "", mode, wm,
+                                          int(rec.get("id") or 0))
             body = page.encode("utf-8")
             handler.send_response(200)
             handler.send_header("Content-Type", "text/html; charset=utf-8")
@@ -302,6 +306,11 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
             if rec:
                 q = _q(handler)
                 room = str(q.get("room") or "")[:120]
+                if not room:
+                    # 脱敏页不在 URL 里带房号；单房分享由服务端回填，合集/列表记聚合值。
+                    kind = rec.get("kind") or "single"
+                    room = (str(rec.get("roomKey") or "") if kind == "single"
+                            else ("collection" if kind == "collection" else "rooms"))
                 mode = str(q.get("mode") or rec.get("mode") or "")[:20]
                 store.share_visit_add(
                     share_id=int(rec.get("id") or 0), room_key=room, mode=mode,
@@ -328,10 +337,25 @@ def route_request(handler: Any, method: str, path: str, store: Any, hub: Any) ->
             if not rec:
                 return send(410, {"ok": False, "error": "link_expired"})
             segs = [s for s in rel.replace("\\", "/").split("/") if s]
-            if segs[:1] == ["houses"] and len(segs) >= 3:
-                if not room_allowed(rec, segs[1]):
-                    return send(403, {"ok": False, "error": "forbidden"})
-            elif segs[:1] == ["share"] and len(segs) >= 3:
+            if segs[:1] == ["a"] and len(segs) == 2:
+                # 脱敏分享的不透明媒体别名：只按当前分享记录解析，URL 无房号。
+                rel = store.resolve_share_asset(int(rec.get("id") or 0), segs[1])
+                if not rel:
+                    return send(404, {"ok": False, "error": "not_found"})
+                segs = [s for s in rel.replace("\\", "/").split("/") if s]
+            if segs[:1] in (["houses"], ["share"]) and len(segs) >= 3:
+                raw_room = segs[1]
+                if raw_room.startswith("~"):
+                    # 脱敏页媒体别名：只在当前分享允许的房号里反查，别名本身不可逆。
+                    if (rec.get("kind") or "single") == "list":
+                        candidates = [str(h.get("roomKey") or "") for h in store.public_rooms("masked")]
+                    else:
+                        candidates = [str(rec.get("roomKey") or "")] + [str(k) for k in (rec.get("roomKeys") or [])]
+                    resolved = store.share_signer.match_room_alias(raw_room, candidates)
+                    if not resolved:
+                        return send(403, {"ok": False, "error": "forbidden"})
+                    segs[1] = resolved
+                    rel = "/".join(segs)
                 if not room_allowed(rec, segs[1]):
                     return send(403, {"ok": False, "error": "forbidden"})
             elif segs[:1] == ["profile"]:
