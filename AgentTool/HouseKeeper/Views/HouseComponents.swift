@@ -194,24 +194,35 @@ final class HouseSyncProgress: ObservableObject {
     /// v2.4 修复：此前「保存上传媒体」与「同步云端账本」两个并发 Task 共用单例，
     /// 先完成的 Task 调 clear() 会把仍在进行中的媒体上传进度误清 → 卡片底部进度条「不见了」。
     private var activeTasks = 0
+    /// v1.1：每个任务独立令牌，避免媒体下载完成后迟到的进度回调把已结束的任务重新点亮。
+    private var nextTaskToken = 0
+    private var activeTokens: Set<Int> = []
 
-    /// 任务开始：计数 +1 并写入初始值（线程安全，内部切主线程）
-    func begin(roomKey: String?, direction: Direction, progress: Double = 0, label: String = "") {
-        Task { @MainActor in
-            activeTasks += 1
-            self.roomKey = roomKey
-            self.direction = direction
-            self.progress = max(0, min(1, progress))
-            self.label = label
-            self.bytesPerSecond = 0
-            self.indeterminate = false
-        }
+    /// 任务开始：计数 +1 并写入初始值；返回令牌，结束/推进时带上它可防止迟到回调复活进度条。
+    @discardableResult
+    func begin(roomKey: String?, direction: Direction, progress: Double = 0, label: String = "") -> Int {
+        nextTaskToken += 1
+        let token = nextTaskToken
+        activeTokens.insert(token)
+        activeTasks += 1
+        self.roomKey = roomKey
+        self.direction = direction
+        self.progress = max(0, min(1, progress))
+        self.label = label
+        self.bytesPerSecond = 0
+        self.indeterminate = false
+        return token
     }
 
     /// 推进：写入最新进度。若无活跃任务则视为任务开始（自动计数 1），保证旧调用点语义兼容。
-    func update(roomKey: String?, direction: Direction, progress: Double, label: String = "") {
+    /// 带 token 的调用若任务已结束则直接忽略，避免“下载完 4/4 后进度条还挂着”。
+    func update(roomKey: String?, direction: Direction, progress: Double, label: String = "", token: Int? = nil) {
         Task { @MainActor in
-            if activeTasks == 0 { activeTasks = 1 }
+            if let token {
+                guard self.activeTokens.contains(token) else { return }
+            } else if self.activeTasks == 0 {
+                self.activeTasks = 1
+            }
             self.roomKey = roomKey
             self.direction = direction
             self.progress = max(0, min(1, progress))
@@ -257,14 +268,19 @@ final class HouseSyncProgress: ObservableObject {
     }
 
     /// 任务结束：计数 -1；仅当全部活跃任务都结束时才真正清空（并发的另一任务进度不被误清）
-    func end() {
+    /// v1.1：可带 begin 返回的 token；任务已结束时重复 end 不再重复扣计数。
+    func end(token: Int? = nil) {
         Task { @MainActor in
-            activeTasks = max(0, activeTasks - 1)
-            if activeTasks == 0 {
-                roomKey = nil
-                label = ""
-                bytesPerSecond = 0
-                indeterminate = false
+            if let token {
+                guard self.activeTokens.remove(token) != nil else { return }
+            }
+            self.activeTasks = max(0, self.activeTasks - 1)
+            if self.activeTasks == 0 {
+                self.activeTokens.removeAll()
+                self.roomKey = nil
+                self.label = ""
+                self.bytesPerSecond = 0
+                self.indeterminate = false
             }
         }
     }
@@ -272,10 +288,12 @@ final class HouseSyncProgress: ObservableObject {
     /// 直接清空（兼容旧调用；新代码统一用 begin/end）
     func clear() {
         Task { @MainActor in
-            roomKey = nil
-            label = ""
-            bytesPerSecond = 0
-            indeterminate = false
+            self.activeTasks = 0
+            self.activeTokens.removeAll()
+            self.roomKey = nil
+            self.label = ""
+            self.bytesPerSecond = 0
+            self.indeterminate = false
         }
     }
 }
@@ -295,6 +313,8 @@ struct HouseCardView: View {
 
     @State private var previewRoute: PhotoPreviewRoute? = nil
     @State private var playingVideo: MediaItem? = nil
+    /// 媒体文件落盘/补下载后强制重建封面，避免视频首帧只在重启后才出现
+    @State private var coverReloadToken = 0
     // v2.20：云端同步新增/修改过、还没点开详情 → 红框
     @State private var isUnread = false
     // v2.24：账本推云端失败的房源 → 标「未同步」
@@ -313,6 +333,7 @@ struct HouseCardView: View {
                 openCover()
             } label: {
                 coverView
+                    .id(coverReloadToken)
             }
             .buttonStyle(.plain)
             .frame(width: 92, height: 76)
@@ -449,6 +470,10 @@ struct HouseCardView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: SyncFailStore.didChange)) { _ in
             syncFailed = SyncFailStore.isFailed(house.mediaRoomKey)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: HouseListView.houseStoreChanged)) { _ in
+            // 媒体下载完成会先落文件、再广播；封面按文件重新生成，不能等重启
+            coverReloadToken += 1
         }
         .fullScreenCover(item: $previewRoute) { route in
             PhotoPreviewView(photos: house.photos, startIndex: route.index, roomKey: house.mediaRoomKey)

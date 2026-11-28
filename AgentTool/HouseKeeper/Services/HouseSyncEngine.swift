@@ -256,8 +256,9 @@ final class HouseSyncEngine: ObservableObject {
         for job in jobs {
             let roomKey = job.house.mediaRoomKey
             let offset = jobOffset
-            HouseSyncProgress.shared.begin(roomKey: roomKey, direction: .download,
-                                           progress: 0, label: "下载媒体 0/\(job.records.count)")
+            let progressToken = HouseSyncProgress.shared.begin(
+                roomKey: roomKey, direction: .download,
+                progress: 0, label: "下载媒体 0/\(job.records.count)")
             let result = await HouseRemoteClient.shared.downloadMissingMedia(
                 roomKey: roomKey,
                 records: job.records,
@@ -267,7 +268,8 @@ final class HouseSyncEngine: ObservableObject {
                         HouseSyncProgress.shared.update(
                             roomKey: roomKey, direction: .download,
                             progress: Double(globalDone) / Double(total),
-                            label: "下载媒体 \(globalDone)/\(total)")
+                            label: "下载媒体 \(globalDone)/\(total)",
+                            token: progressToken)
                         if let taskID {
                             SyncTaskCenter.shared.advance(
                                 id: taskID, done: globalDone,
@@ -278,7 +280,7 @@ final class HouseSyncEngine: ObservableObject {
             downloaded += result.files.count
             failed += result.failedFiles.count
             jobOffset += job.records.count
-            HouseSyncProgress.shared.end()
+            HouseSyncProgress.shared.end(token: progressToken)
         }
 
         if let taskID {
