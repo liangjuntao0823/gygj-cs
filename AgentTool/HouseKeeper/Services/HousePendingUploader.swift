@@ -101,7 +101,9 @@ enum HousePendingRegistry {
     private static func migrateLegacyIfNeeded() {
         let legacy = Set(UserDefaults.standard.stringArray(forKey: legacyKey) ?? [])
         guard !legacy.isEmpty else { return }
-        var set = keys()
+        // 注意：这里不能调用 keys()（会再次进入本函数导致递归）；直接读权威键+changes 兜底。
+        var set = Set(UserDefaults.standard.stringArray(forKey: pendingKey) ?? [])
+        set.formUnion(changes().map { $0.roomKey })
         set.formUnion(legacy)
         UserDefaults.standard.set(Array(set), forKey: pendingKey)
         UserDefaults.standard.removeObject(forKey: legacyKey)
